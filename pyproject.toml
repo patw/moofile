@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moofile"
-version = "0.1.0"
+version = "0.1.1"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 readme = "docs/README.md"
@@ -17,6 +17,12 @@ dependencies = [
 [project.optional-dependencies]
 pandas = ["pandas>=1.0"]
 dev = ["pytest>=7", "pandas>=1.0"]
+
+[project.scripts]
+moosh      = "moofile.cli.repl:main"
+moo2json   = "moofile.cli.json_tool:main"
+moo2mongo  = "moofile.cli.mongo_tool:main"
+moo2sqlite = "moofile.cli.sqlite_tool:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

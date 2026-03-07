@@ -421,6 +421,137 @@ Single-threaded only.  Concurrent reads are safe.  Concurrent writes are not pro
 
 ---
 
+## CLI Tools
+
+Four command-line tools are installed with the package.
+
+### moosh — interactive shell
+
+Opens a `.bson` collection and starts a Python REPL with `db` pre-bound to the `Collection` and all aggregation helpers in scope. Good for quick inspection, one-off queries, or data fixes.
+
+```
+moosh [--indexes FIELDS] [--readonly] <collection.bson>
+```
+
+| Flag | Description |
+|---|---|
+| `--indexes FIELDS` | Comma-separated fields to index (e.g. `email,age`) |
+| `--readonly` | Open the collection read-only |
+
+```bash
+moosh users.bson
+moosh users.bson --indexes email,age --readonly
+```
+
+Inside the shell:
+
+```python
+>>> db.find({"age": {"$gt": 25}}).sort("age").to_list()
+>>> db.insert({"name": "Dave", "email": "dave@example.com"})
+>>> db.find().group("status").agg(count(), mean("age")).to_list()
+>>> exit()
+```
+
+Available names: `db`, `count`, `sum`, `mean`, `min`, `max`, `collect`, `first`, `last`, and the exception classes (`MooFileError`, `DuplicateKeyError`, `DocumentNotFoundError`, `ReadOnlyError`).
+
+---
+
+### moo2json
+
+Export/import between a `.bson` collection and a JSON file (array format) or NDJSON stream.
+
+```
+moo2json [--import] [--indexes FIELDS] [--quiet] <src> <dst>
+```
+
+| Flag | Description |
+|---|---|
+| *(no flag)* | Export: `<collection.bson>` → `<output.json>` (use `-` for stdout) |
+| `--import` | Import: `<input.json>` → `<collection.bson>` (use `-` for stdin) |
+| `--indexes FIELDS` | Comma-separated fields to index on import (e.g. `email,age`) |
+| `--quiet` | Suppress progress output |
+
+```bash
+# Export all documents to a JSON file
+moo2json users.bson users.json
+
+# Export to stdout (pipe-friendly)
+moo2json users.bson -
+
+# Import from a JSON array or NDJSON file
+moo2json --import users.json users.bson --indexes email,age
+
+# Import from stdin (e.g. from another process)
+cat users.json | moo2json --import - users.bson
+```
+
+---
+
+### moo2mongo
+
+Export/import between a `.bson` collection and a MongoDB collection.
+
+```
+moo2mongo [--import] --uri <uri> --collection <name> [--drop] [--indexes FIELDS] [--quiet] <collection.bson>
+```
+
+| Flag | Description |
+|---|---|
+| *(no flag)* | Export: MooFile → MongoDB |
+| `--import` | Import: MongoDB → MooFile |
+| `--uri` | MongoDB connection URI (must include database name, e.g. `mongodb://localhost/mydb`) |
+| `--collection` | MongoDB collection name |
+| `--drop` | Drop target MongoDB collection before exporting |
+| `--indexes FIELDS` | Comma-separated fields to index on import (MooFile side) |
+| `--quiet` | Suppress progress output |
+
+```bash
+# Export to MongoDB
+moo2mongo users.bson --uri mongodb://localhost/mydb --collection users
+
+# Export with drop (replace existing data)
+moo2mongo users.bson --uri mongodb://localhost/mydb --collection users --drop
+
+# Import from MongoDB
+moo2mongo --import users.bson --uri mongodb://localhost/mydb --collection users --indexes email
+```
+
+---
+
+### moo2sqlite
+
+Export/import between a `.bson` collection and a SQLite database table.
+
+Nested documents and arrays are flattened to JSON strings in SQLite; they are restored automatically on import.
+
+```
+moo2sqlite [--import] [--table <name>] [--drop] [--indexes FIELDS] [--quiet] <src> <dst>
+```
+
+| Flag | Description |
+|---|---|
+| *(no flag)* | Export: `<collection.bson>` → `<database.sqlite>` |
+| `--import` | Import: `<database.sqlite>` → `<collection.bson>` |
+| `--table` | SQLite table name (default: derived from `.bson` filename stem) |
+| `--drop` | Drop existing table before export |
+| `--indexes FIELDS` | Comma-separated fields to index on import (MooFile side) |
+| `--quiet` | Suppress progress output |
+
+```bash
+# Export to SQLite (table name: "users", derived from "users.bson")
+moo2sqlite users.bson users.db
+
+# Export to a named table, replacing existing data
+moo2sqlite users.bson users.db --table people --drop
+
+# Import from SQLite
+moo2sqlite --import users.db users.bson --table people --indexes email,age
+```
+
+All columns are stored as `TEXT`. The `_id` field becomes the `TEXT PRIMARY KEY`.
+
+---
+
 ## Examples
 
 See the [`examples/`](../examples/) directory:
@@ -431,3 +562,4 @@ See the [`examples/`](../examples/) directory:
 | `contacts_app.py` | A realistic contacts manager with filtering and updates |
 | `analytics.py` | Sales analytics with `group().agg()` pipeline |
 | `event_log.py` | Structured event log with time-based purging and compaction |
+| `import_export.py` | CLI tools in action: JSON, SQLite, and MongoDB round-trips |

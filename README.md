@@ -85,6 +85,67 @@ db.close()
 
 ---
 
+## CLI Tools
+
+Four command-line utilities are installed alongside the package:
+
+| Tool | Description |
+|---|---|
+| `moosh` | Interactive Python shell with the collection pre-loaded as `db` |
+| `moo2json` | Export/import between a `.bson` collection and a JSON file |
+| `moo2mongo` | Export/import between a `.bson` collection and a MongoDB collection |
+| `moo2sqlite` | Export/import between a `.bson` collection and a SQLite database |
+
+### moosh — interactive shell
+
+```bash
+moosh users.bson
+moosh users.bson --indexes email,age
+moosh users.bson --readonly
+```
+
+Drops into a Python REPL with `db` bound to the open collection and all aggregation helpers (`count`, `sum`, `mean`, ...) in scope.
+
+All tools default to **export** (MooFile → target) and switch to **import** with `--import`.
+
+### moo2json
+
+```bash
+# Export to JSON file
+moo2json users.bson users.json
+
+# Export to stdout (pipe-friendly)
+moo2json users.bson -
+
+# Import from JSON (array or NDJSON), indexing on email
+moo2json --import users.json users.bson --indexes email
+```
+
+### moo2mongo
+
+```bash
+# Export to MongoDB
+moo2mongo users.bson --uri mongodb://localhost/mydb --collection users
+
+# Import from MongoDB
+moo2mongo --import users.bson --uri mongodb://localhost/mydb --collection users
+```
+
+### moo2sqlite
+
+```bash
+# Export to SQLite (table name derived from filename: "users")
+moo2sqlite users.bson users.db
+
+# Export to a specific table, dropping it first
+moo2sqlite users.bson users.db --table people --drop
+
+# Import from SQLite
+moo2sqlite --import users.db users.bson --table people --indexes email
+```
+
+---
+
 ## Full Documentation
 
 See [`docs/README.md`](docs/README.md) for the complete API reference, including:
