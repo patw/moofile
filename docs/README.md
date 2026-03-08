@@ -83,6 +83,23 @@ db.close()
 
 ---
 
+## Key Differences & Gotchas
+
+MooFile's API looks like MongoDB but has important differences that can trip up coding agents:
+
+- **Updates use Python keyword args**: `update_one(filter, set={...}, inc={...})` NOT `update_one(filter, {"$set": {...}})`
+- **update_one/replace_one are strict**: Raise `DocumentNotFoundError` if no match (MongoDB silently no-ops)
+- **delete_one returns bool**: Returns `True`/`False`, NOT a result object like MongoDB
+- **Vector/text search return tuples**: `[(doc, score), ...]` NOT plain document lists like `find()`
+- **Single-threaded only**: No concurrent write safety — serialize writes at application layer
+- **No nested field indexes**: Only top-level fields can be indexed (no `"user.name"` paths)
+- **No joins or $lookup**: No cross-document references or aggregation pipelines
+- **No async API**: All operations are synchronous
+- **Filters vs updates**: Filters use MongoDB-style `{"field": {"$gt": 5}}` but updates use kwargs `set={"field": value}`
+- **Explicit compaction**: Dead records accumulate until you call `db.compact()`
+
+---
+
 ## File Layout
 
 A MooFile database is two files:
@@ -106,7 +123,39 @@ Indexes are **never persisted** — they are rebuilt in memory on every open by 
 
 ---
 
+## All Imports
+
+```python
+from moofile import (
+    Collection,
+    count, sum, mean, min, max, collect, first, last,
+    MooFileError, DuplicateKeyError, DocumentNotFoundError, ReadOnlyError,
+)
+```
+
+---
+
 ## API Reference
+
+### Return Types Quick Reference
+
+| Method | Returns |
+|---|---|
+| `find().to_list()` | `list[dict]` |
+| `find().first()` | `dict \| None` |
+| `find_one()` | `dict \| None` |
+| `find().count()` | `int` (0 if no matches) |
+| `count()` | `int` (0 if no matches) |
+| `exists()` | `bool` |
+| `vector_search().to_list()` | `list[tuple[dict, float]]` |
+| `text_search().to_list()` | `list[tuple[dict, float]]` |
+| `insert()` | `dict` (with _id populated) |
+| `insert_many()` | `list[dict]` |
+| `update_one()` | `bool` (always True, raises DocumentNotFoundError if no match) |
+| `update_many()` | `int` (count of updated docs) |
+| `replace_one()` | `bool` (always True, raises DocumentNotFoundError if no match) |
+| `delete_one()` | `bool` |
+| `delete_many()` | `int` |
 
 ### Opening a Collection
 
@@ -152,6 +201,14 @@ docs = db.insert_many([{...}, {...}])
 - Providing a custom `_id` of any hashable type is allowed.
 - `DuplicateKeyError` is raised if `_id` already exists.
 
+### _id Behavior
+
+- **Auto-generated type**: 24-character hex string (e.g., `"507f1f77bcf86cd799439011"`)
+- **Custom _id**: Any hashable type allowed (`str`, `int`, `tuple`, etc.) 
+- **Always present**: `_id` is populated on all returned documents after insert
+- **Uniqueness**: Enforced at insert time — duplicates raise `DuplicateKeyError`
+- **Preserved**: `_id` cannot be changed by updates, always preserved during `replace_one()`
+
 ---
 
 ### Find
@@ -171,6 +228,14 @@ db.exists({"email": "alice@example.com"})
 ```
 
 `.find()` returns a lazy `Query` object.  No work is done until a terminal method is called.
+
+### Empty/Edge Case Behavior
+
+- **find() with no matches**: `to_list()` → `[]`, `first()` → `None`, `count()` → `0`
+- **find_one() with no matches**: → `None`
+- **count()/exists() with no matches**: → `0` / `False`
+- **update_many() with no matches**: → `0` (count of updated docs, not an error)
+- **group().agg() with no documents**: → `[]` (empty list, no group rows created)
 
 ---
 
@@ -663,3 +728,96 @@ See the [`examples/`](../examples/) directory:
 | `analytics.py` | Sales analytics with `group().agg()` pipeline |
 | `event_log.py` | Structured event log with time-based purging and compaction |
 | `import_export.py` | CLI tools in action: JSON, SQLite, and MongoDB round-trips |
+
+### End-to-End Examples
+
+#### 1. Filter + Vector Search
+
+```python
+from moofile import Collection
+import numpy as np
+
+with Collection("docs.bson", vector_indexes={"embedding": 384}) as db:
+    # Pre-filter by category, then find similar documents by embedding
+    query_vector = np.random.randn(384).tolist()
+    
+    results = (
+        db.find({"category": "AI", "published": True})
+        .vector_search("embedding", query_vector, limit=5)
+        .to_list()
+    )
+    
+    # Unpack tuples: each result is (document, similarity_score)
+    for doc, similarity in results:
+        print(f"{doc['title']}: {similarity:.3f}")
+```
+
+#### 2. Full Analytics Pipeline  
+
+```python
+from moofile import Collection, count, mean, sum, max
+
+with Collection("sales.bson", indexes=["region", "date"]) as db:
+    # Complex analytics: filter → group → aggregate → sort → limit
+    monthly_stats = (
+        db.find({
+            "date": {"$gte": "2024-01-01"}, 
+            "status": "completed"
+        })
+        .group("region")
+        .agg(
+            count(),                  # Total transactions
+            sum("amount"),           # Revenue per region
+            mean("amount"),          # Average order value  
+            max("date")              # Latest transaction
+        )
+        .sort("sum_amount", descending=True)
+        .limit(10)
+        .to_list()
+    )
+    
+    for row in monthly_stats:
+        print(f"Region: {row['region']}")
+        print(f"  Revenue: ${row['sum_amount']:,.2f}")
+        print(f"  Transactions: {row['count']}")
+        print(f"  Avg Order: ${row['mean_amount']:.2f}")
+```
+
+#### 3. Data Lifecycle Management
+
+```python
+from moofile import Collection, DocumentNotFoundError
+
+with Collection("users.bson", indexes=["email", "last_login"]) as db:
+    # Insert new user
+    user = db.insert({
+        "email": "alice@example.com",
+        "name": "Alice Smith", 
+        "credits": 100,
+        "last_login": "2024-01-15"
+    })
+    user_id = user["_id"]  # Capture the auto-generated ID
+    
+    # Update user activity  
+    try:
+        db.update_one(
+            {"_id": user_id}, 
+            set={"last_login": "2024-01-20"},
+            inc={"credits": -25}
+        )
+        print("User updated successfully")
+    except DocumentNotFoundError:
+        print("User not found!")
+    
+    # Find updated user
+    updated_user = db.find_one({"email": "alice@example.com"})
+    if updated_user:
+        print(f"Credits remaining: {updated_user['credits']}")
+        
+    # Archive inactive users
+    archived_count = db.update_many(
+        {"last_login": {"$lt": "2024-01-01"}},
+        set={"status": "archived"}
+    )
+    print(f"Archived {archived_count} inactive users")
+```
