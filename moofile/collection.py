@@ -43,6 +43,8 @@ class Collection:
         self,
         path: str,
         indexes=None,
+        vector_indexes=None,
+        text_indexes=None,
         readonly: bool = False,
         schema=None,
     ) -> None:
@@ -54,16 +56,22 @@ class Collection:
         self._storage: StorageEngine | None = None
 
         declared = list(indexes or [])
+        vector_fields = dict(vector_indexes or {})
+        text_fields = list(text_indexes or [])
 
         if not readonly:
             # Create the data file if it does not exist
             if not os.path.exists(path):
                 open(path, "wb").close()
-            self._save_meta(declared)
+            self._save_meta(declared, vector_fields, text_fields)
 
-        loaded_indexes = self._load_meta(declared)
+        loaded_indexes, loaded_vector_indexes, loaded_text_indexes = self._load_meta(
+            declared, vector_fields, text_fields
+        )
         self._storage = StorageEngine(path, readonly=readonly)
-        self._index_manager = IndexManager(loaded_indexes)
+        self._index_manager = IndexManager(
+            loaded_indexes, loaded_vector_indexes, loaded_text_indexes
+        )
         self._load_from_file()
 
     # -----------------------------------------------------------------------
@@ -396,9 +404,12 @@ class Collection:
                 self._index_manager.add(doc)
             elif record_type == RECORD_TOMBSTONE:
                 self._index_manager.remove(_id)
+        
+        # Rebuild vector indexes after loading all documents
+        self._index_manager.rebuild_vector_indexes()
 
-    def _save_meta(self, indexes: list) -> None:
-        """Persist (or update) the .meta file with the given index list."""
+    def _save_meta(self, indexes: list, vector_indexes: dict = None, text_indexes: list = None) -> None:
+        """Persist (or update) the .meta file with the given index configurations."""
         existing: dict = {}
         if os.path.exists(self._meta_path):
             try:
@@ -408,12 +419,23 @@ class Collection:
                 pass
 
         existing_indexes = existing.get("indexes", [])
-        # Merge, preserving order and removing duplicates
-        merged = list(dict.fromkeys(existing_indexes + indexes))
+        existing_vector_indexes = existing.get("vector_indexes", {})
+        existing_text_indexes = existing.get("text_indexes", [])
+        
+        # Merge regular indexes, preserving order and removing duplicates
+        merged_indexes = list(dict.fromkeys(existing_indexes + indexes))
+        
+        # Merge vector indexes
+        merged_vector_indexes = {**existing_vector_indexes, **(vector_indexes or {})}
+        
+        # Merge text indexes
+        merged_text_indexes = list(dict.fromkeys(existing_text_indexes + (text_indexes or [])))
 
         meta = {
             "version": 1,
-            "indexes": merged,
+            "indexes": merged_indexes,
+            "vector_indexes": merged_vector_indexes,
+            "text_indexes": merged_text_indexes,
             "created_at": existing.get(
                 "created_at",
                 datetime.now(timezone.utc).isoformat(),
@@ -422,17 +444,30 @@ class Collection:
         with open(self._meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
-    def _load_meta(self, declared: list) -> list:
+    def _load_meta(self, declared: list, vector_indexes: dict, text_indexes: list) -> tuple:
         """Load persisted indexes from .meta and merge with declared indexes."""
         if os.path.exists(self._meta_path):
             try:
                 with open(self._meta_path) as f:
                     meta = json.load(f)
-                persisted = meta.get("indexes", [])
-                return list(dict.fromkeys(persisted + declared))
+                
+                # Merge regular indexes
+                persisted_indexes = meta.get("indexes", [])
+                merged_indexes = list(dict.fromkeys(persisted_indexes + declared))
+                
+                # Merge vector indexes
+                persisted_vector = meta.get("vector_indexes", {})
+                merged_vector = {**persisted_vector, **vector_indexes}
+                
+                # Merge text indexes  
+                persisted_text = meta.get("text_indexes", [])
+                merged_text = list(dict.fromkeys(persisted_text + text_indexes))
+                
+                return merged_indexes, merged_vector, merged_text
+                
             except (json.JSONDecodeError, OSError):
                 pass
-        return declared
+        return declared, vector_indexes, text_indexes
 
     def _require_write(self) -> None:
         if self._readonly:

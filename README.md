@@ -8,15 +8,28 @@
 ```python
 from moofile import Collection, count, mean
 
-with Collection("mydata.bson", indexes=["email", "age"]) as db:
-    db.insert({"name": "Alice", "email": "alice@example.com", "age": 30})
+with Collection("mydata.bson", 
+                indexes=["email", "age"],
+                vector_indexes={"embedding": 384},
+                text_indexes=["content"]) as db:
+    
+    db.insert({
+        "name": "Alice", 
+        "email": "alice@example.com", 
+        "age": 30,
+        "content": "Machine learning and data science expert",
+        "embedding": [0.1, 0.2, ...]  # 384-dimensional vector
+    })
 
-    result = (
-        db.find({"age": {"$gt": 25}})
-        .sort("age", descending=True)
-        .limit(10)
-        .to_list()
-    )
+    # Traditional query
+    results = db.find({"age": {"$gt": 25}}).sort("age").to_list()
+    
+    # Vector similarity search
+    query_vector = [0.15, 0.25, ...]
+    similar_docs = db.find({}).vector_search("embedding", query_vector, limit=5).to_list()
+    
+    # Text search
+    text_results = db.find({}).text_search("content", "machine learning", limit=10).to_list()
 ```
 
 ---
@@ -28,12 +41,15 @@ with Collection("mydata.bson", indexes=["email", "age"]) as db:
 | No server | ✓ | ✓ | ✗ | **✓** |
 | Document-oriented | ✗ | ✓ | ✓ | **✓** |
 | Indexes | ✓ | ✗ | ✓ | **✓** |
+| Vector search | ✗ | ✗ | ✓ (Atlas) | **✓** |
+| Text search | ✓ (FTS) | ✗ | ✓ | **✓** |
 | Developer-friendly API | ✗ (SQL) | ✓ (raw Python) | ✓ | **✓** |
 | Single-file portability | ✓ | ✓ | ✗ | **✓** |
 
-MooFile is the right tool when you want MongoDB-style ergonomics without running a server: local tooling, embedded applications, tests, small datasets, single-process services.
+MooFile is the right tool when you want MongoDB-style ergonomics with vector and text search without running a server: local tooling, embedded applications, tests, small datasets, single-process services.
 
-**Target dataset size:** megabytes to single-digit gigabytes.
+**Target dataset size:** megabytes to single-digit gigabytes.  
+**New in v0.2:** Vector similarity search and BM25 text search with lightweight dependencies.
 
 ---
 
@@ -45,7 +61,7 @@ pip install moofile
 pip install "moofile[pandas]"
 ```
 
-**Dependencies:** `pymongo` (for BSON encoding) and `sortedcontainers`.
+**Dependencies:** `pymongo` (BSON encoding), `sortedcontainers` (indexes), `numpy` (vector search), `snowballstemmer` (text search).
 
 ---
 
@@ -54,22 +70,47 @@ pip install "moofile[pandas]"
 ```python
 from moofile import Collection
 
-# Open or create a collection.  Indexes are declared here.
-db = Collection("users.bson", indexes=["email", "status"])
+# Open or create a collection with multiple index types
+db = Collection("users.bson", 
+                indexes=["email", "status"],           # Regular field indexes
+                text_indexes=["bio"],                   # Full-text search
+                vector_indexes={"profile_vec": 128})    # Vector similarity
 
 # Insert
 alice = db.insert({"name": "Alice", "email": "alice@example.com", "age": 30, "status": "active"})
 print(alice["_id"])   # auto-generated 24-char hex string
 
 db.insert_many([
-    {"name": "Bob",   "email": "bob@example.com",  "age": 22, "status": "trial"},
-    {"name": "Carol", "email": "carol@example.com", "age": 40, "status": "active"},
+    {
+        "name": "Bob", "email": "bob@example.com", "age": 22, "status": "trial",
+        "bio": "Software engineer interested in machine learning",
+        "profile_vec": [0.1, 0.2, ...] # 128-dimensional vector
+    },
+    {
+        "name": "Carol", "email": "carol@example.com", "age": 40, "status": "active",
+        "bio": "Data scientist with expertise in deep learning",
+        "profile_vec": [0.3, 0.4, ...] # 128-dimensional vector  
+    },
 ])
 
 # Query
 active = db.find({"status": "active"}).to_list()
 young  = db.find({"age": {"$lt": 30}}).sort("age").to_list()
 one    = db.find_one({"email": "alice@example.com"})
+
+# Vector search - find similar profiles
+query_vector = [0.15, 0.25, ...]  # Your query vector
+similar_profiles = db.find({}).vector_search("profile_vec", query_vector, limit=3).to_list()
+for doc, similarity in similar_profiles:
+    print(f"{doc['name']}: {similarity:.3f}")
+
+# Text search - find people by bio content  
+ml_experts = db.find({}).text_search("bio", "machine learning", limit=5).to_list()
+for doc, relevance in ml_experts:
+    print(f"{doc['name']}: {relevance:.3f}")
+
+# Combined search - vector search within filtered results
+active_similar = db.find({"status": "active"}).vector_search("profile_vec", query_vector).to_list()
 
 # Update
 db.update_one({"email": "alice@example.com"}, set={"age": 31})

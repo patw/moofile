@@ -112,18 +112,28 @@ Indexes are **never persisted** — they are rebuilt in memory on every open by 
 
 ```python
 db = Collection(
-    path,              # path to the .bson file (created if absent)
-    indexes=[],        # list of top-level field names to index
-    readonly=False,    # True to prevent all writes
-    schema=None,       # optional hints, ignored in v1
+    path,                        # path to the .bson file (created if absent)
+    indexes=[],                  # list of top-level field names to index
+    vector_indexes={},           # dict: field -> vector_dimension
+    text_indexes=[],             # list of field names for full-text search
+    readonly=False,              # True to prevent all writes
+    schema=None,                 # optional hints, ignored in v1
 )
 ```
 
 Use as a context manager for automatic cleanup:
 
 ```python
-with Collection("data.bson", indexes=["email"]) as db:
-    db.insert({"email": "bob@example.com"})
+with Collection("data.bson", 
+                indexes=["email"], 
+                vector_indexes={"embedding": 384},
+                text_indexes=["title", "content"]) as db:
+    db.insert({
+        "email": "bob@example.com",
+        "title": "Machine Learning Guide",
+        "content": "Introduction to ML algorithms",
+        "embedding": [0.1, 0.2, ...]  # 384-dimensional vector
+    })
 ```
 
 ---
@@ -319,6 +329,87 @@ Documents where the aggregated field is absent are excluded from the computation
 
 ---
 
+### Vector Search
+
+Vector similarity search using cosine similarity. Requires numpy.
+
+```python
+# Setup collection with vector index
+db = Collection("docs.bson", vector_indexes={"embedding": 384})
+
+# Insert documents with vector embeddings
+db.insert({
+    "title": "Machine Learning",
+    "content": "Introduction to ML algorithms",
+    "embedding": [0.1, 0.2, 0.3, ...]  # 384-dimensional vector
+})
+
+# Perform vector search
+query_vector = [0.15, 0.25, 0.35, ...]  # Your query embedding
+results = db.find({}).vector_search("embedding", query_vector, limit=10).to_list()
+
+# Results are (document, similarity_score) tuples
+for doc, score in results:
+    print(f"{doc['title']}: {score:.3f}")
+
+# Combine with filters
+results = (
+    db.find({"category": "AI"})
+    .vector_search("embedding", query_vector, limit=5)
+    .to_list()
+)
+```
+
+**Vector search features:**
+- Uses cosine similarity (values from -1 to 1, higher is more similar)
+- Brute-force search rebuilds vector arrays on collection open
+- Invalid vectors (wrong dimension, non-numeric) are ignored
+- Pre-filtering with `.find()` conditions is supported
+
+---
+
+### Text Search
+
+BM25 full-text search with Porter stemming. Requires snowballstemmer.
+
+```python
+# Setup collection with text index
+db = Collection("docs.bson", text_indexes=["title", "content"])
+
+# Insert documents with text content
+db.insert({
+    "title": "Machine Learning Introduction",
+    "content": "Learn about supervised and unsupervised learning algorithms.",
+    "category": "AI"
+})
+
+# Perform text search
+results = db.find({}).text_search("content", "machine learning", limit=10).to_list()
+
+# Results are (document, relevance_score) tuples
+for doc, score in results:
+    print(f"{doc['title']}: {score:.3f}")
+
+# Combine with filters
+results = (
+    db.find({"category": "AI"})
+    .text_search("content", "neural networks", limit=5)
+    .to_list()
+)
+
+# Search specific fields
+title_results = db.find({}).text_search("title", "introduction").to_list()
+```
+
+**Text search features:**
+- BM25 scoring algorithm with stemming (higher scores = more relevant)
+- Porter stemming handles word variations ("running" matches "run", "runs")
+- Tokenizes on word boundaries, ignores punctuation
+- Pre-filtering with `.find()` conditions is supported
+- Only processes string fields (non-strings are ignored)
+
+---
+
 ### Utility
 
 ```python
@@ -365,23 +456,32 @@ All MooFile exceptions are subclasses of `MooFileError`.
 MooFile uses an index automatically when a filter's top-level field is indexed:
 
 ```python
-db = Collection("data.bson", indexes=["email", "age"])
+db = Collection("data.bson", 
+                indexes=["email", "age"],
+                vector_indexes={"embedding": 384},
+                text_indexes=["content"])
 
-# Uses the 'email' index — O(log n) lookup
+# Regular field indexes — O(log n) lookup
 db.find({"email": "alice@example.com"})
-
-# Uses the 'age' index — O(log n) range scan
 db.find({"age": {"$gt": 25}})
+
+# Vector search — O(n) cosine similarity
+db.find({}).vector_search("embedding", query_vector)
+
+# Text search — BM25 scoring 
+db.find({}).text_search("content", "machine learning")
 
 # Full scan — 'name' is not indexed
 db.find({"name": "Alice"})
 ```
 
 Index rules:
-- Only **top-level** fields can be indexed (no nested paths in v1).
-- `_id` is always available for fast lookup regardless of declared indexes.
-- Indexes are rebuilt in memory on every open.
-- Declaring additional indexes is cheap — add them to the `indexes=` parameter and reopen.
+- **Regular indexes**: Only top-level fields (no nested paths in v1)
+- **Vector indexes**: Brute-force cosine similarity on all vectors
+- **Text indexes**: BM25 scoring with Porter stemming
+- `_id` is always available for fast lookup regardless of declared indexes
+- All indexes are rebuilt in memory on every open
+- Declaring additional indexes is cheap — just reopen the collection
 
 ---
 

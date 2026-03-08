@@ -120,6 +120,20 @@ class Query:
         q = self._clone()
         q._agg_funcs = list(funcs)
         return q
+    
+    def vector_search(self, field: str, query_vector, limit: int = 10) -> "VectorQuery":
+        """
+        Perform vector similarity search on a field.
+        Returns a VectorQuery that yields (doc, score) tuples.
+        """
+        return VectorQuery(self._collection, field, query_vector, limit, self._filter)
+    
+    def text_search(self, field: str, query: str, limit: int = 10) -> "TextQuery":
+        """
+        Perform BM25 text search on a field.
+        Returns a TextQuery that yields (doc, score) tuples.
+        """
+        return TextQuery(self._collection, field, query, limit, self._filter)
 
     # --- Terminal methods ---
 
@@ -209,3 +223,82 @@ class Query:
                     row[func.output_name] = func.compute(group_docs)
             result.append(row)
         return result
+
+
+class VectorQuery:
+    """
+    Query results from vector similarity search.
+    Returns (document, similarity_score) tuples.
+    """
+    
+    def __init__(self, collection, field: str, query_vector, limit: int, pre_filter: dict):
+        self._collection = collection
+        self._field = field
+        self._query_vector = query_vector
+        self._limit = limit
+        self._pre_filter = pre_filter
+    
+    def to_list(self) -> list:
+        """Return list of (doc, score) tuples sorted by similarity descending."""
+        # Apply pre-filter if any (non-empty filter dict)
+        if self._pre_filter and self._pre_filter != {}:
+            # Get documents that match the filter first
+            filtered_docs = self._collection._get_docs(self._pre_filter)
+            # Create a temporary collection index with only filtered docs
+            # For simplicity, we'll just do vector search on all docs and then filter
+            all_results = self._collection._index_manager.vector_search(
+                self._field, self._query_vector, limit=None
+            )
+            # Filter results to only include pre-filtered docs
+            filtered_doc_ids = {doc["_id"] for doc in filtered_docs}
+            results = [(doc, score) for doc, score in all_results 
+                      if doc["_id"] in filtered_doc_ids]
+            return results[:self._limit]
+        else:
+            return self._collection._index_manager.vector_search(
+                self._field, self._query_vector, self._limit
+            )
+    
+    def first(self):
+        """Return the best match as (doc, score) tuple or None."""
+        results = self.to_list()
+        return results[0] if results else None
+
+
+class TextQuery:
+    """
+    Query results from BM25 text search.
+    Returns (document, relevance_score) tuples.
+    """
+    
+    def __init__(self, collection, field: str, query: str, limit: int, pre_filter: dict):
+        self._collection = collection
+        self._field = field
+        self._query = query
+        self._limit = limit
+        self._pre_filter = pre_filter
+    
+    def to_list(self) -> list:
+        """Return list of (doc, score) tuples sorted by relevance descending."""
+        # Apply pre-filter if any (non-empty filter dict)
+        if self._pre_filter and self._pre_filter != {}:
+            # Get documents that match the filter first
+            filtered_docs = self._collection._get_docs(self._pre_filter)
+            # Get text search results
+            all_results = self._collection._index_manager.text_search(
+                self._field, self._query, limit=None
+            )
+            # Filter results to only include pre-filtered docs
+            filtered_doc_ids = {doc["_id"] for doc in filtered_docs}
+            results = [(doc, score) for doc, score in all_results 
+                      if doc["_id"] in filtered_doc_ids]
+            return results[:self._limit]
+        else:
+            return self._collection._index_manager.text_search(
+                self._field, self._query, self._limit
+            )
+    
+    def first(self):
+        """Return the best match as (doc, score) tuple or None."""
+        results = self.to_list()
+        return results[0] if results else None

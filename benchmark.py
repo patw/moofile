@@ -14,6 +14,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 
+import numpy as np
 from moofile import Collection, count, mean, sum
 
 
@@ -24,8 +25,13 @@ from moofile import Collection, count, mean, sum
 N_DOCS = 10_000          # documents to insert
 N_LOOKUPS = 1000        # indexed lookups to perform
 N_SCANS = 100            # full-scan queries to perform
+N_VECTOR_SEARCHES = 100  # vector searches to perform
+N_TEXT_SEARCHES = 100    # text searches to perform
+VECTOR_DIM = 128         # vector dimension
 STATUSES = ["active", "inactive", "trial", "expired"]
 CITIES = ["NYC", "LA", "Chicago", "Houston", "Phoenix", "Austin"]
+CONTENT_WORDS = ["machine", "learning", "data", "science", "artificial", "intelligence", 
+                "neural", "network", "deep", "algorithm", "python", "database", "analytics"]
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +51,13 @@ def random_email(i: int) -> str:
 
 
 def make_doc(i: int) -> dict:
+    # Generate random text content
+    content_length = random.randint(5, 15)
+    content = " ".join(random.choices(CONTENT_WORDS, k=content_length))
+    
+    # Generate random vector
+    vector = np.random.normal(0, 1, VECTOR_DIM).tolist()
+    
     return {
         "_id": str(i),
         "email": random_email(i),
@@ -53,6 +66,8 @@ def make_doc(i: int) -> dict:
         "city": random.choice(CITIES),
         "score": random.random() * 100,
         "name": "".join(random.choices(string.ascii_lowercase, k=8)),
+        "content": content,
+        "embedding": vector,
     }
 
 
@@ -74,7 +89,10 @@ def run(tmp_dir: str) -> None:
     print("INSERT")
     docs = [make_doc(i) for i in range(N_DOCS)]
 
-    with Collection(path, indexes=["email", "age", "status", "city"]) as db:
+    with Collection(path, 
+                    indexes=["email", "age", "status", "city"],
+                    vector_indexes={"embedding": VECTOR_DIM},
+                    text_indexes=["content"]) as db:
 
         with timer(f"insert_many {N_DOCS:,} docs"):
             db.insert_many(docs)
@@ -165,6 +183,45 @@ def run(tmp_dir: str) -> None:
             )
 
         hr()
+        
+        # -------- Vector Search ------------------------------------------------
+        print("VECTOR SEARCH")
+        
+        # Generate query vectors
+        query_vectors = [np.random.normal(0, 1, VECTOR_DIM).tolist() 
+                        for _ in range(N_VECTOR_SEARCHES)]
+        
+        with timer(f"vector_search similarity ({N_VECTOR_SEARCHES} queries, limit=10)"):
+            for query_vec in query_vectors:
+                db.find({}).vector_search("embedding", query_vec, limit=10).to_list()
+        
+        with timer("vector_search with filter (status='active', limit=5)"):
+            for i, query_vec in enumerate(query_vectors[:N_VECTOR_SEARCHES//2]):
+                db.find({"status": "active"}).vector_search("embedding", query_vec, limit=5).to_list()
+        
+        hr()
+        
+        # -------- Text Search ---------------------------------------------------
+        print("TEXT SEARCH")
+        
+        # Generate text queries
+        text_queries = [random.choice(CONTENT_WORDS) for _ in range(N_TEXT_SEARCHES)]
+        multi_word_queries = [" ".join(random.choices(CONTENT_WORDS, k=2)) 
+                             for _ in range(N_TEXT_SEARCHES//2)]
+        
+        with timer(f"text_search single word ({N_TEXT_SEARCHES} queries, limit=10)"):
+            for query in text_queries:
+                db.find({}).text_search("content", query, limit=10).to_list()
+        
+        with timer(f"text_search multi-word ({len(multi_word_queries)} queries, limit=5)"):
+            for query in multi_word_queries:
+                db.find({}).text_search("content", query, limit=5).to_list()
+        
+        with timer("text_search with filter (city='NYC', limit=5)"):
+            for query in text_queries[:N_TEXT_SEARCHES//2]:
+                db.find({"city": "NYC"}).text_search("content", query, limit=5).to_list()
+
+        hr()
 
         # -------- Compaction -------------------------------------------------
         print("COMPACTION")
@@ -184,7 +241,10 @@ def run(tmp_dir: str) -> None:
 
     # Re-open outside the with block to time cold open
     with timer(f"Collection open + reindex ({db.count() + len(ids_to_delete)} records on disk)"):
-        with Collection(path, indexes=["email", "age", "status", "city"]) as db2:
+        with Collection(path, 
+                       indexes=["email", "age", "status", "city"],
+                       vector_indexes={"embedding": VECTOR_DIM},
+                       text_indexes=["content"]) as db2:
             _ = db2.count()
 
     hr()

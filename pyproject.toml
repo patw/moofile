@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moofile"
-version = "0.1.1"
+version = "0.2.0"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 readme = "docs/README.md"
@@ -12,6 +12,8 @@ requires-python = ">=3.10"
 dependencies = [
     "pymongo>=4.0",
     "sortedcontainers>=2.0",
+    "numpy>=1.20",
+    "snowballstemmer>=2.0",
 ]
 
 [project.optional-dependencies]
