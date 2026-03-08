@@ -210,6 +210,8 @@ See the [`examples/`](examples/) directory:
 | `contacts_app.py` | A realistic contacts manager with filtering and updates |
 | `analytics.py` | Sales analytics with `group().agg()` pipeline |
 | `event_log.py` | Structured event log with time-based purging and compaction |
+| `import_export.py` | Demonstration of CLI tools with round-trip import/export testing |
+| `document_search.py` | Vector similarity and BM25 text search for semantic document retrieval |
 
 ---
 

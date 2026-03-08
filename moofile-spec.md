@@ -1,6 +1,6 @@
-# MooFile — Specification v0.1
+# MooFile — Specification v0.2.0
 
-> A lightweight, embedded, single-file document store with a developer-friendly query API.  
+> A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.
 
 ---
@@ -11,17 +11,19 @@ SQLite is magical because it is a library, not a server. You get persistence, in
 
 JSON files are the other extreme. Perfect ergonomics, zero infrastructure, but no indexes. Once your dataset grows past a few thousand documents, every query is a full scan.
 
-MongoDB's query language (MQL) is closer to how developers naturally think — queries look like the documents they describe. But MongoDB requires a server, which is heavy for local or embedded use cases.
+MongoDB's query language (MQL) is closer to how developers naturally think — queries look like the documents they describe. But MongoDB requires a server, which is heavy for local or embedded use cases. Vector databases like Pinecone provide semantic search but require infrastructure and often sacrifice document flexibility.
 
 MooFile sits in the gap:
 
 - **Embedded** like SQLite — a library, no daemon, no network
 - **Document-oriented** like MongoDB — JSON-shaped data, flexible schema
+- **Vector search** like modern vector databases — cosine similarity, semantic search
+- **Text search** like Elasticsearch — BM25 ranking, full-text indexing
 - **Developer-friendly API** — method chains, not operator dicts
 - **Single-file portability** — your database is a file you can copy, version control, or email
 
 Target dataset size: **megabytes to single-digit gigabytes**.  
-If you need replication, sharding, or multi-process writes, use real MongoDB.
+If you need horizontal scaling, distributed search, or sub-millisecond vector lookups, use specialized infrastructure.
 
 ---
 
@@ -30,9 +32,12 @@ If you need replication, sharding, or multi-process writes, use real MongoDB.
 - No network interface or server mode — ever
 - No replication or clustering
 - No multi-process concurrent writes
-- No `$lookup` / joins in v1 — denormalize your data
+- No `$lookup` / joins — denormalize your data
 - No SQL compatibility
 - No full MongoDB MQL parity — implement the 80%, skip the 20% nobody uses
+- No HNSW, IVF, or advanced vector indexing — brute-force is sufficient for target scale
+- No advanced NLP — BM25 + Porter stemming covers most use cases
+- No persistent indexes — correctness over startup performance
 
 ---
 
@@ -42,10 +47,10 @@ A MooFile database is two files:
 
 ```
 mydata.bson       ← append-only document store, source of truth
-mydata.bson.meta  ← index configuration (which fields are indexed)
+mydata.bson.meta  ← index configuration (regular, vector, and text indexes)
 ```
 
-Indexes are **never persisted**. They are rebuilt in memory on every open by scanning the BSON file. The BSON file is always the source of truth. If the index file is lost or corrupt, delete it and reopen — it will be rebuilt.
+Indexes are **never persisted**. They are rebuilt in memory on every open by scanning the BSON file. This includes regular field indexes, vector indexes for similarity search, and inverted text indexes for BM25 ranking. The BSON file is always the source of truth. If the meta file is lost or corrupt, delete it and reopen — it will be rebuilt.
 
 ### Why No Persistent Indexes?
 
@@ -53,7 +58,10 @@ Indexes are **never persisted**. They are rebuilt in memory on every open by sca
 - Eliminates WAL complexity entirely  
 - Simplifies the codebase dramatically
 - For the target dataset size (MBs to low GBs), rebuild on open is fast enough
-- Correctness is guaranteed — the index can never be out of sync with the data
+- Correctness is guaranteed — indexes can never be out of sync with data
+- Applies to all index types: regular field indexes, vector arrays, and inverted text indexes
+- Vector rebuilds are O(n) but acceptable for datasets under ~100K documents
+- Text index rebuilds include tokenization and stemming but complete in seconds
 
 ### BSON File Format
 
@@ -80,9 +88,13 @@ A small JSON file — human readable by design:
 {
   "version": 1,
   "indexes": ["email", "age", "status"],
+  "vector_indexes": {"embedding": 384, "profile_vec": 128},
+  "text_indexes": ["title", "content", "description"],
   "created_at": "2025-01-01T00:00:00Z"
 }
 ```
+
+Vector indexes specify field name and vector dimensionality. Text indexes list fields that support BM25 full-text search.
 
 ---
 
@@ -114,7 +126,7 @@ Rules:
 
 ### In-Memory Indexes
 
-On open, MooFile scans the BSON file and builds in-memory indexes using Python's `sortedcontainers.SortedDict`. Do not implement a custom B-tree.
+On open, MooFile scans the BSON file and builds three types of in-memory indexes:
 
 ```python
 # internal structure (simplified)
@@ -122,10 +134,25 @@ self._indexes = {
     "email": SortedDict(),   # value → [list of _ids]
     "age":   SortedDict(),   # value → [list of _ids]
 }
+self._vector_indexes = {
+    "embedding": np.array(),  # [n_docs × vector_dim] matrix
+    "embedding_ids": [],     # [_id1, _id2, ...] parallel to matrix rows
+}
+self._text_indexes = {
+    "content": {
+        "terms": {},          # term → {_id: tf_count, ...}
+        "doc_lengths": {},    # _id → token_count
+        "idf": {},            # term → inverse_document_frequency
+    }
+}
 self._documents = {}         # _id → (file_offset, document_dict)
 ```
 
-Index updates on write are synchronous — after every insert/update/delete, the in-memory index is updated immediately before returning to the caller.
+**Regular indexes:** Use `sortedcontainers.SortedDict` for range queries  
+**Vector indexes:** Dense numpy arrays for efficient cosine similarity  
+**Text indexes:** Inverted indexes with term frequencies for BM25 scoring
+
+All index updates are synchronous — after every insert/update/delete, all relevant indexes are updated immediately before returning to the caller.
 
 ### No WAL
 
@@ -157,29 +184,50 @@ Every document has an `_id` field. Rules:
 ```python
 from moofile import Collection
 
-# open or create
-db = Collection("mydata.bson", indexes=["email", "age", "status"])
+# open or create with multiple index types
+db = Collection(
+    "mydata.bson", 
+    indexes=["email", "age", "status"],           # regular field indexes
+    vector_indexes={"embedding": 384},             # vector similarity search
+    text_indexes=["title", "content"]             # BM25 text search
+)
 
 # read-only mode
 db = Collection("mydata.bson", readonly=True)
+
+# minimal setup (indexes optional)
+db = Collection("mydata.bson")
 ```
 
 On open:
 1. Create files if they do not exist
-2. Scan BSON file, build in-memory indexes
+2. Scan BSON file, build all in-memory indexes (regular, vector, text)
 3. Ready
+
+Index build time scales with document count: ~1-2 seconds for 10K documents, including vector arrays and text tokenization.
 
 ### Insert
 
 ```python
+# basic insert
 doc = db.insert({"name": "alice", "age": 30, "email": "alice@example.com"})
 # returns the document with _id populated
+
+# insert with vector and text data
+doc = db.insert({
+    "title": "Machine Learning Basics",
+    "content": "Introduction to supervised and unsupervised learning...",
+    "embedding": [0.1, 0.2, 0.3, ...],  # 384-dimensional vector
+    "category": "AI"
+})
 
 docs = db.insert_many([{...}, {...}, {...}])
 # returns list of inserted documents
 ```
 
-### Query
+Vectors and text content are automatically indexed according to the declared `vector_indexes` and `text_indexes` configuration.
+
+### Traditional Query
 
 ```python
 # return all matching documents as a list of dicts
@@ -195,21 +243,59 @@ db.count({"status": "active"})
 db.exists({"email": "alice@example.com"})
 ```
 
-### Method Chain API
-
-`.find()` returns a lazy `Query` object. Results are not materialized until a terminal method is called.
+### Vector Similarity Search
 
 ```python
+# find semantically similar documents
+query_vector = [0.15, 0.25, 0.35, ...]
+results = db.find({}).vector_search("embedding", query_vector, limit=5).to_list()
+# returns: [(doc1, similarity1), (doc2, similarity2), ...]
+
+# combine with filters - search only within specific categories
+results = db.find({"category": "AI"}).vector_search("embedding", query_vector).to_list()
+```
+
+### BM25 Text Search
+
+```python
+# keyword search with relevance ranking
+results = db.find({}).text_search("content", "machine learning", limit=5).to_list()
+# returns: [(doc1, relevance1), (doc2, relevance2), ...]
+
+# search multiple fields
+title_results = db.find({}).text_search("title", "neural networks").to_list()
+content_results = db.find({}).text_search("content", "neural networks").to_list()
+
+# combine with filters
+results = db.find({"year": {"$gte": 2020}}).text_search("content", "transformers").to_list()
+```
+
+### Method Chain API
+
+`.find()` returns a lazy `Query` object. Vector and text search return specialized query objects. Results are not materialized until a terminal method is called.
+
+```python
+# traditional queries
 db.find({"status": "active"})
   .sort("age", descending=True)
   .skip(20)
   .limit(10)
   .to_list()
 
+# vector similarity search with chaining
+db.find({"category": "research"})
+  .vector_search("embedding", query_vector, limit=20)
+  .to_list()  # returns [(doc, similarity), ...]
+
+# text search with chaining  
+db.find({"published": True})
+  .text_search("content", "machine learning", limit=10)
+  .to_list()  # returns [(doc, relevance), ...]
+
 # terminal methods
-.to_list()       # → list of dicts
+.to_list()       # → list of dicts (or list of (doc, score) tuples for search)
 .to_df()         # → pandas DataFrame (pandas optional dependency)
-.first()         # → first dict or None
+.first()         # → first dict or (doc, score) tuple
 .count()         # → int
 ```
 
@@ -232,7 +318,9 @@ db.update_many(
 db.replace_one({"_id": "abc123"}, {"name": "alice", "age": 32})
 ```
 
-Update operators in v1: `$set`, `$unset`, `$inc`. That covers 95% of real usage.
+Update operators: `set`, `unset`, `inc`. That covers 95% of real usage.
+
+When updating documents with vector or text fields, the relevant indexes are automatically updated.
 
 ### Delete
 
@@ -310,7 +398,9 @@ No `$lookup`. No `$facet`. No `$bucket` in v1.
 |---|---|
 | `$elemMatch` | at least one array element matches |
 
-That is the complete v1 filter surface. No `$regex`, no `$text`, no `$where`, no geospatial.
+That is the complete filter surface for traditional queries. No `$regex`, no `$where`, no geospatial.
+
+Text search uses dedicated `.text_search()` methods rather than `$text` operators, providing more explicit control over BM25 ranking.
 
 ### Utility
 
@@ -339,29 +429,45 @@ with Collection("mydata.bson", indexes=["email"]) as db:
 
 ### Index Usage
 
-When a filter references an indexed field, MooFile uses the index. Otherwise it falls back to a full document scan. No query planner — simple rule: if the top-level filter key matches an index, use it.
+**Traditional queries:** When a filter references an indexed field, MooFile uses the sorted index. Otherwise it falls back to a full document scan. No query planner — simple rule: if the top-level filter key matches an index, use it.
+
+**Vector search:** Always O(n) brute-force cosine similarity across all documents (after applying filters). Uses numpy for efficient vector operations.
+
+**Text search:** Uses inverted indexes with BM25 scoring. Includes tokenization, Porter stemming, and term frequency analysis.
 
 ```python
-# indexed — fast
+# regular indexed queries — fast
 db.find({"email": "alice@example.com"})
 db.find({"age": {"$gt": 25}})
 
-# not indexed — full scan
+# vector similarity — O(n) but optimized
+db.find().vector_search("embedding", query_vec)  # numpy cosine similarity
+
+# text search — inverted index lookup + BM25 scoring
+db.find().text_search("content", "machine learning")  # stemmed token matching
+
+# not indexed — full document scan
 db.find({"name": "alice"})
-db.find({"address.city": "Toronto"})  # nested fields not indexed in v1
+db.find({"address.city": "Toronto"})  # nested fields not indexed
 ```
 
-Nested field indexing is explicitly out of scope for v1. Index top-level fields only.
+Nested field indexing is explicitly out of scope. Index top-level fields only.
 
 ### Execution Order
 
-For a chained query:
+For traditional chained queries:
 
 ```
-filter → unwind (if any) → group + agg → sort → skip → limit → project
+filter → group + agg → sort → skip → limit → project
 ```
 
-Filtering always runs first. Limit and skip always run last.
+For search queries:
+
+```
+filter → vector_search/text_search → limit (implicit in search) → materialize
+```
+
+Filtering always runs first. For search queries, filters are applied before similarity computation to reduce the search space.
 
 ---
 
@@ -382,15 +488,17 @@ Schema hints may be used in future versions for index type optimization. In v1 t
 
 ## Dependencies
 
-MooFile targets a minimal dependency footprint:
+MooFile has grown beyond minimal dependencies to support search capabilities:
 
 | Dependency | Purpose | Required |
 |---|---|---|
-| `bson` | BSON encode/decode | Yes |
-| `sortedcontainers` | In-memory sorted index | Yes |
-| `pandas` | `.to_df()` terminal method | Optional |
+| `pymongo>=4.0` | BSON encode/decode | Yes |
+| `sortedcontainers>=2.0` | In-memory sorted indexes | Yes |
+| `numpy>=1.20` | Vector operations, cosine similarity | Yes |
+| `snowballstemmer>=2.0` | Porter stemming for text search | Yes |
+| `pandas>=1.0` | `.to_df()` terminal method | Optional |
 
-No database drivers. No async frameworks. No C extensions beyond what `bson` brings.
+The addition of numpy and stemming increases the footprint but enables semantic and text search without external services. No database drivers, async frameworks, or deep learning dependencies.
 
 ---
 
@@ -411,9 +519,9 @@ All errors are subclasses of `MooFileError`. No silent failures.
 
 ## Thread Safety
 
-Single-threaded only in v1. One `Collection` instance per process per file. Concurrent reads from multiple threads are safe. Concurrent writes are not protected and will corrupt the file.
+Single-threaded only. One `Collection` instance per process per file. Concurrent reads from multiple threads are safe. Concurrent writes are not protected and will corrupt the file.
 
-If you need multi-threaded writes, serialize them with a lock at the application layer. MooFile will not do this for you.
+This applies to all operations: traditional queries, vector search, text search, and index updates. If you need multi-threaded writes, serialize them with a lock at the application layer. MooFile will not do this for you.
 
 ---
 
@@ -421,56 +529,91 @@ If you need multi-threaded writes, serialize them with a lock at the application
 
 ### Simplicity Over Performance
 
-When in doubt, choose the simpler implementation. MooFile's primary value is being a small, readable codebase that a developer can understand in under an hour. If a performance optimization requires more than ~30 lines of non-obvious code, skip it.
+When in doubt, choose the simpler implementation. MooFile's primary value is being a readable codebase that a developer can understand. Examples:
 
-### Approximate Code Budget (v1)
+- **Vector search:** Brute-force cosine similarity, not HNSW or IVF indexing
+- **Text search:** Simple BM25 + Porter stemming, not transformer embeddings
+- **Storage:** Append-only files, not complex page-based storage
+- **Indexes:** Full rebuilds on open, not incremental maintenance
+
+If a performance optimization requires significant complexity, it likely violates the embedded-database design philosophy.
+
+### Current Code Structure (v0.2.0)
 
 ```
 moofile/
-  __init__.py         exports
+  __init__.py         exports, version
   collection.py       main Collection class, open/close, scan
   storage.py          BSON file append, read, compaction
-  index.py            in-memory index build and update
-  query.py            Query builder, filter evaluation
+  index.py            in-memory index build and update (regular + vector + text)
+  query.py            Query builders: Query, VectorQuery, TextQuery
   operators.py        $gt, $lt, $in, etc. — one function each
-  aggregation.py      group/agg execution
+  aggregation.py      group/agg execution  
+  text_search.py      BM25 implementation, Porter stemming, inverted indexes
   errors.py           exception classes
+  cli/                command-line tools (moosh, moo2json, moo2mongo, moo2sqlite)
+    __init__.py
+    moosh.py
+    moo2json.py
+    moo2mongo.py
+    moo2sqlite.py
 
-~ 800-1200 lines total
+~ 1800-2000 lines total (excluding tests)
 ```
 
-If the codebase exceeds ~1500 lines before tests, scope has crept.
+Scope has grown significantly beyond the original v1 plan, but the additions (search capabilities and CLI tools) provide substantial practical value.
 
 ### Recommended Libraries
 
-- Use `bson` from PyMongo — do not implement BSON encoding
+- Use `pymongo.bson` — do not implement BSON encoding
 - Use `sortedcontainers.SortedDict` — do not implement a B-tree
-- Use Python's `mmap` module for the optional future persistent index path
+- Use `numpy` for vector operations — do not implement matrix math
+- Use `snowballstemmer` for text processing — do not implement NLP algorithms
 - Use `os.replace()` for atomic file rename during compaction
+- Use built-in `json` for meta file format — human readable
 
-### What Not to Build in v1
+### What Not to Build
 
 - Custom BSON parser
-- Custom B-tree
+- Custom B-tree  
 - WAL
 - Query optimizer / planner
 - Nested field indexing
-- `$lookup`
+- `$lookup` / joins
 - Network interface
 - Async API
-- CLI tool (nice to have, not v1)
+- Advanced vector indexing (HNSW, IVF)
+- Deep learning embeddings (use external models)
+- Complex NLP beyond stemming
+- Persistent indexes
+- Multi-process coordination
 
 ---
 
-## Future Directions (Not v1)
+## Future Directions
 
-- Persistent mmap'd index file for faster open on large datasets
-- CLI inspection tool: `moofile inspect mydata.bson`
-- C core with Python/JS/Go bindings
+### Implemented in v0.2.0
+- ✅ CLI tools: `moosh`, `moo2json`, `moo2mongo`, `moo2sqlite`
+- ✅ Vector similarity search with cosine distance
+- ✅ BM25 text search with Porter stemming
+
+### Potential Future Features
+- Persistent mmap'd index files for faster startup on very large datasets
+- Advanced vector search algorithms (HNSW) for > 100K document performance
+- Nested field indexes (`"address.city"` indexing)
+- `$unwind` for array flattening in aggregation pipelines
 - Optional schema enforcement mode
-- Nested field indexes
-- `$unwind` for array flattening
-- Watch/change stream for local reactivity
+- Watch/change streams for local reactivity
+- C core with Python/JS/Go bindings for performance
+- Approximate nearest neighbor search with configurable trade-offs
+- Multi-field text search with weighted scoring
+
+### Explicitly Not Planned
+- Network interfaces or server modes
+- Distributed or replicated deployments  
+- Multi-process write coordination
+- Advanced NLP beyond stemming
+- Integration with specific ML frameworks
 
 ---
 
