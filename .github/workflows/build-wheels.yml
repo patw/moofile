@@ -15,8 +15,6 @@ jobs:
             maturin-interpreter: python3.10
           - os: macos-latest
             maturin-interpreter: python3
-          - os: macos-13
-            maturin-interpreter: python3
           - os: windows-latest
             maturin-interpreter: python3
     runs-on: ${{ matrix.os }}
