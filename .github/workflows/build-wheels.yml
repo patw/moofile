@@ -23,7 +23,6 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
-          target: ${{ matrix.target || 'x86_64' }}
           args: --release --out dist
           manylinux: auto
           before-script-linux: |
