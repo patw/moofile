@@ -10,7 +10,15 @@ jobs:
   native:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+        include:
+          - os: ubuntu-latest
+            maturin-interpreter: python3.10
+          - os: macos-latest
+            maturin-interpreter: python3
+          - os: macos-13
+            maturin-interpreter: python3
+          - os: windows-latest
+            maturin-interpreter: python3
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -23,7 +31,7 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
-          args: --release --out dist
+          args: --release --out dist -i ${{ matrix.maturin-interpreter }}
           manylinux: auto
           before-script-linux: |
             yum install -y openssl-devel || true
