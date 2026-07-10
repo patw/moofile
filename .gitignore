@@ -34,3 +34,9 @@ htmlcov/
 # Claude
 CLAUDE.md
 .claude/
+
+# Rust build artifacts
+target/
+
+# Compiled native extensions
+*.so

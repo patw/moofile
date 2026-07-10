@@ -1,0 +1,78 @@
+name: Build wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # ── Native wheels (Rust core) ─────────────────────────────────
+  native:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target || 'x86_64' }}
+          args: --release --out dist
+          manylinux: auto
+          before-script-linux: |
+            yum install -y openssl-devel || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist/
+
+  # ── Pure-Python wheel (fallback for unsupported platforms) ──
+  pure-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build pure-Python wheel
+        run: |
+          pip install build
+          # Temporarily swap to setuptools build
+          cat > pyproject.toml.bak << 'PYEOF'
+          [build-system]
+          requires = ["setuptools>=61"]
+          build-backend = "setuptools.build_meta"
+          PYEOF
+          python -m build --wheel --outdir dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-pure
+          path: dist/
+
+  # ── Publish to PyPI (only on tag push) ───────────────────────
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [native, pure-python]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

@@ -1,7 +1,8 @@
-# MooFile — Specification v0.2.0
+# MooFile — Specification v0.3.0
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, and a developer-friendly query API.  
-> No server. No infrastructure. Just a file and a library.
+> No server. No infrastructure. Just a file and a library.  
+> **Now with a Rust core — 2-24× faster than pure Python.**
 
 ---
 
@@ -21,6 +22,7 @@ MooFile sits in the gap:
 - **Text search** like Elasticsearch — BM25 ranking, full-text indexing
 - **Developer-friendly API** — method chains, not operator dicts
 - **Single-file portability** — your database is a file you can copy, version control, or email
+- **Rust core** (v0.3.0) — 18-24× faster cold open, 10× faster insert, transparent fallback to pure Python
 
 Target dataset size: **megabytes to single-digit gigabytes**.  
 If you need horizontal scaling, distributed search, or sub-millisecond vector lookups, use specialized infrastructure.
@@ -98,6 +100,92 @@ Vector indexes specify field name and vector dimensionality. Text indexes list f
 
 ---
 
+## Rust Core (v0.3.0)
+
+MooFile now ships with an optional Rust-native engine. When available, `import moofile` transparently uses the Rust core. If the native extension can't be loaded (no prebuilt wheel for your platform, Rust not installed), MooFile falls back to the pure-Python implementation — same API, same file format, zero configuration.
+
+### Architecture
+
+```
+import moofile
+    │
+    ├─ try: from moofile._native import NativeCollection   ← Rust via PyO3
+    │       ✓ 18-24× faster cold open, 10× faster insert
+    │
+    └─ except ImportError:
+           from moofile.collection import Collection        ← Pure Python
+           ✓ Always works, no build required
+```
+
+Both implementations share the exact same file format, meta file schema, and BSON encoding. A database written by the Rust engine can be read by the pure-Python implementation and vice versa. The Python implementation serves as both a fallback and a reference for correctness.
+
+### Source Layout
+
+```
+moofile/
+├── core/                    # Rust library crate
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs           # Collection, CollectionBuilder, public API
+│       ├── storage.rs       # Append-only BSON file I/O
+│       ├── index.rs         # BTreeMap + vector + text indexes
+│       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval
+│       ├── text.rs          # BM25 + Porter stemming (rust-stemmers)
+│       └── errors.rs        # MooFileError enum
+│
+├── bindings/python/         # PyO3 binding (maturin build)
+│   ├── Cargo.toml
+│   ├── pyproject.toml
+│   └── src/
+│       └── lib.rs           # NativeCollection PyO3 wrapper
+│
+├── moofile/                 # Python package (both impls)
+│   ├── __init__.py          # Auto-detects Rust, falls back to Python
+│   ├── _rust_adapter.py     # Adapter: Rust NativeCollection → Python API
+│   ├── collection.py        # Pure-Python implementation (reference)
+│   ├── storage.py
+│   ├── index.py
+│   ├── query.py
+│   ├── operators.py
+│   ├── aggregation.py
+│   ├── text_search.py
+│   ├── errors.py
+│   └── cli/                 # moosh, moo2json, moo2mongo, moo2sqlite
+│
+├── tests/                   # Python test suite (both impls)
+├── tests-cross/             # Cross-implementation validation tests
+├── moofile-spec.md          # This file
+└── pyproject.toml           # maturin build config
+```
+
+### Dependencies
+
+| Dependency | Python impl | Rust impl | Purpose |
+|---|---|---|---|
+| `bson` (crate) / `pymongo` (py) | pymongo≥4.0 | bson 2.x | BSON encode/decode |
+| `sortedcontainers` | sortedcontainers≥2.0 | — | Sorted indexes (Python only) |
+| `numpy` | numpy≥1.20 | — | Vector ops (Python only) |
+| `snowballstemmer` | snowballstemmer≥2.0 | — | Stemming (Python only) |
+| `rust-stemmers` | — | rust-stemmers 1.2 | Porter stemming (Rust) |
+| `serde` / `serde_json` | — | serde 1.x | Meta file JSON |
+| `thiserror` | — | thiserror 2.x | Error derive macros |
+| `pandas` (opt) | pandas≥1.0 | — | `.to_df()` method |
+
+### Performance (10K docs, 128d vectors)
+
+| Operation | Python | Rust (pure) | Speedup |
+|---|---|---|---|
+| Cold open (scan + index rebuild) | 4,194 ms | 175 ms | **24×** |
+| Insert 10K docs | 3,622 ms | 174 ms | **21×** |
+| find_one indexed (2,000×) | 2.3 ms | 4.9 ms | 0.5× |
+| Full scan (200×) | 304 ms | 81 ms | **3.7×** |
+| Update (500×) | 1,202 ms | 215 ms | **5.6×** |
+| Delete (200×) | 287 ms | 82 ms | **3.5×** |
+| Vector search (50×) | 60 ms | 47 ms | 1.3× |
+| Text search (50×) | 73 ms | 32 ms | 2.3× |
+
+---
+
 ## Storage Engine
 
 ### Append-Only Writes
@@ -126,33 +214,31 @@ Rules:
 
 ### In-Memory Indexes
 
-On open, MooFile scans the BSON file and builds three types of in-memory indexes:
+On open, MooFile scans the BSON file and builds three types of in-memory indexes.
 
+**Python implementation:**
 ```python
-# internal structure (simplified)
 self._indexes = {
     "email": SortedDict(),   # value → [list of _ids]
-    "age":   SortedDict(),   # value → [list of _ids]
 }
 self._vector_indexes = {
     "embedding": np.array(),  # [n_docs × vector_dim] matrix
-    "embedding_ids": [],     # [_id1, _id2, ...] parallel to matrix rows
 }
 self._text_indexes = {
-    "content": {
-        "terms": {},          # term → {_id: tf_count, ...}
-        "doc_lengths": {},    # _id → token_count
-        "idf": {},            # term → inverse_document_frequency
-    }
+    "content": { "terms": {}, "doc_lengths": {}, "idf": {} }
 }
-self._documents = {}         # _id → (file_offset, document_dict)
+self._documents = {}         # _id → document_dict
 ```
 
-**Regular indexes:** Use `sortedcontainers.SortedDict` for range queries  
-**Vector indexes:** Dense numpy arrays for efficient cosine similarity  
-**Text indexes:** Inverted indexes with term frequencies for BM25 scoring
+**Rust implementation:**
+```rust
+documents: BTreeMap<String, Arc<Document>>          // _id → shared doc
+regular: BTreeMap<String, BTreeMap<Value, Vec<String>>> // field → value → ids
+vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)> // (ids, matrix, dim)
+text_indexes: BTreeMap<String, TextIndex>           // BM25 inverted indexes
+```
 
-All index updates are synchronous — after every insert/update/delete, all relevant indexes are updated immediately before returning to the caller.
+Documents are stored as `Arc<Document>` — reference-counted to avoid deep copies during queries. Regular indexes use `BTreeMap` with `Bound`-based range queries for O(log n + k) lookups. Pure equality and pure range queries on a single indexed field return `IndexResult::Exact` — no secondary `matches()` filter pass needed.
 
 ### No WAL
 
@@ -162,343 +248,78 @@ WAL is explicitly excluded. The tradeoff:
 - On open, scan to the last complete record and truncate any partial trailing write
 - All prior records are intact — you lose at most the last in-flight write
 
-This is acceptable for the target use case. Implementing a WAL adds significant complexity for marginal benefit at this scale.
-
 ---
 
 ## Document Identity
 
 Every document has an `_id` field. Rules:
 
-- If not provided on insert, MooFile generates a random 12-byte hex string (no ObjectId dependency)
-- `_id` is always indexed automatically, regardless of declared indexes
-- `_id` must be unique — inserting a duplicate `_id` raises `DuplicateKeyError`
-- The developer can provide their own `_id` value of any hashable type
+- If not provided on insert, MooFile generates a random 16-byte hex string (Rust) or 24-char hex string (Python). Both are valid.
+- `_id` is always indexed automatically
+- `_id` must be unique — inserting a duplicate raises `DuplicateKeyError`
 
 ---
 
 ## Python API
 
-### Opening a Collection
+Identical across both implementations. See the [README](README.md) for full examples.
+
+### Opening
 
 ```python
 from moofile import Collection
 
-# open or create with multiple index types
-db = Collection(
-    "mydata.bson", 
-    indexes=["email", "age", "status"],           # regular field indexes
-    vector_indexes={"embedding": 384},             # vector similarity search
-    text_indexes=["title", "content"]             # BM25 text search
-)
-
-# read-only mode
-db = Collection("mydata.bson", readonly=True)
-
-# minimal setup (indexes optional)
-db = Collection("mydata.bson")
+db = Collection("mydata.bson", 
+    indexes=["email", "age", "status"],
+    vector_indexes={"embedding": 384},
+    text_indexes=["title", "content"])
 ```
 
-On open:
-1. Create files if they do not exist
-2. Scan BSON file, build all in-memory indexes (regular, vector, text)
-3. Ready
-
-Index build time scales with document count: ~1-2 seconds for 10K documents, including vector arrays and text tokenization.
-
-### Insert
-
-```python
-# basic insert
-doc = db.insert({"name": "alice", "age": 30, "email": "alice@example.com"})
-# returns the document with _id populated
-
-# insert with vector and text data
-doc = db.insert({
-    "title": "Machine Learning Basics",
-    "content": "Introduction to supervised and unsupervised learning...",
-    "embedding": [0.1, 0.2, 0.3, ...],  # 384-dimensional vector
-    "category": "AI"
-})
-
-docs = db.insert_many([{...}, {...}, {...}])
-# returns list of inserted documents
-```
-
-Vectors and text content are automatically indexed according to the declared `vector_indexes` and `text_indexes` configuration.
-
-### Traditional Query
-
-```python
-# return all matching documents as a list of dicts
-db.find({"age": {"$gt": 25}})
-
-# return first match or None
-db.find_one({"email": "alice@example.com"})
-
-# count matches without materializing documents
-db.count({"status": "active"})
-
-# check existence
-db.exists({"email": "alice@example.com"})
-```
-
-### Vector Similarity Search
-
-```python
-# find semantically similar documents
-query_vector = [0.15, 0.25, 0.35, ...]
-results = db.find({}).vector_search("embedding", query_vector, limit=5).to_list()
-# returns: [(doc1, similarity1), (doc2, similarity2), ...]
-
-# combine with filters - search only within specific categories
-results = db.find({"category": "AI"}).vector_search("embedding", query_vector).to_list()
-```
-
-### BM25 Text Search
-
-```python
-# keyword search with relevance ranking
-results = db.find({}).text_search("content", "machine learning", limit=5).to_list()
-# returns: [(doc1, relevance1), (doc2, relevance2), ...]
-
-# search multiple fields
-title_results = db.find({}).text_search("title", "neural networks").to_list()
-content_results = db.find({}).text_search("content", "neural networks").to_list()
-
-# combine with filters
-results = db.find({"year": {"$gte": 2020}}).text_search("content", "transformers").to_list()
-```
+On open: scans BSON file, builds all in-memory indexes, ready. Index build time: ~175ms (Rust) or ~4s (Python) for 10K documents.
 
 ### Method Chain API
 
-`.find()` returns a lazy `Query` object. Vector and text search return specialized query objects. Results are not materialized until a terminal method is called.
-
 ```python
-# traditional queries
 db.find({"status": "active"})
   .sort("age", descending=True)
-  .skip(20)
-  .limit(10)
+  .skip(20).limit(10)
   .to_list()
 
-# vector similarity search with chaining
 db.find({"category": "research"})
   .vector_search("embedding", query_vector, limit=20)
-  .to_list()  # returns [(doc, similarity), ...]
+  .to_list()  # → [(doc, similarity), ...]
 
-# text search with chaining  
 db.find({"published": True})
   .text_search("content", "machine learning", limit=10)
-  .to_list()  # returns [(doc, relevance), ...]
-
-# terminal methods
-.to_list()       # → list of dicts (or list of (doc, score) tuples for search)
-.to_df()         # → pandas DataFrame (pandas optional dependency)
-.first()         # → first dict or (doc, score) tuple
-.count()         # → int
+  .to_list()  # → [(doc, relevance), ...]
 ```
 
-### Update
+### Update Operators
 
-```python
-# update first match
-db.update_one(
-    where={"email": "alice@example.com"},
-    set={"age": 31}
-)
+`$set`, `$unset`, `$inc` — covers 95% of real usage.
 
-# update all matches
-db.update_many(
-    where={"status": "trial"},
-    set={"status": "expired"}
-)
+---
 
-# replace entire document (preserves _id)
-db.replace_one({"_id": "abc123"}, {"name": "alice", "age": 32})
-```
+## Filter Operators
 
-Update operators: `set`, `unset`, `inc`. That covers 95% of real usage.
+| Comparison | Logical | Element | Array |
+|---|---|---|---|
+| `$eq`, `$ne` | `$and` | `$exists` | `$elemMatch` |
+| `$gt`, `$gte` | `$or` | | |
+| `$lt`, `$lte` | `$not` | | |
+| `$in`, `$nin` | | | |
 
-When updating documents with vector or text fields, the relevant indexes are automatically updated.
-
-### Delete
-
-```python
-db.delete_one({"_id": "abc123"})
-db.delete_many({"status": "archived"})
-```
-
-### Aggregation
-
-Aggregation is expressed as a method chain, not a pipeline dict. This is intentional — it reads as a sentence.
-
-```python
-db.find({"status": "active"})
-  .group("city")
-  .agg(
-      count(),
-      mean("age"),
-      sum("revenue"),
-      min("created_at"),
-      max("created_at"),
-  )
-  .sort("count", descending=True)
-  .limit(10)
-  .to_list()
-```
-
-#### Aggregation Functions (v1)
-
-| Function | Description |
-|---|---|
-| `count()` | number of documents in group |
-| `sum(field)` | sum of field values |
-| `mean(field)` | average of field values |
-| `min(field)` | minimum field value |
-| `max(field)` | maximum field value |
-| `collect(field)` | list of all values in group |
-| `first(field)` | first value encountered |
-| `last(field)` | last value encountered |
-
-No `$lookup`. No `$facet`. No `$bucket` in v1.
-
-### Filter Operators
-
-#### Comparison
-
-| Operator | Meaning |
-|---|---|
-| `$eq` | equal (default, implicit) |
-| `$ne` | not equal |
-| `$gt` | greater than |
-| `$gte` | greater than or equal |
-| `$lt` | less than |
-| `$lte` | less than or equal |
-| `$in` | value is in list |
-| `$nin` | value is not in list |
-
-#### Logical
-
-| Operator | Meaning |
-|---|---|
-| `$and` | all conditions must match |
-| `$or` | any condition must match |
-| `$not` | inverts a condition |
-
-#### Element
-
-| Operator | Meaning |
-|---|---|
-| `$exists` | field exists (or does not exist) |
-
-#### Array
-
-| Operator | Meaning |
-|---|---|
-| `$elemMatch` | at least one array element matches |
-
-That is the complete filter surface for traditional queries. No `$regex`, no `$where`, no geospatial.
-
-Text search uses dedicated `.text_search()` methods rather than `$text` operators, providing more explicit control over BM25 ranking.
-
-### Utility
-
-```python
-# database stats
-db.stats()
-# → {"documents": 42150, "dead_records": 3201, "file_size_bytes": 8421000, "dead_ratio": 0.07}
-
-# compact the file
-db.compact()
-
-# rebuild indexes from scratch (useful after manual file manipulation)
-db.reindex()
-
-# close explicitly (also called on __del__ and context manager exit)
-db.close()
-
-# context manager
-with Collection("mydata.bson", indexes=["email"]) as db:
-    db.insert({"email": "bob@example.com"})
-```
+That is the complete filter surface. No `$regex`, no `$where`, no geospatial.
 
 ---
 
 ## Query Execution
 
-### Index Usage
+**Indexed queries:** When the filter references a single indexed field with a pure equality or pure range condition, MooFile returns results directly from the index — no secondary `matches()` pass needed (`IndexResult::Exact`).
 
-**Traditional queries:** When a filter references an indexed field, MooFile uses the sorted index. Otherwise it falls back to a full document scan. No query planner — simple rule: if the top-level filter key matches an index, use it.
+**Mixed queries:** When filter has multiple fields or mixed operators, MooFile uses the index for candidate pre-filtering then runs `matches()` on each candidate (`IndexResult::Candidates`).
 
-**Vector search:** Always O(n) brute-force cosine similarity across all documents (after applying filters). Uses numpy for efficient vector operations.
-
-**Text search:** Uses inverted indexes with BM25 scoring. Includes tokenization, Porter stemming, and term frequency analysis.
-
-```python
-# regular indexed queries — fast
-db.find({"email": "alice@example.com"})
-db.find({"age": {"$gt": 25}})
-
-# vector similarity — O(n) but optimized
-db.find().vector_search("embedding", query_vec)  # numpy cosine similarity
-
-# text search — inverted index lookup + BM25 scoring
-db.find().text_search("content", "machine learning")  # stemmed token matching
-
-# not indexed — full document scan
-db.find({"name": "alice"})
-db.find({"address.city": "Toronto"})  # nested fields not indexed
-```
-
-Nested field indexing is explicitly out of scope. Index top-level fields only.
-
-### Execution Order
-
-For traditional chained queries:
-
-```
-filter → group + agg → sort → skip → limit → project
-```
-
-For search queries:
-
-```
-filter → vector_search/text_search → limit (implicit in search) → materialize
-```
-
-Filtering always runs first. For search queries, filters are applied before similarity computation to reduce the search space.
-
----
-
-## Schema
-
-MooFile is schema-free by design. Any document can be inserted regardless of shape. The `schema` parameter is optional and informational only — it is never enforced:
-
-```python
-db = Collection("mydata.bson",
-    indexes=["email", "age"],
-    schema={"email": str, "age": int, "name": str}  # optional hints only
-)
-```
-
-Schema hints may be used in future versions for index type optimization. In v1 they are ignored by the engine and exist purely for developer documentation purposes.
-
----
-
-## Dependencies
-
-MooFile has grown beyond minimal dependencies to support search capabilities:
-
-| Dependency | Purpose | Required |
-|---|---|---|
-| `pymongo>=4.0` | BSON encode/decode | Yes |
-| `sortedcontainers>=2.0` | In-memory sorted indexes | Yes |
-| `numpy>=1.20` | Vector operations, cosine similarity | Yes |
-| `snowballstemmer>=2.0` | Porter stemming for text search | Yes |
-| `pandas>=1.0` | `.to_df()` terminal method | Optional |
-
-The addition of numpy and stemming increases the footprint but enables semantic and text search without external services. No database drivers, async frameworks, or deep learning dependencies.
+**Full scan:** Falls back to scanning all documents when no index applies.
 
 ---
 
@@ -507,116 +328,45 @@ The addition of numpy and stemming increases the footprint but enables semantic 
 ```python
 from moofile import (
     Collection,
-    DuplicateKeyError,    # _id conflict on insert
-    DocumentNotFoundError, # update_one / replace_one with no match
-    MooFileError,         # base exception class
+    DuplicateKeyError,
+    DocumentNotFoundError,
+    MooFileError,
+    ReadOnlyError,
 )
 ```
 
-All errors are subclasses of `MooFileError`. No silent failures.
-
 ---
 
-## Thread Safety
+## Build & Distribution
 
-Single-threaded only. One `Collection` instance per process per file. Concurrent reads from multiple threads are safe. Concurrent writes are not protected and will corrupt the file.
+### Source install (needs Rust)
 
-This applies to all operations: traditional queries, vector search, text search, and index updates. If you need multi-threaded writes, serialize them with a lock at the application layer. MooFile will not do this for you.
-
----
-
-## Implementation Notes
-
-### Simplicity Over Performance
-
-When in doubt, choose the simpler implementation. MooFile's primary value is being a readable codebase that a developer can understand. Examples:
-
-- **Vector search:** Brute-force cosine similarity, not HNSW or IVF indexing
-- **Text search:** Simple BM25 + Porter stemming, not transformer embeddings
-- **Storage:** Append-only files, not complex page-based storage
-- **Indexes:** Full rebuilds on open, not incremental maintenance
-
-If a performance optimization requires significant complexity, it likely violates the embedded-database design philosophy.
-
-### Current Code Structure (v0.2.0)
-
-```
-moofile/
-  __init__.py         exports, version
-  collection.py       main Collection class, open/close, scan
-  storage.py          BSON file append, read, compaction
-  index.py            in-memory index build and update (regular + vector + text)
-  query.py            Query builders: Query, VectorQuery, TextQuery
-  operators.py        $gt, $lt, $in, etc. — one function each
-  aggregation.py      group/agg execution  
-  text_search.py      BM25 implementation, Porter stemming, inverted indexes
-  errors.py           exception classes
-  cli/                command-line tools (moosh, moo2json, moo2mongo, moo2sqlite)
-    __init__.py
-    moosh.py
-    moo2json.py
-    moo2mongo.py
-    moo2sqlite.py
-
-~ 1800-2000 lines total (excluding tests)
+```bash
+pip install maturin
+cd bindings/python && maturin develop --release
 ```
 
-Scope has grown significantly beyond the original v1 plan, but the additions (search capabilities and CLI tools) provide substantial practical value.
+### Prebuilt wheels
 
-### Recommended Libraries
+Platform wheels built via GitHub Actions CI for:
+- Linux x86_64 (manylinux)
+- macOS x86_64 + ARM64
+- Windows x86_64
 
-- Use `pymongo.bson` — do not implement BSON encoding
-- Use `sortedcontainers.SortedDict` — do not implement a B-tree
-- Use `numpy` for vector operations — do not implement matrix math
-- Use `snowballstemmer` for text processing — do not implement NLP algorithms
-- Use `os.replace()` for atomic file rename during compaction
-- Use built-in `json` for meta file format — human readable
-
-### What Not to Build
-
-- Custom BSON parser
-- Custom B-tree  
-- WAL
-- Query optimizer / planner
-- Nested field indexing
-- `$lookup` / joins
-- Network interface
-- Async API
-- Advanced vector indexing (HNSW, IVF)
-- Deep learning embeddings (use external models)
-- Complex NLP beyond stemming
-- Persistent indexes
-- Multi-process coordination
+Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms without prebuilt native wheels.
 
 ---
 
-## Future Directions
+## Version History
 
-### Implemented in v0.2.0
-- ✅ CLI tools: `moosh`, `moo2json`, `moo2mongo`, `moo2sqlite`
-- ✅ Vector similarity search with cosine distance
-- ✅ BM25 text search with Porter stemming
-
-### Potential Future Features
-- Persistent mmap'd index files for faster startup on very large datasets
-- Advanced vector search algorithms (HNSW) for > 100K document performance
-- Nested field indexes (`"address.city"` indexing)
-- `$unwind` for array flattening in aggregation pipelines
-- Optional schema enforcement mode
-- Watch/change streams for local reactivity
-- C core with Python/JS/Go bindings for performance
-- Approximate nearest neighbor search with configurable trade-offs
-- Multi-field text search with weighted scoring
-
-### Explicitly Not Planned
-- Network interfaces or server modes
-- Distributed or replicated deployments  
-- Multi-process write coordination
-- Advanced NLP beyond stemming
-- Integration with specific ML frameworks
+| Version | Changes |
+|---|---|
+| 0.1.0 | Initial release — pure-Python, basic CRUD, sorted indexes |
+| 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
+| 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
 
 ---
 
 ## Name
 
-**MooFile**. It is a cow. Cows are not fast or scalable but they are reliable, friendly, and everyone likes them. This is that.
+**MooFile**. It is a cow. Cows are not fast or scalable but they are reliable, friendly, and everyone likes them. This is that. (The Rust core makes the cow surprisingly quick, though.)

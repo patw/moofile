@@ -1,0 +1,30 @@
+[package]
+name = "moofile-core"
+version = "0.3.0"
+edition = "2021"
+description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
+license = "MIT"
+repository = "https://github.com/patw/moofile"
+keywords = ["database", "embedded", "document-store", "bson", "vector-search"]
+categories = ["database-implementations", "embedded"]
+
+[lib]
+name = "moofile"
+path = "src/lib.rs"
+
+[dependencies]
+bson = "2"
+rust-stemmers = "1.2"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex-lite = "0.1"
+getrandom = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"

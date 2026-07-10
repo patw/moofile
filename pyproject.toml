@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "moofile"
-version = "0.2.1"
+version = "0.3.0"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
-readme = "docs/README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 authors = [
     {name = "Pat Wendorf", email = "dungeons@gmail.com"}
@@ -22,6 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Text Processing :: Indexing",
@@ -48,6 +49,8 @@ moo2json   = "moofile.cli.json_tool:main"
 moo2mongo  = "moofile.cli.mongo_tool:main"
 moo2sqlite = "moofile.cli.sqlite_tool:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["moofile*"]
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "."
+module-name = "moofile._native"
+features = []

@@ -1,0 +1,13 @@
+[package]
+name = "moofile-py"
+version = "0.3.0"
+edition = "2021"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+moofile-core = { path = "../../core", package = "moofile-core" }
+pyo3 = { version = "0.24", features = ["extension-module"] }
+bson = "2"

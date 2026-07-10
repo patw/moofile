@@ -14,7 +14,6 @@ MooFile — lightweight embedded document store.
 """
 
 from .aggregation import collect, count, first, last, max, mean, min, sum
-from .collection import Collection
 from .errors import (
     DocumentNotFoundError,
     DuplicateKeyError,
@@ -23,6 +22,25 @@ from .errors import (
 )
 
 __version__ = "0.2.1"
+
+# --- Try the Rust native backend first ---
+_NATIVE_LOADED = False
+try:
+    from moofile._native import NativeCollection as _NativeCollection  # type: ignore[import-untyped]
+    from moofile._rust_adapter import Collection as _RustCollection
+
+    _NATIVE_LOADED = True
+except ImportError:
+    pass
+
+if _NATIVE_LOADED:
+    # Patch the adapter with the native class
+    import moofile._rust_adapter as _adapter
+
+    _adapter._NativeCollection = _NativeCollection
+    Collection = _RustCollection  # type: ignore[misc]
+else:
+    from .collection import Collection  # type: ignore[no-redef]
 
 __all__ = [
     # Core
