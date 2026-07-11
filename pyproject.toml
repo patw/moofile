@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "moofile"
-version = "0.3.3"
+version = "0.3.4"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 readme = "README.md"

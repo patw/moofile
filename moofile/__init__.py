@@ -21,7 +21,7 @@ from .errors import (
     ReadOnlyError,
 )
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 # --- Try the Rust native backend first ---
 _NATIVE_LOADED = False
