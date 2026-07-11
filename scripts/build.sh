@@ -68,7 +68,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moofile"
-version = "0.3.0"
+version = "0.3.5"
 requires-python = ">=3.10"
 dependencies = [
     "pymongo>=4.0",

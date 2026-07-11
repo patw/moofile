@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "moofile"
-version = "0.3.4"
+version = "0.3.5"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 readme = "README.md"
@@ -22,6 +22,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Rust",
     "Topic :: Database",
     "Topic :: Software Development :: Libraries :: Python Modules",
