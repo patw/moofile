@@ -1,6 +1,6 @@
 [package]
 name = "moofile-core"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 license = "MIT"
