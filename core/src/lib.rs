@@ -39,6 +39,7 @@ mod text;
 
 pub use errors::MooFileError;
 pub use query::{AggFunc, Query, TextQuery, VectorQuery};
+pub use storage::Durability;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,6 +61,7 @@ pub struct CollectionBuilder {
     vector_indexes: Vec<(String, usize)>,
     text_indexes: Vec<String>,
     readonly: bool,
+    durability: Durability,
 }
 
 impl CollectionBuilder {
@@ -70,6 +72,7 @@ impl CollectionBuilder {
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
             readonly: false,
+            durability: Durability::Os,
         }
     }
 
@@ -100,6 +103,11 @@ impl CollectionBuilder {
         self
     }
 
+    pub fn durability(mut self, d: Durability) -> Self {
+        self.durability = d;
+        self
+    }
+
     pub fn open(self) -> Result<Collection, MooFileError> {
         Collection::open_inner(
             &self.path,
@@ -107,6 +115,7 @@ impl CollectionBuilder {
             &self.vector_indexes,
             &self.text_indexes,
             self.readonly,
+            self.durability,
         )
     }
 }
@@ -132,6 +141,9 @@ struct CollectionInner {
     loaded_from_cache: bool,
     /// True if any write (insert/update/delete) has occurred since open.
     dirty: bool,
+    /// Advisory lock file handle — held open to prevent concurrent multi-process
+    /// access.  The OS releases the lock when this file descriptor is closed.
+    _lock_file: Option<fs::File>,
 }
 
 impl Collection {
@@ -141,6 +153,12 @@ impl Collection {
 
     pub fn builder(path: impl Into<PathBuf>) -> CollectionBuilder {
         CollectionBuilder::new(path)
+    }
+
+    /// Return the data file path.
+    pub fn path(&self) -> PathBuf {
+        let inner = self.inner.read().expect("lock poisoned");
+        inner.path.clone()
     }
 
     pub fn open(
@@ -165,8 +183,38 @@ impl Collection {
         vector_indexes: &[(String, usize)],
         text_indexes: &[String],
         readonly: bool,
+        durability: Durability,
     ) -> Result<Self, MooFileError> {
         let meta_path = path.with_extension("bson.meta");
+
+        // --- Advisory file lock to prevent silent corruption from
+        //     multi-process access.  Two processes opening the same file
+        //     would silently interleave appends and corrupt the BSON. ---
+        let lock_path = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".lock");
+            PathBuf::from(s)
+        };
+        let _lock_file = {
+            use fs4::fs_std::FileExt;
+            // Always open the lock file with create+write so it can be
+            // created if it doesn't exist yet.  The lock type (shared vs
+            // exclusive) is what controls access, not the open mode.
+            let lf = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| crate::errors::io_err(&lock_path, e))?;
+            if readonly {
+                lf.try_lock_shared()
+                    .map_err(|_| MooFileError::ConcurrentAccess(lock_path.clone()))?;
+            } else {
+                lf.try_lock_exclusive()
+                    .map_err(|_| MooFileError::ConcurrentAccess(lock_path.clone()))?;
+            }
+            Some(lf)
+        };
 
         if !readonly && !path.exists() {
             fs::write(path, &[]).map_err(|e| crate::errors::io_err(path, e))?;
@@ -187,7 +235,7 @@ impl Collection {
             save_meta(&meta_path, &merged_indexes, &merged_vector, &merged_text)?;
         }
 
-        let mut storage = StorageEngine::open(path, readonly)?;
+        let mut storage = StorageEngine::open(path, readonly, durability)?;
 
         // --- Try the disposable cache first ---
         let (index_manager, total_records, loaded_from_cache) =
@@ -219,6 +267,7 @@ impl Collection {
                 closed: false,
                 loaded_from_cache,
                 dirty: false,
+                _lock_file,
             })),
         })
     }
@@ -454,6 +503,21 @@ impl Collection {
         Ok(())
     }
 
+    /// Flush and fsync the data file, ensuring all buffered writes are
+    /// durable on disk.
+    ///
+    /// With [`Durability::Os`] (default) or [`Durability::None`], writes
+    /// are only flushed to the OS page cache.  This method forces an
+    /// `fsync`, making all prior writes durable across power loss.
+    ///
+    /// Useful for batched durability: insert many documents with the fast
+    /// default durability, then call `sync()` once.
+    pub fn sync(&self) -> Result<(), MooFileError> {
+        let inner = self.inner.write().expect("lock poisoned");
+        inner.require_open()?;
+        inner.storage.sync()
+    }
+
     pub fn compact(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
@@ -571,6 +635,7 @@ impl Collection {
             }
         }
 
+        inner._lock_file = None; // release advisory lock
         inner.closed = true;
         Ok(())
     }
@@ -664,7 +729,7 @@ struct MetaFile {
     #[serde(default)]
     indexes: Vec<String>,
     #[serde(default)]
-    vector_indexes: Vec<(String, usize)>,
+    vector_indexes: std::collections::HashMap<String, usize>,
     #[serde(default)]
     text_indexes: Vec<String>,
 }
@@ -706,7 +771,11 @@ fn merge_meta(
         }
     }
 
-    let mut vector = existing.vector_indexes;
+    // Convert existing HashMap to Vec and merge with declared.
+    let mut vector: Vec<(String, usize)> = existing
+        .vector_indexes
+        .into_iter()
+        .collect();
     for (field, dim) in declared_vector {
         if !vector.iter().any(|(f, _)| f == field) {
             vector.push((field.clone(), *dim));
@@ -784,18 +853,20 @@ fn generate_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    let mut buf = [0u8; 8];
-    getrandom::fill(&mut buf).unwrap_or_else(|_| {
+    // 12 random bytes → 24 hex chars, matching the Python implementation.
+    let mut buf = [0u8; 12];
+    getrandom::fill(&mut buf[..8]).unwrap_or_else(|_| {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        buf = (ns as u64).to_le_bytes();
+        buf[..8].copy_from_slice(&(ns as u64).to_le_bytes());
     });
-
+    // Mix in a counter for uniqueness within the same nanosecond.
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let raw = u64::from_le_bytes(buf) ^ counter;
-    format!("{raw:016x}")
+    buf[8..].copy_from_slice(&counter.to_le_bytes()[..4]);
+
+    hex::encode(buf)
 }
 
 // ---------------------------------------------------------------------------

@@ -15,3 +15,7 @@ class DocumentNotFoundError(MooFileError):
 
 class ReadOnlyError(MooFileError):
     """Raised when attempting a write operation on a read-only collection."""
+
+
+class ConcurrentAccessError(MooFileError):
+    """Raised when the database file is already open by another process."""

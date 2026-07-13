@@ -65,7 +65,15 @@ def compact(path: str, live_docs: list) -> None:
         with open(tmp_path, "wb") as f:
             for doc in live_docs:
                 f.write(encode_record(RECORD_LIVE, doc))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
+        # fsync parent directory so the rename is durable across power loss
+        dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
         if os.path.exists(tmp_path):
             try:
@@ -78,9 +86,10 @@ def compact(path: str, live_docs: list) -> None:
 class StorageEngine:
     """Handles append-only writes to the BSON file."""
 
-    def __init__(self, path: str, readonly: bool = False) -> None:
+    def __init__(self, path: str, readonly: bool = False, durability: str = "os") -> None:
         self.path = path
         self.readonly = readonly
+        self.durability = durability
         self._file = None
         self._open_file()
 
@@ -96,7 +105,18 @@ class StorageEngine:
             raise ReadOnlyError("Collection is open in read-only mode")
         data = encode_record(record_type, doc)
         self._file.write(data)
-        self._file.flush()
+        if self.durability == "os":
+            self._file.flush()
+        elif self.durability == "fsync":
+            self._file.flush()
+            os.fsync(self._file.fileno())
+        # durability == "none": no flush at all
+
+    def sync(self) -> None:
+        """Flush and fsync the data file, ensuring durability on disk."""
+        if self._file is not None:
+            self._file.flush()
+            os.fsync(self._file.fileno())
 
     def close(self) -> None:
         if self._file is not None:

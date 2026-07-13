@@ -23,6 +23,8 @@ getrandom = "0.3"
 log = "0.4"
 rayon = "1"
 bincode = "1"
+fs4 = "0.12"
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

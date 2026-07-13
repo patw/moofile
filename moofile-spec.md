@@ -33,7 +33,7 @@ If you need horizontal scaling, distributed search, or sub-millisecond vector lo
 
 - No network interface or server mode — ever
 - No replication or clustering
-- No multi-process concurrent writes
+- No multi-process concurrent writes — detected and rejected with `ConcurrentAccessError` rather than silently corrupting data
 - No `$lookup` / joins — denormalize your data
 - No SQL compatibility
 - No full MongoDB MQL parity — implement the 80%, skip the 20% nobody uses
@@ -45,12 +45,15 @@ If you need horizontal scaling, distributed search, or sub-millisecond vector lo
 
 ## File Layout
 
-A MooFile database is two files:
+A MooFile database is three files:
 
 ```
 mydata.bson       ← append-only document store, source of truth
 mydata.bson.meta  ← index configuration (regular, vector, and text indexes)
+mydata.bson.lock  ← advisory lock file (prevents concurrent multi-process access)
 ```
+
+The `.lock` file is disposable — safe to delete, it will be re-created on next open. It exists only to detect and reject concurrent access from another process.
 
 Indexes are **never persisted**. They are rebuilt in memory on every open by scanning the BSON file. This includes regular field indexes, vector indexes for similarity search, and inverted text indexes for BM25 ranking. The BSON file is always the source of truth. If the meta file is lost or corrupt, delete it and reopen — it will be rebuilt.
 
@@ -235,7 +238,8 @@ db.compact()  # explicit, never automatic
 
 Rules:
 - Never runs automatically — the developer decides when
-- Writes to a `.tmp` file first, then atomically renames
+- Writes to a `.tmp` file first, fsyncs it, then atomically renames
+- fsyncs the parent directory so the rename is durable across power loss
 - Safe to interrupt — if it fails, original file is untouched
 - Recommended when dead space exceeds ~30% of file size (check via `db.stats()`)
 
@@ -274,6 +278,39 @@ WAL is explicitly excluded. The tradeoff:
 - A crash mid-write may corrupt the final record in the BSON file
 - On open, scan to the last complete record and truncate any partial trailing write
 - All prior records are intact — you lose at most the last in-flight write
+
+### Durability Modes
+
+The default `durability="os"` flushes writes to the OS page cache, which survives process crashes but **not** power loss. With the default, the "you lose at most the last in-flight write" claim applies to process crashes only — a power loss can lose any writes still in the page cache.
+
+For applications that need power-loss durability, MooFile offers three durability levels:
+
+| Mode | Behavior | Survives | Equivalent |
+|---|---|---|---|
+| `durability="none"` | No flush — data in userspace buffer | Nothing | SQLite `synchronous=OFF` |
+| `durability="os"` (default) | `flush()` → OS page cache | Process crash | SQLite `synchronous=NORMAL` |
+| `durability="fsync"` | `sync_all()` after every write | Power loss | SQLite `synchronous=FULL` |
+
+For batched durability (best of both worlds), use the default and call `db.sync()` after a batch of writes:
+
+```python
+db = Collection("data.bson", durability="os")
+for doc in docs:
+    db.insert(doc)
+db.sync()  # fsync once — all inserts are now durable
+```
+
+Compaction always fsyncs the temporary file and parent directory regardless of the durability setting, because it is a destructive rewrite of the entire file.
+
+### Advisory File Locking
+
+Multi-process concurrent writes are a non-goal, but two processes opening the same file would silently interleave appends and corrupt the BSON file. MooFile detects this situation and raises `ConcurrentAccessError` instead of silently corrupting data.
+
+On open, MooFile acquires an advisory lock on `mydata.bson.lock`:
+- Write mode → exclusive lock (`LOCK_EX`)
+- Read-only mode → shared lock (`LOCK_SH`)
+
+Multiple read-only opens are fine. One writer OR multiple readers, never both. The lock is released automatically when the collection is closed or the process exits.
 
 ---
 
@@ -359,6 +396,7 @@ from moofile import (
     DocumentNotFoundError,
     MooFileError,
     ReadOnlyError,
+    ConcurrentAccessError,
 )
 ```
 

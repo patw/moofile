@@ -38,6 +38,25 @@ pub(crate) const RECORD_REPLACEMENT: u8 = 0x03;
 const HEADER_SIZE: usize = 5;
 
 // ---------------------------------------------------------------------------
+// Durability
+// ---------------------------------------------------------------------------
+
+/// Write durability level.
+///
+/// - [`Durability::None`] — no flush at all; data sits in the userspace
+///   buffer.  Fastest, but a process crash can lose buffered writes.
+/// - [`Durability::Os`] — flush to the OS page cache (the default).
+///   Survives process crashes but **not** power loss.
+/// - [`Durability::Fsync`] — `sync_all()` after every write.  Durable
+///   across power loss, but significantly slower for per-document inserts.
+#[derive(Clone, Copy, Debug)]
+pub enum Durability {
+    None,
+    Os,
+    Fsync,
+}
+
+// ---------------------------------------------------------------------------
 // Raw record encoding / decoding
 // ---------------------------------------------------------------------------
 
@@ -101,8 +120,14 @@ pub(crate) fn scan_file(path: &Path) -> Result<(Vec<Record>, Option<u64>), MooFi
         let payload_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let record_type = buf[4];
 
-        // Sanity check: don't allocate gigabytes based on corrupt length
+        // Sanity check: don't allocate gigabytes based on corrupt length.
+        // But if the claimed length extends past EOF, treat it as a
+        // partial write (truncation) rather than corruption — this
+        // matches the Python implementation's behaviour.
         if payload_len > 100 * 1024 * 1024 {
+            if offset + HEADER_SIZE as u64 + payload_len as u64 > file_len {
+                return Ok((records, Some(offset)));
+            }
             return Err(MooFileError::CorruptRecord {
                 offset,
                 reason: format!("implausible payload length {payload_len} bytes"),
@@ -157,13 +182,27 @@ pub(crate) fn compact(path: &Path, live_docs: &[Document]) -> Result<(), MooFile
     }
 
     f.flush().map_err(|e| errors::io_err(&tmp_path, e))?;
+    // fsync the tmp file so its contents are durable on disk before the
+    // rename.  Without this, a power loss after the rename could leave
+    // the new file pointing to unallocated/zeroed blocks.
+    f.sync_all().map_err(|e| errors::io_err(&tmp_path, e))?;
     drop(f);
 
     fs::rename(&tmp_path, path).map_err(|e| {
         // Best-effort cleanup of the temp file on failure.
         let _ = fs::remove_file(&tmp_path);
         errors::io_err(path, e)
-    })
+    })?;
+
+    // fsync the parent directory so the rename (a directory entry update)
+    // is durable across power loss.  Without this, a power loss could
+    // result in the old file being gone but the new name not yet visible.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    if let Ok(parent_file) = File::open(parent) {
+        let _ = parent_file.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Truncate a file at the given byte offset.
@@ -184,17 +223,19 @@ pub(crate) fn truncate(path: &Path, at: u64) -> Result<(), MooFileError> {
 pub(crate) struct StorageEngine {
     path: PathBuf,
     readonly: bool,
+    durability: Durability,
     file: Option<File>,
 }
 
 impl StorageEngine {
     /// Open (or create) the BSON data file.
-    pub fn open(path: &Path, readonly: bool) -> Result<Self, MooFileError> {
+    pub fn open(path: &Path, readonly: bool, durability: Durability) -> Result<Self, MooFileError> {
         if readonly {
             let file = File::open(path).map_err(|e| errors::io_err(path, e))?;
             Ok(Self {
                 path: path.to_path_buf(),
                 readonly,
+                durability,
                 file: Some(file),
             })
         } else {
@@ -207,6 +248,7 @@ impl StorageEngine {
             Ok(Self {
                 path: path.to_path_buf(),
                 readonly: false,
+                durability,
                 file: Some(file),
             })
         }
@@ -222,7 +264,25 @@ impl StorageEngine {
         let f = self.file.as_mut().expect("StorageEngine: file handle missing");
         f.write_all(&data)
             .map_err(|e| errors::io_err(&self.path, e))?;
-        f.flush().map_err(|e| errors::io_err(&self.path, e))?;
+        match self.durability {
+            Durability::None => {}
+            Durability::Os => {
+                f.flush().map_err(|e| errors::io_err(&self.path, e))?;
+            }
+            Durability::Fsync => {
+                f.sync_all().map_err(|e| errors::io_err(&self.path, e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush and fsync the file, ensuring all buffered writes are durable
+    /// on disk.  Useful with [`Durability::Os`] or [`Durability::None`] to
+    /// batch durability: insert many documents, then call `sync()` once.
+    pub fn sync(&self) -> Result<(), MooFileError> {
+        if let Some(f) = &self.file {
+            f.sync_all().map_err(|e| errors::io_err(&self.path, e))?;
+        }
         Ok(())
     }
 
@@ -409,7 +469,7 @@ mod tests {
         let dir = setup_dir();
         let path = dir.path().join("engine.bson");
 
-        let mut engine = StorageEngine::open(&path, false).unwrap();
+        let mut engine = StorageEngine::open(&path, false, Durability::Os).unwrap();
         let doc = doc! { "_id": "1", "hello": "world" };
         engine.append(RECORD_LIVE, &doc).unwrap();
 
@@ -433,7 +493,7 @@ mod tests {
         let path = dir.path().join("ro.bson");
         File::create(&path).unwrap();
 
-        let mut engine = StorageEngine::open(&path, true).unwrap();
+        let mut engine = StorageEngine::open(&path, true, Durability::Os).unwrap();
         let result = engine.append(RECORD_LIVE, &doc! {"_id": "x"});
         assert!(result.is_err());
         match result.unwrap_err() {

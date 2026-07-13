@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 moofile-core = { path = "../../core", package = "moofile-core" }
 pyo3 = { version = "0.24", features = ["extension-module"] }
 bson = "2"
+serde_json = "1"

@@ -139,6 +139,19 @@ fn eval_field_condition(field_val: Option<&Bson>, condition: &Bson) -> bool {
                             return false;
                         }
                     }
+                    "$elemMatch" => {
+                        let sub_filter = match op_val.as_document() {
+                            Some(d) => d,
+                            None => return false,
+                        };
+                        let arr = match field_val {
+                            Some(Bson::Array(arr)) => arr,
+                            _ => return false,
+                        };
+                        if !arr.iter().any(|elem| elem_matches(elem, sub_filter)) {
+                            return false;
+                        }
+                    }
                     _ => {
                         // Unknown operator — reject
                         return false;
@@ -158,6 +171,16 @@ fn is_operator_doc(val: &Bson) -> bool {
     match val {
         Bson::Document(d) => d.keys().any(|k| k.starts_with('$')),
         _ => false,
+    }
+}
+
+/// Check if a single array element matches an `$elemMatch` sub-filter.
+/// - Dict elements: use full `matches()` evaluation.
+/// - Scalar elements: treat the sub-filter as operator conditions on the value.
+fn elem_matches(elem: &Bson, filter: &Document) -> bool {
+    match elem {
+        Bson::Document(doc) => matches(doc, filter),
+        _ => eval_field_condition(Some(elem), &Bson::Document(filter.clone())),
     }
 }
 

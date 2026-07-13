@@ -111,15 +111,24 @@ struct NativeCollection {
 #[pymethods]
 impl NativeCollection {
     #[new]
-    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false))]
+    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false, durability="os"))]
     fn new(
         path: String,
         indexes: Option<Vec<String>>,
         vector_indexes: Option<HashMap<String, usize>>,
         text_indexes: Option<Vec<String>>,
         readonly: bool,
+        durability: &str,
     ) -> PyResult<Self> {
-        let mut builder = RustCollection::builder(&path);
+        let dur = match durability {
+            "none" => moofile_core::Durability::None,
+            "os" => moofile_core::Durability::Os,
+            "fsync" => moofile_core::Durability::Fsync,
+            other => return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("invalid durability '{}': must be 'none', 'os', or 'fsync'", other),
+            )),
+        };
+        let mut builder = RustCollection::builder(&path).durability(dur);
         if let Some(idxs) = &indexes {
             let refs: Vec<&str> = idxs.iter().map(|s| s.as_str()).collect();
             builder = builder.indexes(&refs);
@@ -147,7 +156,8 @@ impl NativeCollection {
 
     /// Insert many documents in a single Rust loop — much faster than
     /// calling `insert()` N times from Python.
-    fn insert_many(&self, docs: &Bound<PyList>) -> PyResult<usize> {
+    /// Returns a list of raw BSON bytes for Python-side decoding.
+    fn insert_many(&self, py: Python<'_>, docs: &Bound<PyList>) -> PyResult<PyObject> {
         let mut rust_docs = Vec::with_capacity(docs.len());
         for item in docs.iter() {
             let dict = item.downcast::<PyDict>()?;
@@ -156,7 +166,8 @@ impl NativeCollection {
         let results = self.inner.insert_many(rust_docs).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
         })?;
-        Ok(results.len())
+        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
+        Ok(list.unwrap().into())
     }
 
     /// Find all matching documents and return as a Python list of dicts.
@@ -270,6 +281,33 @@ impl NativeCollection {
         })
     }
 
+    fn update_many(
+        &self,
+        where_clause: &Bound<PyDict>,
+        set: Option<&Bound<PyDict>>,
+        unset: Option<Vec<String>>,
+        inc: Option<&Bound<PyDict>>,
+    ) -> PyResult<usize> {
+        let w = py_to_document(where_clause)?;
+        let s = set.map(|d| py_to_document(d)).transpose()?;
+        let i = inc.map(|d| py_to_document(d)).transpose()?;
+        self.inner.update_many(w, s, unset, i).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
+    fn replace_one(
+        &self,
+        where_clause: &Bound<PyDict>,
+        replacement: &Bound<PyDict>,
+    ) -> PyResult<bool> {
+        let w = py_to_document(where_clause)?;
+        let r = py_to_document(replacement)?;
+        self.inner.replace_one(w, r).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
     fn delete_one(&self, where_clause: &Bound<PyDict>) -> PyResult<bool> {
         let w = py_to_document(where_clause)?;
         self.inner.delete_one(w).map_err(|e| {
@@ -282,6 +320,109 @@ impl NativeCollection {
         self.inner.delete_many(w).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
+    }
+
+    /// Vector similarity search — returns list of (raw_bson_bytes, score) tuples.
+    #[pyo3(signature = (filter, field, query_vector, limit=10))]
+    fn vector_search_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+        field: &str,
+        query_vector: Vec<f32>,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let results = self
+            .inner
+            .find(f)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .vector_search(field, query_vector, limit)
+            .to_list()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let list = PyList::new(
+            py,
+            results.iter().map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py);
+                (bytes, *score as f64).to_object(py)
+            }),
+        );
+        Ok(list.unwrap().into())
+    }
+
+    /// BM25 text search — returns list of (raw_bson_bytes, score) tuples.
+    #[pyo3(signature = (filter, field, query, limit=10))]
+    fn text_search_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+        field: &str,
+        query: &str,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let results = self
+            .inner
+            .find(f)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .text_search(field, query, limit)
+            .to_list()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let list = PyList::new(
+            py,
+            results.iter().map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py);
+                (bytes, *score as f64).to_object(py)
+            }),
+        );
+        Ok(list.unwrap().into())
+    }
+
+    /// Return index configuration for compatibility shims.
+    fn index_config(&self) -> PyResult<(Vec<String>, HashMap<String, usize>, Vec<String>)> {
+        // Read the meta file to get the configured indexes.
+        // This is a simplified approach — the Rust core doesn't expose
+        // the IndexManager's field lists directly.
+        let path = self.inner.path();
+        let meta_path = path.with_extension("bson.meta");
+        if let Ok(raw) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let indexes: Vec<String> = meta["indexes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let vector_indexes: HashMap<String, usize> = meta["vector_indexes"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .filter_map(|(k, v)| v.as_u64().map(|d| (k.clone(), d as usize)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let text_indexes: Vec<String> = meta["text_indexes"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok((indexes, vector_indexes, text_indexes));
+            }
+        }
+        Ok((Vec::new(), HashMap::new(), Vec::new()))
     }
 
     fn stats(&self) -> PyResult<HashMap<String, f64>> {
@@ -298,6 +439,12 @@ impl NativeCollection {
 
     fn compact(&self) -> PyResult<()> {
         self.inner.compact().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
+    fn sync(&self) -> PyResult<()> {
+        self.inner.sync().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
     }

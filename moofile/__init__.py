@@ -15,6 +15,7 @@ MooFile — lightweight embedded document store.
 
 from .aggregation import collect, count, first, last, max, mean, min, sum
 from .errors import (
+    ConcurrentAccessError,
     DocumentNotFoundError,
     DuplicateKeyError,
     MooFileError,
@@ -50,6 +51,7 @@ __all__ = [
     "DuplicateKeyError",
     "DocumentNotFoundError",
     "ReadOnlyError",
+    "ConcurrentAccessError",
     # Aggregation functions
     "count",
     "sum",

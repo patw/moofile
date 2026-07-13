@@ -49,6 +49,11 @@ pub enum MooFileError {
     /// Non-fatal — the cache is disposable and will be rebuilt.
     #[error("cache error: {0}")]
     CacheError(String),
+
+    /// Another process has the database file open — concurrent multi-process
+    /// access is not supported and would silently corrupt the file.
+    #[error("concurrent access detected — file is locked by another process: {0}")]
+    ConcurrentAccess(PathBuf),
 }
 
 /// Convenience: wrap a `std::io::Error` alongside the path that caused it.

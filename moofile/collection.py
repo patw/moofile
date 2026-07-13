@@ -50,20 +50,27 @@ class Collection:
         text_indexes=None,
         readonly: bool = False,
         schema=None,
+        durability: str = "os",
     ) -> None:
         self._path = path
         self._readonly = readonly
         self._schema = schema  # informational only in v1; not enforced
         self._meta_path = path + ".meta"
         self._cache_path = path + ".cache"
+        self._lock_path = path + ".lock"
         self._total_records: int = 0
         self._storage: StorageEngine | None = None
         self._loaded_from_cache: bool = False
         self._dirty: bool = False
+        self._lock_fd = None
 
         declared = list(indexes or [])
         vector_fields = dict(vector_indexes or {})
         text_fields = list(text_indexes or [])
+
+        # Acquire advisory lock to prevent silent corruption from
+        # multi-process access.
+        self._acquire_lock()
 
         if not readonly:
             # Create the data file if it does not exist
@@ -74,7 +81,7 @@ class Collection:
         loaded_indexes, loaded_vector_indexes, loaded_text_indexes = self._load_meta(
             declared, vector_fields, text_fields
         )
-        self._storage = StorageEngine(path, readonly=readonly)
+        self._storage = StorageEngine(path, readonly=readonly, durability=durability)
         self._index_manager = IndexManager(
             loaded_indexes, loaded_vector_indexes, loaded_text_indexes
         )
@@ -294,6 +301,21 @@ class Collection:
         self._delete_cache()
         self._dirty = True
 
+    def sync(self) -> None:
+        """
+        Flush and fsync the data file, ensuring all buffered writes are
+        durable on disk.
+
+        With durability='os' (default) or durability='none', writes are
+        only flushed to the OS page cache.  This method forces an fsync,
+        making all prior writes durable across power loss.
+
+        Useful for batched durability: insert many documents with the fast
+        default durability, then call sync() once.
+        """
+        if self._storage is not None:
+            self._storage.sync()
+
     def reindex(self) -> None:
         """Rebuild all in-memory indexes by re-scanning the data file."""
         self._loaded_from_cache = False
@@ -314,6 +336,8 @@ class Collection:
 
         if not self._loaded_from_cache or self._dirty:
             self._save_cache()
+
+        self._release_lock()
 
     # --- Context manager protocol ---
 
@@ -400,6 +424,34 @@ class Collection:
     # -----------------------------------------------------------------------
     # File management helpers
     # -----------------------------------------------------------------------
+
+    def _acquire_lock(self) -> None:
+        """Acquire an advisory lock on a .lock file to detect concurrent access."""
+        try:
+            import fcntl
+        except ImportError:
+            return  # Windows — best-effort, no locking in pure-Python fallback
+
+        try:
+            self._lock_fd = open(self._lock_path, "a+")
+            if self._readonly:
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            else:
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, IOError):
+            from .errors import ConcurrentAccessError
+            raise ConcurrentAccessError(
+                f"File is already open by another process: {self._lock_path}"
+            )
+
+    def _release_lock(self) -> None:
+        """Release the advisory lock."""
+        if self._lock_fd is not None:
+            try:
+                self._lock_fd.close()
+            except OSError:
+                pass
+            self._lock_fd = None
 
     def _load_from_file(self) -> None:
         """Scan the BSON file and build in-memory indexes from scratch,
