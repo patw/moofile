@@ -63,6 +63,7 @@ class Collection:
         self._loaded_from_cache: bool = False
         self._dirty: bool = False
         self._lock_fd = None
+        self._batch: "BatchContext | None" = None
 
         declared = list(indexes or [])
         vector_fields = dict(vector_indexes or {})
@@ -100,6 +101,8 @@ class Collection:
         Raises DuplicateKeyError if _id already exists.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.insert(doc)
         doc = dict(doc)
         if "_id" not in doc:
             doc["_id"] = _generate_id()
@@ -138,6 +141,8 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.update_one(where, set, unset, inc)
         docs = self._get_docs(where)
         if not docs:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
@@ -163,6 +168,8 @@ class Collection:
         Returns the count of updated documents.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.update_many(where, set, unset, inc)
         docs = self._get_docs(where)
         count = 0
         for old_doc in docs:
@@ -184,6 +191,8 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.replace_one(where, new_doc)
         docs = self._get_docs(where)
         if not docs:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
@@ -208,6 +217,8 @@ class Collection:
         Returns True if a document was deleted, False if nothing matched.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.delete_one(where)
         docs = self._get_docs(where)
         if not docs:
             return False
@@ -225,6 +236,8 @@ class Collection:
         Returns the count of deleted documents.
         """
         self._require_write()
+        if self._batch is not None:
+            return self._batch.delete_many(where)
         docs = self._get_docs(where)
         count = 0
         for doc in docs:
@@ -315,6 +328,41 @@ class Collection:
         """
         if self._storage is not None:
             self._storage.sync()
+
+    def batch(self) -> "BatchContext":
+        """
+        Return a context manager for atomic batch writes.
+
+        All write operations (insert, update, delete) performed within
+        the ``with`` block are buffered and applied atomically on
+        commit — a single storage append, a single flush/fsync, and
+        all index mutations applied together.
+
+        If an exception occurs within the ``with`` block, the batch is
+        rolled back entirely: no records are appended and no indexes
+        are mutated.
+
+        Usage::
+
+            with db.batch() as b:
+                db.insert({"name": "alice"})
+                db.update_one({"name": "bob"}, set={"status": "active"})
+                db.delete_one({"name": "charlie"})
+            # All three operations committed atomically here.
+
+        Properties:
+            - **Transactional visibility**: reads within the batch see
+              the pre-batch state.  Buffered writes become visible only
+              after commit.
+            - **Batched I/O**: all records are appended in a single write
+              with one flush/fsync.
+            - **Rollback on exception**: if the ``with`` block raises,
+              the batch is discarded.
+            - **Crash semantics**: a crash mid-batch may commit a prefix
+              of the batch (same as per-record semantics).
+        """
+        self._require_write()
+        return BatchContext(self)
 
     def reindex(self) -> None:
         """Rebuild all in-memory indexes by re-scanning the data file."""
@@ -664,6 +712,184 @@ class Collection:
     def _require_write(self) -> None:
         if self._readonly:
             raise ReadOnlyError("Collection is open in read-only mode")
+
+
+# ---------------------------------------------------------------------------
+# Batch writes
+# ---------------------------------------------------------------------------
+
+class BatchContext:
+    """
+    Context manager for atomic batch writes.
+
+    Created via ``db.batch()``.  See :meth:`Collection.batch` for usage.
+    """
+
+    def __init__(self, collection: "Collection") -> None:
+        self._collection = collection
+        # Buffered storage appends: [(record_type, doc), ...]
+        self._records: list[tuple[int, dict]] = []
+        # Buffered index mutations: [("add", doc) | ("remove", _id), ...]
+        self._index_ops: list[tuple[str, ...]] = []
+        # Working state overlay for validation: _id -> doc | None(deleted)
+        self._overlay: dict = {}
+        self._count: int = 0
+
+    def __enter__(self) -> "BatchContext":
+        self._collection._batch = self
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._collection._batch = None
+        if exc_type is not None:
+            self.rollback()
+        else:
+            self.commit()
+        return False  # don't suppress exceptions
+
+    # --- Validation helpers ---
+
+    def _get(self, _id):
+        """Get a doc from the batch overlay or the live index."""
+        if _id in self._overlay:
+            return self._overlay[_id]  # None means deleted in this batch
+        return self._collection._index_manager.get(_id)
+
+    def _get_docs(self, filter_dict: dict) -> list:
+        """Get docs matching filter from current view (pre-batch + batch changes)."""
+        # Build current view: start with all live docs
+        docs = {}
+        for doc in self._collection._index_manager.all_docs():
+            docs[doc["_id"]] = doc
+        # Apply overlay
+        for _id, doc in self._overlay.items():
+            if doc is None:
+                docs.pop(_id, None)
+            else:
+                docs[_id] = doc
+        if not filter_dict:
+            return list(docs.values())
+        from .query import matches
+        return [doc for doc in docs.values() if matches(doc, filter_dict)]
+
+    # --- Buffered write operations ---
+
+    def insert(self, doc: dict) -> dict:
+        doc = dict(doc)
+        if "_id" not in doc:
+            doc["_id"] = _generate_id()
+        if self._get(doc["_id"]) is not None:
+            raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
+        self._records.append((RECORD_LIVE, doc))
+        self._index_ops.append(("add", doc))
+        self._overlay[doc["_id"]] = doc
+        self._count += 1
+        return doc
+
+    def insert_many(self, docs: list) -> list:
+        return [self.insert(doc) for doc in docs]
+
+    def update_one(
+        self,
+        where: dict,
+        set: dict = None,
+        unset: list = None,
+        inc: dict = None,
+    ) -> bool:
+        docs = self._get_docs(where)
+        if not docs:
+            raise DocumentNotFoundError(f"No document matches: {where!r}")
+        old_doc = docs[0]
+        new_doc = _apply_update(old_doc, set, unset, inc)
+        self._records.append((RECORD_REPLACEMENT, new_doc))
+        self._index_ops.append(("remove", old_doc["_id"]))
+        self._index_ops.append(("add", new_doc))
+        self._overlay[old_doc["_id"]] = new_doc
+        self._count += 1
+        return True
+
+    def update_many(
+        self,
+        where: dict,
+        set: dict = None,
+        unset: list = None,
+        inc: dict = None,
+    ) -> int:
+        docs = self._get_docs(where)
+        count = 0
+        for old_doc in docs:
+            new_doc = _apply_update(old_doc, set, unset, inc)
+            self._records.append((RECORD_REPLACEMENT, new_doc))
+            self._index_ops.append(("remove", old_doc["_id"]))
+            self._index_ops.append(("add", new_doc))
+            self._overlay[old_doc["_id"]] = new_doc
+            self._count += 1
+            count += 1
+        return count
+
+    def replace_one(self, where: dict, new_doc: dict) -> bool:
+        docs = self._get_docs(where)
+        if not docs:
+            raise DocumentNotFoundError(f"No document matches: {where!r}")
+        old_doc = docs[0]
+        replacement = dict(new_doc)
+        replacement["_id"] = old_doc["_id"]
+        self._records.append((RECORD_REPLACEMENT, replacement))
+        self._index_ops.append(("remove", old_doc["_id"]))
+        self._index_ops.append(("add", replacement))
+        self._overlay[old_doc["_id"]] = replacement
+        self._count += 1
+        return True
+
+    def delete_one(self, where: dict) -> bool:
+        docs = self._get_docs(where)
+        if not docs:
+            return False
+        doc = docs[0]
+        self._records.append((RECORD_TOMBSTONE, {"_id": doc["_id"]}))
+        self._index_ops.append(("remove", doc["_id"]))
+        self._overlay[doc["_id"]] = None
+        self._count += 1
+        return True
+
+    def delete_many(self, where: dict) -> int:
+        docs = self._get_docs(where)
+        count = 0
+        for doc in docs:
+            self._records.append((RECORD_TOMBSTONE, {"_id": doc["_id"]}))
+            self._index_ops.append(("remove", doc["_id"]))
+            self._overlay[doc["_id"]] = None
+            self._count += 1
+            count += 1
+        return count
+
+    # --- Commit / Rollback ---
+
+    def commit(self) -> None:
+        """Apply all buffered operations atomically."""
+        if not self._records:
+            return
+        # Append all records in a single write with one flush
+        self._collection._storage.append_batch(self._records)
+        # Apply all index mutations in order
+        for op in self._index_ops:
+            if op[0] == "add":
+                self._collection._index_manager.add(op[1])
+            elif op[0] == "remove":
+                self._collection._index_manager.remove(op[1])
+        self._collection._total_records += self._count
+        self._collection._dirty = True
+        self._records.clear()
+        self._index_ops.clear()
+        self._overlay.clear()
+        self._count = 0
+
+    def rollback(self) -> None:
+        """Discard all buffered operations."""
+        self._records.clear()
+        self._index_ops.clear()
+        self._overlay.clear()
+        self._count = 0
 
 
 # ---------------------------------------------------------------------------

@@ -316,6 +316,26 @@ impl Query {
         }
     }
 
+    /// Switch to hybrid search (Reciprocal Rank Fusion of BM25 + vector).
+    pub fn hybrid_search(
+        self,
+        text_field: impl Into<String>,
+        vector_field: impl Into<String>,
+        query_text: impl Into<String>,
+        query_vector: Vec<f32>,
+        limit: usize,
+    ) -> HybridQuery {
+        HybridQuery {
+            inner: self.inner,
+            text_field: text_field.into(),
+            vector_field: vector_field.into(),
+            query_text: query_text.into(),
+            query_vector,
+            limit,
+            pre_filter: self.filter,
+        }
+    }
+
     // -----------------------------------------------------------
     // Terminal methods
     // -----------------------------------------------------------
@@ -489,6 +509,101 @@ impl TextQuery {
     }
 
     /// Return the best match or `None`.
+    pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
+        Ok(self.to_list()?.into_iter().next())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HybridQuery (Reciprocal Rank Fusion)
+// ---------------------------------------------------------------------------
+
+/// RRF constant — the standard value from the original literature.
+const RRF_K: f32 = 60.0;
+
+/// Hybrid search results using Reciprocal Rank Fusion (RRF).
+///
+/// Combines BM25 text search and vector cosine similarity by fusing
+/// their rank positions.  Returns `(doc, rrf_score)` tuples.
+#[derive(Debug, Clone)]
+pub struct HybridQuery {
+    inner: Arc<RwLock<CollectionInner>>,
+    text_field: String,
+    vector_field: String,
+    query_text: String,
+    query_vector: Vec<f32>,
+    limit: usize,
+    pre_filter: Document,
+}
+
+impl HybridQuery {
+    /// Return `(doc, rrf_score)` pairs sorted by fused rank descending.
+    pub fn to_list(self) -> Result<Vec<(Document, f32)>, MooFileError> {
+        let pool = (self.limit * 5).max(50);
+
+        // Get text search results (pre-filter handled internally)
+        let text_results = TextQuery {
+            inner: Arc::clone(&self.inner),
+            field: self.text_field.clone(),
+            query: self.query_text.clone(),
+            limit: pool,
+            pre_filter: self.pre_filter.clone(),
+        }
+        .to_list()?;
+
+        // Ensure vector indexes are fresh before vector search
+        {
+            let mut inner = self.inner.write().expect("lock poisoned");
+            inner.require_open()?;
+            inner.index_manager.ensure_vectors_fresh();
+        }
+
+        let vec_results = VectorQuery {
+            inner: Arc::clone(&self.inner),
+            field: self.vector_field.clone(),
+            query_vector: self.query_vector.clone(),
+            limit: pool,
+            pre_filter: self.pre_filter.clone(),
+        }
+        .to_list()?;
+
+        // RRF fusion: score(d) = Σ 1/(k + rank + 1)
+        let mut scores: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        let mut docs: std::collections::HashMap<String, Document> =
+            std::collections::HashMap::new();
+
+        for (rank, (doc, _)) in text_results.iter().enumerate() {
+            let id = doc.get_str("_id").unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            *scores.entry(id.clone()).or_insert(0.0) +=
+                1.0 / (RRF_K + rank as f32 + 1.0);
+            docs.insert(id, doc.clone());
+        }
+
+        for (rank, (doc, _)) in vec_results.iter().enumerate() {
+            let id = doc.get_str("_id").unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            *scores.entry(id.clone()).or_insert(0.0) +=
+                1.0 / (RRF_K + rank as f32 + 1.0);
+            docs.entry(id.clone()).or_insert_with(|| doc.clone());
+        }
+
+        let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        ranked.truncate(self.limit);
+
+        Ok(ranked
+            .into_iter()
+            .filter_map(|(id, score)| docs.get(&id).map(|doc| (doc.clone(), score)))
+            .collect())
+    }
+
+    /// Return the top result or `None`.
     pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
         Ok(self.to_list()?.into_iter().next())
     }

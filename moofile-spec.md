@@ -358,6 +358,47 @@ db.find({"published": True})
   .to_list()  # → [(doc, relevance), ...]
 ```
 
+### Hybrid Search (RRF)
+
+Reciprocal Rank Fusion combines BM25 text search and vector cosine similarity by fusing their **rank positions** rather than their raw scores. This avoids the score-normalization problem (BM25 scores are unbounded and can be negative; cosine similarity is in [-1, 1]) and produces a single ranked list that benefits from both lexical and semantic matching.
+
+```python
+db.find({"category": "research"})
+  .hybrid_search("content", "embedding", query_text, query_vector, limit=10)
+  .to_list()  # → [(doc, rrf_score), ...]
+```
+
+**How it works:**
+
+1. Pull a wider candidate pool (`max(limit × 5, 50)`) from each ranker independently.
+2. For each document, compute `RRF_score = Σ 1/(k + rank + 1)` where `k = 60` (the canonical RRF constant) and `rank` is the document's 0-based position in each ranker's result list.
+3. Sort by RRF score descending, truncate to `limit`.
+
+A document that appears in both the text and vector result lists receives contributions from both, boosting it above documents that appear in only one. The pre-filter from `find({...})` is applied to both legs before fusion.
+
+No other embedded single-file document store offers BM25 + cosine + RRF fusion behind a single method call.
+
+### Atomic Batch Writes
+
+The `batch()` context manager buffers all write operations (insert, update, delete) and applies them atomically on commit — a single storage append, a single flush/fsync, and all index mutations applied together.
+
+```python
+with db.batch() as b:
+    db.insert({"name": "alice", "status": "active"})
+    db.update_one({"name": "bob"}, set={"status": "active"})
+    db.delete_one({"name": "charlie"})
+# All three operations committed atomically here.
+```
+
+**Properties:**
+
+- **Transactional visibility**: reads within the batch see the pre-batch state. Buffered writes become visible only after commit.
+- **Batched I/O**: all records are appended in a single write with one flush/fsync, regardless of durability mode. In `durability="fsync"` mode this reduces N fsyncs to 1.
+- **Rollback on exception**: if the `with` block raises, the batch is discarded entirely — no records are appended and no indexes are mutated.
+- **Crash semantics**: a crash mid-batch may commit a prefix of the batch (same as per-record semantics — you lose at most the last in-flight record). For true all-or-nothing crash atomicity, a future version may add commit markers.
+
+Batch operations support the full write API: `insert`, `insert_many`, `update_one`, `update_many`, `replace_one`, `delete_one`, `delete_many`. Validation (duplicate `_id` detection, `DocumentNotFoundError`) happens eagerly at buffer time, so the caller gets immediate feedback.
+
 ### Update Operators
 
 `$set`, `$unset`, `$inc` — covers 95% of real usage.
@@ -429,6 +470,7 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.1.0 | Initial release — pure-Python, basic CRUD, sorted indexes |
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
+| 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception |
 
 ---
 

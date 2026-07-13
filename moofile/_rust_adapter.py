@@ -184,6 +184,10 @@ class Collection:
         except RuntimeError as e:
             _map_errors(e)
 
+    def batch(self):
+        """Return a context manager for atomic batch writes."""
+        return _NativeBatchContext(self._native)
+
     def close(self):
         try:
             self._native.save_cache()
@@ -249,6 +253,11 @@ class _NativeQuery:
     def text_search(self, field, query, limit=10):
         return _NativeTextQuery(
             self._native, self._filter, field, query, limit
+        )
+
+    def hybrid_search(self, text_field, vector_field, query_text, query_vector, limit=10):
+        return _NativeHybridQuery(
+            self._native, self._filter, text_field, vector_field, query_text, query_vector, limit
         )
 
     def to_list(self) -> list:
@@ -369,3 +378,69 @@ class _NativeTextQuery:
     def first(self):
         results = self.to_list()
         return results[0] if results else None
+
+
+# ---------------------------------------------------------------------------
+# _NativeHybridQuery
+# ---------------------------------------------------------------------------
+
+class _NativeHybridQuery:
+    """Hybrid search (RRF) results from the native engine."""
+
+    def __init__(self, native, pre_filter, text_field, vector_field, query_text, query_vector, limit):
+        self._native = native
+        self._pre_filter = pre_filter
+        self._text_field = text_field
+        self._vector_field = vector_field
+        self._query_text = query_text
+        self._query_vector = query_vector
+        self._limit = limit
+
+    def to_list(self) -> list:
+        try:
+            raw_results = self._native.hybrid_search_raw(
+                self._pre_filter if self._pre_filter else None,
+                self._text_field,
+                self._vector_field,
+                self._query_text,
+                self._query_vector,
+                self._limit if self._limit is not None else 10,
+            )
+        except RuntimeError as e:
+            _map_errors(e)
+        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+
+    def first(self):
+        results = self.to_list()
+        return results[0] if results else None
+
+
+# ---------------------------------------------------------------------------
+# _NativeBatchContext
+# ---------------------------------------------------------------------------
+
+class _NativeBatchContext:
+    """Context manager for atomic batch writes, backed by the native engine."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def __enter__(self):
+        try:
+            self._native.batch_begin()
+        except RuntimeError as e:
+            _map_errors(e)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self._native.batch_rollback()
+            except RuntimeError as e:
+                _map_errors(e)
+        else:
+            try:
+                self._native.batch_commit()
+            except RuntimeError as e:
+                _map_errors(e)
+        return False

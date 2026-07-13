@@ -276,6 +276,37 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Append multiple records with a single flush/fsync.
+    ///
+    /// Used by the batch context to commit all buffered records in one
+    /// I/O operation regardless of the durability mode.
+    pub fn append_batch(&mut self, records: &[(u8, &Document)]) -> Result<(), MooFileError> {
+        if self.readonly {
+            return Err(MooFileError::ReadOnly);
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let mut buf = Vec::new();
+        for (rt, doc) in records {
+            buf.extend_from_slice(&encode_record(*rt, doc));
+        }
+        let f = self.file.as_mut().expect("StorageEngine: file handle missing");
+        f.write_all(&buf)
+            .map_err(|e| errors::io_err(&self.path, e))?;
+        match self.durability {
+            Durability::None => {}
+            Durability::Os => {
+                f.flush().map_err(|e| errors::io_err(&self.path, e))?;
+            }
+            Durability::Fsync => {
+                f.sync_all().map_err(|e| errors::io_err(&self.path, e))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Flush and fsync the file, ensuring all buffered writes are durable
     /// on disk.  Useful with [`Durability::Os`] or [`Durability::None`] to
     /// batch durability: insert many documents, then call `sync()` once.

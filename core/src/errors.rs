@@ -54,6 +54,10 @@ pub enum MooFileError {
     /// access is not supported and would silently corrupt the file.
     #[error("concurrent access detected — file is locked by another process: {0}")]
     ConcurrentAccess(PathBuf),
+
+    /// Attempted to start a batch while another batch is already active.
+    #[error("a batch is already active — nested batches are not supported")]
+    BatchAlreadyActive,
 }
 
 /// Convenience: wrap a `std::io::Error` alongside the path that caused it.

@@ -386,6 +386,65 @@ impl NativeCollection {
         Ok(list.unwrap().into())
     }
 
+    /// Hybrid search (RRF) — returns list of (raw_bson_bytes, score) tuples.
+    #[pyo3(signature = (filter, text_field, vector_field, query_text, query_vector, limit=10))]
+    fn hybrid_search_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+        text_field: &str,
+        vector_field: &str,
+        query_text: &str,
+        query_vector: Vec<f32>,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let results = self
+            .inner
+            .find(f)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .hybrid_search(text_field, vector_field, query_text, query_vector, limit)
+            .to_list()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let list = PyList::new(
+            py,
+            results.iter().map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py);
+                (bytes, *score as f64).to_object(py)
+            }),
+        );
+        Ok(list.unwrap().into())
+    }
+
+    // --- Batch writes ---
+
+    /// Begin a batch write context.  All subsequent writes are buffered
+    /// until `batch_commit` is called.
+    fn batch_begin(&self) -> PyResult<()> {
+        self.inner.batch_begin().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
+    /// Commit the active batch: append all buffered records in a single
+    /// write and apply all index mutations.
+    fn batch_commit(&self) -> PyResult<()> {
+        self.inner.batch_commit().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
+    /// Rollback the active batch: discard all buffered operations.
+    fn batch_rollback(&self) -> PyResult<()> {
+        self.inner.batch_rollback().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
     /// Return index configuration for compatibility shims.
     fn index_config(&self) -> PyResult<(Vec<String>, HashMap<String, usize>, Vec<String>)> {
         // Read the meta file to get the configured indexes.

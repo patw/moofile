@@ -112,6 +112,26 @@ class StorageEngine:
             os.fsync(self._file.fileno())
         # durability == "none": no flush at all
 
+    def append_batch(self, records: list) -> None:
+        """Append multiple records with a single flush/fsync.
+
+        Args:
+            records: list of (record_type, doc) tuples.
+        """
+        from .errors import ReadOnlyError
+        if self.readonly:
+            raise ReadOnlyError("Collection is open in read-only mode")
+        if not records:
+            return
+        buf = b"".join(encode_record(rt, doc) for rt, doc in records)
+        self._file.write(buf)
+        if self.durability == "os":
+            self._file.flush()
+        elif self.durability == "fsync":
+            self._file.flush()
+            os.fsync(self._file.fileno())
+        # durability == "none": no flush at all
+
     def sync(self) -> None:
         """Flush and fsync the data file, ensuring durability on disk."""
         if self._file is not None:

@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "bson",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-py"
-version = "0.3.5"
+version = "0.4.0"
 dependencies = [
  "bson",
  "moofile-core",

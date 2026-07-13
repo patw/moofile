@@ -149,6 +149,7 @@ from moofile import (
 | `exists()` | `bool` |
 | `vector_search().to_list()` | `list[tuple[dict, float]]` |
 | `text_search().to_list()` | `list[tuple[dict, float]]` |
+| `hybrid_search().to_list()` | `list[tuple[dict, float]]` |
 | `insert()` | `dict` (with _id populated) |
 | `insert_many()` | `list[dict]` |
 | `update_one()` | `bool` (always True, raises DocumentNotFoundError if no match) |
@@ -472,6 +473,96 @@ title_results = db.find({}).text_search("title", "introduction").to_list()
 - Tokenizes on word boundaries, ignores punctuation
 - Pre-filtering with `.find()` conditions is supported
 - Only processes string fields (non-strings are ignored)
+
+---
+
+### Hybrid Search (RRF)
+
+Reciprocal Rank Fusion combines BM25 text search and vector cosine similarity into a single ranked list. It fuses **rank positions** rather than raw scores, which avoids the score-normalization problem (BM25 scores are unbounded; cosine similarity is in [-1, 1]).
+
+```python
+# Setup: you need both a text index and a vector index on the same collection
+db = Collection("docs.bson",
+    text_indexes=["content"],
+    vector_indexes={"embedding": 384},
+)
+
+# Insert documents with both text content and embeddings
+db.insert({
+    "content": "Introduction to machine learning algorithms",
+    "embedding": [0.1, 0.2, 0.3, ...],
+})
+
+# Hybrid search: fuse BM25 text ranking + vector cosine ranking
+query_text = "machine learning"
+query_vector = [0.15, 0.25, 0.35, ...]
+results = (
+    db.find({})
+    .hybrid_search("content", "embedding", query_text, query_vector, limit=10)
+    .to_list()
+)
+
+# Results are (document, rrf_score) tuples
+for doc, score in results:
+    print(f"{doc['content'][:50]}...: {score:.5f}")
+
+# Combine with pre-filters
+results = (
+    db.find({"category": "AI"})
+    .hybrid_search("content", "embedding", query_text, query_vector, limit=5)
+    .to_list()
+)
+```
+
+**How RRF works:**
+
+For each document that appears in either ranker's results, MooFile computes:
+
+```
+RRF_score(d) = Σ 1/(k + rank + 1)
+```
+
+where `k = 60` (the canonical RRF constant) and `rank` is the document's 0-based position in each ranker's list. A document that appears in **both** the text and vector results gets two contributions, boosting it above documents that appear in only one.
+
+MooFile pulls a wider candidate pool (`max(limit × 5, 50)`) from each ranker to ensure enough overlap for meaningful fusion.
+
+**Why RRF over weighted score fusion?** BM25 scores are unbounded and can even be negative (when a term appears in >50% of documents). Cosine similarity is bounded in [-1, 1]. Naively combining them with weights requires score normalization, which is fragile. RRF uses only rank positions, making it robust to any score distribution.
+
+No other embedded single-file document store offers BM25 + cosine + RRF fusion behind a single method call.
+
+---
+
+### Atomic Batch Writes
+
+The `batch()` context manager buffers all write operations and applies them atomically on commit — a single storage append, a single flush/fsync, and all index mutations applied together.
+
+```python
+with db.batch() as b:
+    db.insert({"name": "alice", "status": "active"})
+    db.update_one({"name": "bob"}, set={"status": "active"})
+    db.delete_one({"name": "charlie"})
+# All three operations committed atomically here.
+```
+
+**Properties:**
+
+- **Transactional visibility**: reads within the batch see the pre-batch state. Buffered writes become visible only after commit.
+- **Batched I/O**: all records are appended in a single write with one flush/fsync, regardless of durability mode. In `durability="fsync"` mode this reduces N fsyncs to 1.
+- **Rollback on exception**: if the `with` block raises, the batch is discarded entirely — no records are appended and no indexes are mutated.
+- **Crash semantics**: a crash mid-batch may commit a prefix of the batch (same as per-record semantics — you lose at most the last in-flight record).
+
+Batch operations support the full write API: `insert`, `insert_many`, `update_one`, `update_many`, `replace_one`, `delete_one`, `delete_many`. Validation (duplicate `_id` detection, `DocumentNotFoundError`) happens eagerly at buffer time.
+
+**Example: atomic multi-doc update**
+
+```python
+# Transfer credits between two users atomically
+with db.batch():
+    db.update_one({"_id": "alice"}, inc={"credits": -50})
+    db.update_one({"_id": "bob"}, inc={"credits": 50})
+    db.insert({"type": "transfer", "from": "alice", "to": "bob", "amount": 50})
+# If any operation fails, all three are rolled back.
+```
 
 ---
 

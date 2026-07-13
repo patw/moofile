@@ -135,6 +135,30 @@ class Query:
         """
         return TextQuery(self._collection, field, query, limit, self._filter)
 
+    def hybrid_search(
+        self,
+        text_field: str,
+        vector_field: str,
+        query_text: str,
+        query_vector,
+        limit: int = 10,
+    ) -> "HybridQuery":
+        """
+        Perform hybrid search combining BM25 text search and vector
+        similarity using Reciprocal Rank Fusion (RRF).
+
+        Returns a HybridQuery that yields (doc, rrf_score) tuples.
+        """
+        return HybridQuery(
+            self._collection,
+            text_field,
+            vector_field,
+            query_text,
+            query_vector,
+            limit,
+            self._filter,
+        )
+
     # --- Terminal methods ---
 
     def to_list(self) -> list:
@@ -295,5 +319,82 @@ class TextQuery:
     
     def first(self):
         """Return the best match as (doc, score) tuple or None."""
+        results = self.to_list()
+        return results[0] if results else None
+
+
+class HybridQuery:
+    """
+    Hybrid search results using Reciprocal Rank Fusion (RRF).
+
+    Combines BM25 text search and vector cosine similarity by fusing
+    their rank positions rather than their raw scores.  RRF is
+    score-scale-agnostic — it works even though BM25 scores are
+    unbounded (and can be negative) while cosine similarity is in
+    [-1, 1].
+
+    Returns (document, rrf_score) tuples sorted by fused rank descending.
+    """
+
+    #: RRF constant — the standard value from the original literature.
+    #: Smaller values weight top ranks more heavily; 60 is the
+    #: canonical default.
+    _RRF_K = 60
+
+    def __init__(
+        self,
+        collection,
+        text_field: str,
+        vector_field: str,
+        query_text: str,
+        query_vector,
+        limit: int,
+        pre_filter: dict,
+    ):
+        self._collection = collection
+        self._text_field = text_field
+        self._vector_field = vector_field
+        self._query_text = query_text
+        self._query_vector = query_vector
+        self._limit = limit
+        self._pre_filter = pre_filter
+
+    def to_list(self) -> list:
+        """Return list of (doc, rrf_score) tuples sorted by fused rank descending."""
+        # Pull a wider candidate pool from each ranker so RRF has
+        # enough overlap to fuse meaningfully.
+        pool = max(self._limit * 5, 50)
+
+        text_results = TextQuery(
+            self._collection, self._text_field, self._query_text, pool, self._pre_filter
+        ).to_list()
+        vec_results = VectorQuery(
+            self._collection, self._vector_field, self._query_vector, pool, self._pre_filter
+        ).to_list()
+
+        # RRF fusion: score(d) = Σ 1/(k + rank + 1)
+        k = self._RRF_K
+        scores: dict = {}
+        docs: dict = {}
+
+        for rank, (doc, _) in enumerate(text_results):
+            did = doc["_id"]
+            scores[did] = scores.get(did, 0.0) + 1.0 / (k + rank + 1)
+            docs[did] = doc
+
+        for rank, (doc, _) in enumerate(vec_results):
+            did = doc["_id"]
+            scores[did] = scores.get(did, 0.0) + 1.0 / (k + rank + 1)
+            if did not in docs:
+                docs[did] = doc
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if self._limit is not None:
+            ranked = ranked[: self._limit]
+
+        return [(docs[did], score) for did, score in ranked]
+
+    def first(self):
+        """Return the top result as (doc, rrf_score) tuple or None."""
         results = self.to_list()
         return results[0] if results else None

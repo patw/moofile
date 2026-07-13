@@ -218,3 +218,100 @@ def test_vector_search_after_insert(make_collection, tmp_path):
     ids = {doc["_id"] for doc, _ in r2}
     assert "c" in ids
     assert "d" in ids
+
+
+def test_hybrid_search_basic(make_collection):
+    """Hybrid search (RRF) fuses text and vector results."""
+    db = make_collection(
+        vector_indexes={"embedding": 3},
+        text_indexes=["content"],
+    )
+
+    db.insert({"_id": "a", "category": "ai", "content": "machine learning algorithms", "embedding": [1.0, 0.0, 0.0]})
+    db.insert({"_id": "b", "category": "ai", "content": "deep learning neural networks", "embedding": [0.9, 0.1, 0.0]})
+    db.insert({"_id": "c", "category": "food", "content": "cooking recipes pasta pizza", "embedding": [0.0, 0.0, 0.1]})
+
+    results = (
+        db.find({})
+        .hybrid_search("content", "embedding", "machine learning", [1.0, 0.0, 0.0], limit=5)
+        .to_list()
+    )
+
+    assert len(results) > 0
+    # Scores should be positive and descending
+    scores = [s for _, s in results]
+    assert all(s > 0 for s in scores)
+    assert scores == sorted(scores, reverse=True)
+    # "a" and "b" should rank above "c" (cooking) — they match both text and vector
+    # while "c" only appears via vector with cosine=0 (low rank)
+    a_score = next(s for d, s in results if d["_id"] == "a")
+    c_score = next((s for d, s in results if d["_id"] == "c"), 0)
+    assert a_score > c_score
+
+
+def test_hybrid_search_with_prefilter(make_collection):
+    """Hybrid search honours the find() pre-filter."""
+    db = make_collection(
+        indexes=["category"],
+        vector_indexes={"embedding": 3},
+        text_indexes=["content"],
+    )
+
+    db.insert({"_id": "a", "category": "ai", "content": "machine learning", "embedding": [1.0, 0.0, 0.0]})
+    db.insert({"_id": "b", "category": "food", "content": "machine learning for food", "embedding": [1.0, 0.1, 0.0]})
+
+    results = (
+        db.find({"category": "ai"})
+        .hybrid_search("content", "embedding", "machine learning", [1.0, 0.0, 0.0], limit=5)
+        .to_list()
+    )
+
+    for doc, _ in results:
+        assert doc["category"] == "ai"
+    assert len(results) == 1
+    assert results[0][0]["_id"] == "a"
+
+
+def test_batch_insert_commit(make_collection):
+    """Batch writes are visible after commit."""
+    db = make_collection()
+
+    with db.batch():
+        db.insert({"_id": "a", "v": 1})
+        db.insert({"_id": "b", "v": 2})
+        db.insert({"_id": "c", "v": 3})
+
+    assert db.count({}) == 3
+    assert db.find_one({"_id": "a"}) is not None
+
+
+def test_batch_rollback_on_exception(make_collection):
+    """Batch writes are rolled back if the with block raises."""
+    db = make_collection()
+
+    with pytest.raises(ValueError, match="oops"):
+        with db.batch():
+            db.insert({"_id": "a", "v": 1})
+            db.insert({"_id": "b", "v": 2})
+            raise ValueError("oops")
+
+    assert db.count({}) == 0
+
+
+def test_batch_mixed_operations(make_collection):
+    """Insert + update + delete in one batch."""
+    db = make_collection()
+
+    db.insert({"_id": "keep", "status": "active"})
+    db.insert({"_id": "upd", "status": "active"})
+    db.insert({"_id": "del", "status": "active"})
+
+    with db.batch():
+        db.insert({"_id": "new", "status": "active"})
+        db.update_one({"_id": "upd"}, set={"status": "inactive"})
+        db.delete_one({"_id": "del"})
+
+    assert db.count({}) == 3
+    assert db.find_one({"_id": "del"}) is None
+    assert db.find_one({"_id": "upd"})["status"] == "inactive"
+    assert db.find_one({"_id": "new"}) is not None
