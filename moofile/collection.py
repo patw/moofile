@@ -3,6 +3,9 @@
 import binascii
 import json
 import os
+import pickle
+import struct
+import time
 from datetime import datetime, timezone
 
 from .errors import DocumentNotFoundError, DuplicateKeyError, ReadOnlyError
@@ -52,8 +55,11 @@ class Collection:
         self._readonly = readonly
         self._schema = schema  # informational only in v1; not enforced
         self._meta_path = path + ".meta"
+        self._cache_path = path + ".cache"
         self._total_records: int = 0
         self._storage: StorageEngine | None = None
+        self._loaded_from_cache: bool = False
+        self._dirty: bool = False
 
         declared = list(indexes or [])
         vector_fields = dict(vector_indexes or {})
@@ -95,6 +101,7 @@ class Collection:
         self._storage.append(RECORD_LIVE, doc)
         self._index_manager.add(doc)
         self._total_records += 1
+        self._dirty = True
         return doc
 
     def insert_many(self, docs: list) -> list:
@@ -133,6 +140,7 @@ class Collection:
         self._index_manager.remove(old_doc["_id"])
         self._index_manager.add(new_doc)
         self._total_records += 1
+        self._dirty = True
         return True
 
     def update_many(
@@ -157,6 +165,8 @@ class Collection:
             self._index_manager.add(new_doc)
             self._total_records += 1
             count += 1
+        if count > 0:
+            self._dirty = True
         return count
 
     def replace_one(self, where: dict, new_doc: dict) -> bool:
@@ -177,6 +187,7 @@ class Collection:
         self._index_manager.remove(old_doc["_id"])
         self._index_manager.add(replacement)
         self._total_records += 1
+        self._dirty = True
         return True
 
     # -----------------------------------------------------------------------
@@ -197,6 +208,7 @@ class Collection:
         self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
         self._index_manager.remove(doc["_id"])
         self._total_records += 1
+        self._dirty = True
         return True
 
     def delete_many(self, where: dict) -> int:
@@ -213,6 +225,8 @@ class Collection:
             self._index_manager.remove(doc["_id"])
             self._total_records += 1
             count += 1
+        if count > 0:
+            self._dirty = True
         return count
 
     # -----------------------------------------------------------------------
@@ -276,16 +290,30 @@ class Collection:
             self._storage.reopen()
         # After compaction total_records == live document count
         self._total_records = len(live_docs)
+        # The BSON file was rewritten — cache is definitely stale.
+        self._delete_cache()
+        self._dirty = True
 
     def reindex(self) -> None:
         """Rebuild all in-memory indexes by re-scanning the data file."""
+        self._loaded_from_cache = False
+        self._dirty = True
         self._load_from_file()
 
     def close(self) -> None:
-        """Close the collection and release the file handle."""
+        """Close the collection, saving the cache if needed (Option B).
+
+        - Loaded from cache, no writes → skip (cache still valid).
+        - Rebuilt from scan, or writes occurred → write a fresh cache.
+        """
         if self._storage is not None:
+            # Close the storage handle FIRST so the data file's mtime
+            # is settled before we capture it for the cache fingerprint.
             self._storage.close()
             self._storage = None
+
+        if not self._loaded_from_cache or self._dirty:
+            self._save_cache()
 
     # --- Context manager protocol ---
 
@@ -374,13 +402,21 @@ class Collection:
     # -----------------------------------------------------------------------
 
     def _load_from_file(self) -> None:
-        """Scan the BSON file and build in-memory indexes from scratch."""
+        """Scan the BSON file and build in-memory indexes from scratch,
+        or load from cache if valid."""
         self._index_manager.clear()
         self._total_records = 0
 
         if not os.path.exists(self._path):
             return
 
+        # --- Try the disposable cache first ---
+        if self._try_load_cache():
+            self._loaded_from_cache = True
+            return
+        self._loaded_from_cache = False
+
+        # --- Cache miss: rebuild from BSON scan ---
         records, truncate_to = scan_file(self._path)
 
         # Truncate partial trailing write if needed
@@ -404,9 +440,113 @@ class Collection:
                 self._index_manager.add(doc)
             elif record_type == RECORD_TOMBSTONE:
                 self._index_manager.remove(_id)
-        
+
         # Rebuild vector indexes after loading all documents
         self._index_manager.rebuild_vector_indexes()
+
+    # ------------------------------------------------------------------
+    # Cache management
+    # ------------------------------------------------------------------
+
+    def _file_fingerprint(self) -> tuple[int, float] | None:
+        """Return (size, mtime_ns) for the data file, or None if unreadable."""
+        try:
+            stat = os.stat(self._path)
+            return (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return None
+
+    def _try_load_cache(self) -> bool:
+        """Try to load the index cache.  Returns True on hit, False on miss."""
+        if not os.path.exists(self._cache_path):
+            return False
+
+        # Current data file fingerprint
+        fp = self._file_fingerprint()
+        if fp is None:
+            return False
+        actual_len, actual_mtime_ns = fp
+
+        try:
+            with open(self._cache_path, "rb") as f:
+                cache = pickle.load(f)
+        except Exception:
+            return False  # corrupt or wrong format
+
+        # Validate magic + version
+        if cache.get("_magic") != b"MOOF" or cache.get("_version") != 1:
+            return False
+
+        # Validate data file fingerprint
+        if cache.get("_data_file_length") != actual_len:
+            return False
+        if cache.get("_data_file_mtime_ns") != actual_mtime_ns:
+            return False
+
+        # Validate index configuration matches
+        expected_regular = set(self._index_manager._fields)
+        expected_vector = set(self._index_manager._vector_fields.items())
+        expected_text = set(self._index_manager._text_fields)
+
+        if set(cache.get("_regular_fields", [])) != expected_regular:
+            return False
+        if set(cache.get("_vector_fields", {}).items()) != expected_vector:
+            return False
+        if set(cache.get("_text_fields", [])) != expected_text:
+            return False
+
+        # --- Cache hit: reconstruct the IndexManager ---
+        self._index_manager._documents = cache["_documents"]
+        self._index_manager._indexes = cache["_indexes"]
+        self._index_manager._vector_indexes = cache["_vector_indexes"]
+        self._index_manager._text_indexes = cache["_text_indexes"]
+        self._index_manager._vectors_dirty = False
+        self._total_records = cache["_total_records"]
+        return True
+
+    def _save_cache(self) -> None:
+        """Save the current index state to a cache file (best-effort)."""
+        if self._readonly:
+            return
+
+        fp = self._file_fingerprint()
+        if fp is None:
+            return
+        data_len, data_mtime_ns = fp
+
+        cache = {
+            "_magic": b"MOOF",
+            "_version": 1,
+            "_data_file_length": data_len,
+            "_data_file_mtime_ns": data_mtime_ns,
+            "_total_records": self._total_records,
+            "_regular_fields": list(self._index_manager._fields),
+            "_vector_fields": dict(self._index_manager._vector_fields),
+            "_text_fields": list(self._index_manager._text_fields),
+            "_documents": self._index_manager._documents,
+            "_indexes": self._index_manager._indexes,
+            "_vector_indexes": self._index_manager._vector_indexes,
+            "_text_indexes": self._index_manager._text_indexes,
+        }
+
+        tmp_path = self._cache_path + ".tmp"
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, self._cache_path)
+        except Exception:
+            # Cache is disposable — never fail on write error.
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _delete_cache(self) -> None:
+        """Delete the cache file if it exists."""
+        try:
+            os.remove(self._cache_path)
+        except OSError:
+            pass
 
     def _save_meta(self, indexes: list, vector_indexes: dict = None, text_indexes: list = None) -> None:
         """Persist (or update) the .meta file with the given index configurations."""

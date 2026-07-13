@@ -86,7 +86,14 @@ class Collection:
         self._native.compact()
 
     def close(self):
-        pass
+        try:
+            self._native.save_cache()
+        except Exception:
+            pass  # cache is disposable — never fail on cache write
+        try:
+            self._native.close()
+        except Exception:
+            pass
 
     def __enter__(self):
         return self

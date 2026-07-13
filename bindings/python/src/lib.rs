@@ -302,6 +302,18 @@ impl NativeCollection {
         })
     }
 
+    fn save_cache(&self) -> PyResult<()> {
+        self.inner.save_cache().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
+    fn close(&self) -> PyResult<()> {
+        self.inner.close().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
     fn __repr__(&self) -> String {
         "NativeCollection(...)".into()
     }

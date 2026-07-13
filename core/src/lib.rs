@@ -32,6 +32,7 @@
 pub mod errors;
 pub mod storage;
 
+mod cache;
 mod index;
 mod query;
 mod text;
@@ -127,6 +128,10 @@ struct CollectionInner {
     index_manager: IndexManager,
     total_records: u64,
     closed: bool,
+    /// True if the indexes were loaded from a cache file (not rebuilt from scan).
+    loaded_from_cache: bool,
+    /// True if any write (insert/update/delete) has occurred since open.
+    dirty: bool,
 }
 
 impl Collection {
@@ -183,11 +188,26 @@ impl Collection {
         }
 
         let mut storage = StorageEngine::open(path, readonly)?;
-        let mut index_manager =
-            IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
 
-        let total_records =
-            load_from_file(path, readonly, &mut storage, &mut index_manager)?;
+        // --- Try the disposable cache first ---
+        let (index_manager, total_records, loaded_from_cache) =
+            match cache::try_load_cache(path, &merged_indexes, &merged_vector, &merged_text) {
+                cache::CacheLoad::Hit {
+                    index_manager,
+                    total_records,
+                } => {
+                    log::debug!("moofile: cache hit — skipping BSON scan");
+                    (index_manager, total_records, true)
+                }
+                cache::CacheLoad::Miss => {
+                    log::debug!("moofile: cache miss — rebuilding from BSON scan");
+                    let mut im =
+                        IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
+                    let total =
+                        load_from_file(path, readonly, &mut storage, &mut im)?;
+                    (im, total, false)
+                }
+            };
 
         Ok(Self {
             inner: Arc::new(RwLock::new(CollectionInner {
@@ -197,6 +217,8 @@ impl Collection {
                 index_manager,
                 total_records,
                 closed: false,
+                loaded_from_cache,
+                dirty: false,
             })),
         })
     }
@@ -221,6 +243,7 @@ impl Collection {
         inner.storage.append(RECORD_LIVE, &doc)?;
         inner.index_manager.add(doc.clone());
         inner.total_records += 1;
+        inner.dirty = true;
         Ok(doc)
     }
 
@@ -260,6 +283,7 @@ impl Collection {
         inner.index_manager.remove(&old_id);
         inner.index_manager.add(new_doc);
         inner.total_records += 1;
+        inner.dirty = true;
         Ok(true)
     }
 
@@ -290,6 +314,7 @@ impl Collection {
         }
 
         if count > 0 {
+            inner.dirty = true;
         }
         Ok(count)
     }
@@ -318,6 +343,7 @@ impl Collection {
         inner.index_manager.remove(&old_id);
         inner.index_manager.add(new_doc);
         inner.total_records += 1;
+        inner.dirty = true;
         Ok(true)
     }
 
@@ -342,6 +368,7 @@ impl Collection {
             .append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
         inner.index_manager.remove(&_id);
         inner.total_records += 1;
+        inner.dirty = true;
         Ok(true)
     }
 
@@ -365,6 +392,7 @@ impl Collection {
         }
 
         if count > 0 {
+            inner.dirty = true;
         }
         Ok(count)
     }
@@ -437,6 +465,12 @@ impl Collection {
 
         if result.is_ok() {
             inner.total_records = live_docs.len() as u64;
+            // The BSON file was rewritten — cache is definitely stale.
+            cache::delete_cache(&inner.path);
+            // After compaction the in-memory indexes are still valid (they
+            // reflect the live docs which are now the only docs), but the
+            // cache should be refreshed on close.
+            inner.dirty = true;
         }
 
         result
@@ -481,6 +515,63 @@ impl Collection {
         }
 
         inner.total_records = total;
+        // We just did a full rebuild — mark dirty so cache is written on close.
+        inner.loaded_from_cache = false;
+        inner.dirty = true;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Cache management
+    // ------------------------------------------------------------------
+
+    /// Explicitly save the index cache to disk.
+    ///
+    /// The cache is a snapshot of the in-memory indexes keyed on the data
+    /// file's length and modification time.  On the next open, if the data
+    /// file hasn't changed, the cache is loaded instead of rebuilding from
+    /// a BSON scan.
+    ///
+    /// This is called automatically by [`close`](Self::close) when
+    /// appropriate, but can be called manually at any time.
+    pub fn save_cache(&self) -> Result<(), MooFileError> {
+        let inner = self.inner.write().expect("lock poisoned");
+        inner.require_open()?;
+        cache::save_cache(&inner.path, &inner.index_manager, inner.total_records)
+    }
+
+    /// Close the collection, saving the cache if needed.
+    ///
+    /// **Option B logic:**
+    /// - If we loaded from cache and no writes occurred → skip (cache still valid).
+    /// - If we rebuilt from scan (no cache) → write cache so next open is fast.
+    /// - If writes occurred → write a fresh cache.
+    pub fn close(&self) -> Result<(), MooFileError> {
+        let mut inner = self.inner.write().expect("lock poisoned");
+        if inner.closed {
+            return Ok(());
+        }
+
+        // Close the storage handle FIRST so the data file's mtime is settled
+        // before we capture it for the cache fingerprint.
+        inner.storage.close();
+
+        // Save cache only if we didn't load from cache, or if writes happened.
+        if !inner.loaded_from_cache || inner.dirty {
+            if !inner.readonly {
+                if let Err(e) = cache::save_cache(
+                    &inner.path,
+                    &inner.index_manager,
+                    inner.total_records,
+                ) {
+                    log::warn!("moofile: failed to save cache: {e}");
+                    // Don't fail close on cache write error — the cache is
+                    // disposable and will simply be rebuilt on next open.
+                }
+            }
+        }
+
+        inner.closed = true;
         Ok(())
     }
 }
@@ -1352,5 +1443,158 @@ mod tests {
 
         assert_eq!(r[0].0.get_str("_id").unwrap(), "big");
         assert!((r[0].1 - 1.0).abs() < 1e-5, "cosine of same-direction = 1.0 regardless of magnitude");
+    }
+
+    // --- Cache tests ---
+
+    #[test]
+    fn cache_speeds_up_second_open() {
+        let (_dir, path) = setup();
+
+        // First open: insert data, then close (writes cache).
+        {
+            let db = Collection::builder(&path)
+                .index("email")
+                .index("age")
+                .vector_index("embedding", 3)
+                .text_index("content")
+                .open()
+                .unwrap();
+            db.insert_many(vec![
+                doc! { "_id": "a", "email": "a@x.com", "age": 30, "content": "hello world", "embedding": [1.0, 0.0, 0.0] },
+                doc! { "_id": "b", "email": "b@x.com", "age": 25, "content": "goodbye world", "embedding": [0.0, 1.0, 0.0] },
+                doc! { "_id": "c", "email": "c@x.com", "age": 40, "content": "hello again", "embedding": [0.0, 0.0, 1.0] },
+            ])
+            .unwrap();
+            db.close().unwrap();
+        }
+
+        // Cache file should exist.
+        let cache_path = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".cache");
+            std::path::PathBuf::from(s)
+        };
+        assert!(cache_path.exists(), "cache file should exist after close");
+
+        // Second open: should load from cache.
+        let db = Collection::builder(&path)
+            .index("email")
+            .index("age")
+            .vector_index("embedding", 3)
+            .text_index("content")
+            .open()
+            .unwrap();
+
+        // Verify all data is present and correct.
+        assert_eq!(db.count(doc! {}).unwrap(), 3);
+        assert_eq!(
+            db.find_one(doc! { "email": "a@x.com" }).unwrap().unwrap()
+                .get_i32("age").unwrap(),
+            30
+        );
+
+        // Vector search should work (vectors loaded from cache).
+        let vr = db.find(doc! {})
+            .unwrap()
+            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
+            .to_list()
+            .unwrap();
+        assert_eq!(vr.len(), 3);
+        assert_eq!(vr[0].0.get_str("_id").unwrap(), "a");
+
+        // Text search should work (text indexes loaded from cache).
+        let tr = db.find(doc! {})
+            .unwrap()
+            .text_search("content", "hello", 10)
+            .to_list()
+            .unwrap();
+        assert!(!tr.is_empty());
+        let ids: Vec<&str> = tr.iter().map(|(d, _)| d.get_str("_id").unwrap()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"c"));
+    }
+
+    #[test]
+    fn cache_skipped_on_readonly_open() {
+        let (_dir, path) = setup();
+
+        {
+            let db = Collection::builder(&path).index("email").open().unwrap();
+            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
+            db.close().unwrap();
+        }
+
+        // Open readonly — should not try to write cache on close.
+        let db = Collection::builder(&path).index("email").readonly().open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 1);
+        db.close().unwrap(); // should not error
+    }
+
+    #[test]
+    fn cache_deleted_on_compact() {
+        let (_dir, path) = setup();
+
+        {
+            let db = Collection::builder(&path).index("email").open().unwrap();
+            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
+            db.insert(doc! { "_id": "b", "email": "b@x.com" }).unwrap();
+            db.delete_one(doc! { "_id": "b" }).unwrap();
+            db.close().unwrap();
+        }
+
+        // Cache exists.
+        let cache_path = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".cache");
+            std::path::PathBuf::from(s)
+        };
+        assert!(cache_path.exists());
+
+        // Open, compact, close.
+        {
+            let db = Collection::builder(&path).index("email").open().unwrap();
+            db.compact().unwrap();
+            db.close().unwrap();
+        }
+
+        // After compact + close, a new cache should exist (with compacted data).
+        assert!(cache_path.exists(), "new cache should be written after compact+close");
+
+        // Open again — should work fine.
+        let db = Collection::builder(&path).index("email").open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 1);
+    }
+
+    #[test]
+    fn cache_not_rewritten_on_clean_close() {
+        let (_dir, path) = setup();
+
+        // First open: write data, close → cache written.
+        {
+            let db = Collection::builder(&path).index("email").open().unwrap();
+            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
+            db.close().unwrap();
+        }
+
+        let cache_path = {
+            let mut s = path.as_os_str().to_owned();
+            s.push(".cache");
+            std::path::PathBuf::from(s)
+        };
+        let mtime1 = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+
+        // Wait a tiny bit to ensure mtime would differ if rewritten.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Second open: loaded from cache, no writes → close should NOT rewrite.
+        {
+            let db = Collection::builder(&path).index("email").open().unwrap();
+            assert_eq!(db.count(doc! {}).unwrap(), 1);
+            db.close().unwrap();
+        }
+
+        let mtime2 = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+        assert_eq!(mtime1, mtime2, "cache should not be rewritten on clean close");
     }
 }

@@ -65,6 +65,33 @@ Indexes are **never persisted**. They are rebuilt in memory on every open by sca
 - Vector rebuilds are O(n) but acceptable for datasets under ~100K documents
 - Text index rebuilds include tokenization and stemming but complete in seconds
 
+### Disposable Index Snapshot Cache (v0.4.0)
+
+While indexes are never persisted as a source of truth, an optional **disposable cache** can dramatically accelerate cold opens for large datasets.
+
+On close, MooFile may write `mydata.bson.cache` — a binary snapshot of the in-memory indexes plus the data file's length and modification time. On the next open, if the cache's fingerprint matches the data file exactly, the pre-built indexes are loaded directly — skipping the BSON scan, decode, tokenisation, stemming, and vector normalisation that a cold rebuild requires.
+
+**Validation (all must pass or the cache is silently ignored):**
+1. Cache file exists and deserialises successfully
+2. Magic bytes + format version match
+3. Data file byte length matches (catches all append-only writes)
+4. Data file modification time matches (catches compaction, external edits)
+5. Index configuration matches (catches schema changes)
+
+**Properties:**
+- **Never a source of truth** — the BSON file is always the source of truth. The cache is a memoisation of the rebuild, keyed on file identity.
+- **Safe to delete at any time** — a missing cache simply triggers a normal rebuild.
+- **Can never be wrong** — any mismatch (modified file, corrupt cache, version change, schema change) triggers a full rebuild. The worst case is a cache miss, which is exactly the pre-cache behavior.
+- **Zero crash-recovery logic** — if the cache write is interrupted, the partial cache file is rejected on next open (deserialisation fails → rebuild).
+- **Format-specific** — a cache written by the Rust engine (bincode) is rejected by the Python engine (pickle) and vice versa. Cross-implementation portability is maintained through the BSON file, not the cache.
+
+**Option B write strategy:** The cache is written on close only when needed:
+- Loaded from cache, no writes → skip (cache is still valid)
+- Rebuilt from scan (no cache existed) → write cache so next open is fast
+- Writes occurred → write a fresh cache
+
+This avoids redundant cache writes when the collection is opened read-only or opened from a valid cache without modifications.
+
 ### BSON File Format
 
 The data file is **append-only**. Documents are never updated or deleted in place.

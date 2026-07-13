@@ -16,9 +16,11 @@ use rust_stemmers::{Algorithm, Stemmer};
 ///
 /// Tokenizes documents with a simple regex (`[a-zA-Z]+`), lowercases,
 /// stems with Porter, and scores with BM25.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TextIndex {
     k1: f32,
     b: f32,
+    #[serde(skip, default = "default_stemmer")]
     stemmer: Stemmer,
 
     /// Inverted index: stem → (doc_id → term_frequency)
@@ -30,6 +32,26 @@ pub(crate) struct TextIndex {
 
     /// Document frequency: stem → number of documents containing it
     doc_frequencies: HashMap<String, u32>,
+}
+
+impl Clone for TextIndex {
+    fn clone(&self) -> Self {
+        Self {
+            k1: self.k1,
+            b: self.b,
+            stemmer: Stemmer::create(Algorithm::English),
+            inverted: self.inverted.clone(),
+            doc_lengths: self.doc_lengths.clone(),
+            total_length: self.total_length,
+            doc_frequencies: self.doc_frequencies.clone(),
+        }
+    }
+}
+
+/// Create an English Porter stemmer — used as the serde default for the
+/// non-serializable `Stemmer` field when deserializing from cache.
+fn default_stemmer() -> Stemmer {
+    Stemmer::create(Algorithm::English)
 }
 
 impl std::fmt::Debug for TextIndex {

@@ -155,3 +155,30 @@ class TextIndex:
         self._doc_frequencies.clear()
         self._doc_count = 0
         self._total_length = 0
+
+    # ------------------------------------------------------------------
+    # Pickle support — the C stemmer object is not picklable, so we
+    # exclude it from the serialised state and recreate it on unpickle.
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        del state['_stemmer']  # C stemmer — not picklable
+        # Convert defaultdicts to regular dicts (lambda factories
+        # can't be pickled).
+        state['_inverted_index'] = dict(state['_inverted_index'])
+        for k in state['_inverted_index']:
+            state['_inverted_index'][k] = dict(state['_inverted_index'][k])
+        state['_doc_frequencies'] = dict(state['_doc_frequencies'])
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._stemmer = stemmer('english')
+        # Restore defaultdicts with their factories
+        from collections import defaultdict
+        self._inverted_index = defaultdict(
+            lambda: defaultdict(int),
+            {k: defaultdict(int, v) for k, v in self._inverted_index.items()}
+        )
+        self._doc_frequencies = defaultdict(int, self._doc_frequencies)

@@ -22,6 +22,7 @@ regex-lite = "0.1"
 getrandom = "0.3"
 log = "0.4"
 rayon = "1"
+bincode = "1"
 
 [dev-dependencies]
 tempfile = "3"

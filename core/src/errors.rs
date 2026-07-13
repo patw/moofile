@@ -44,6 +44,11 @@ pub enum MooFileError {
     /// and re-open; the indexes will be rebuilt.
     #[error("meta file corrupt: {0}")]
     MetaCorrupt(String),
+
+    /// Cache file error (serialisation/deserialisation failure).
+    /// Non-fatal — the cache is disposable and will be rebuilt.
+    #[error("cache error: {0}")]
+    CacheError(String),
 }
 
 /// Convenience: wrap a `std::io::Error` alongside the path that caused it.

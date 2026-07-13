@@ -15,12 +15,12 @@ use crate::text::TextIndex;
 /// Below this, rayon's thread-pool overhead isn't worth it.
 const PARALLEL_THRESHOLD: usize = 4096;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Value {
     Null, Bool(bool), I32(i32), I64(i64), Double(OrderedFloat), String(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(crate) struct OrderedFloat(f64);
 
 impl PartialEq for OrderedFloat {
@@ -48,14 +48,14 @@ impl IndexResult {
 }
 
 pub(crate) struct IndexManager {
-    regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
-    regular_fields: Vec<String>,
-    vector_fields: Vec<(String, usize)>,
-    vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
-    text_indexes: BTreeMap<String, TextIndex>,
-    text_fields: Vec<String>,
-    documents: BTreeMap<String, Arc<Document>>,
-    vectors_stale: bool,
+    pub(crate) regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
+    pub(crate) regular_fields: Vec<String>,
+    pub(crate) vector_fields: Vec<(String, usize)>,
+    pub(crate) vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
+    pub(crate) text_indexes: BTreeMap<String, TextIndex>,
+    pub(crate) text_fields: Vec<String>,
+    pub(crate) documents: BTreeMap<String, Arc<Document>>,
+    pub(crate) vectors_stale: bool,
 }
 
 impl std::fmt::Debug for IndexManager {
@@ -77,6 +77,36 @@ impl IndexManager {
             vector_fields: vector_fields.to_vec(), vector_data: BTreeMap::new(),
             text_indexes, text_fields: text_fields.to_vec(),
             documents: BTreeMap::new(), vectors_stale: true,
+        }
+    }
+
+    /// Reconstruct an IndexManager from a cache snapshot.
+    ///
+    /// All fields are pre-built — no scanning, no tokenisation, no vector
+    /// normalisation needed.  `vectors_stale` is `false` because the
+    /// cached vectors are already normalised.
+    ///
+    /// The field lists (`regular_fields`, `vector_fields`, `text_fields`)
+    /// are passed explicitly so that configured-but-empty indexes are
+    /// preserved (e.g. a vector index on a field that no document has yet).
+    pub(crate) fn from_cache(
+        regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
+        regular_fields: Vec<String>,
+        vector_fields: Vec<(String, usize)>,
+        vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
+        text_fields: Vec<String>,
+        text_indexes: BTreeMap<String, TextIndex>,
+        documents: BTreeMap<String, Arc<Document>>,
+    ) -> Self {
+        Self {
+            regular,
+            regular_fields,
+            vector_fields,
+            vector_data,
+            text_indexes,
+            text_fields,
+            documents,
+            vectors_stale: false,
         }
     }
 
