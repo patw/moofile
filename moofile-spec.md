@@ -1,4 +1,4 @@
-# MooFile — Specification v0.3.0
+# MooFile — Specification v0.4.0
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
@@ -161,6 +161,7 @@ moofile/
 │       ├── index.rs         # BTreeMap + vector + text indexes
 │       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval
 │       ├── text.rs          # BM25 + Porter stemming (rust-stemmers)
+│       ├── cache.rs         # Disposable index snapshot cache (bincode)
 │       └── errors.rs        # MooFileError enum
 │
 ├── bindings/python/         # PyO3 binding (maturin build)
@@ -199,6 +200,13 @@ moofile/
 | `rust-stemmers` | — | rust-stemmers 1.2 | Porter stemming (Rust) |
 | `serde` / `serde_json` | — | serde 1.x | Meta file JSON |
 | `thiserror` | — | thiserror 2.x | Error derive macros |
+| `regex-lite` | — | regex-lite 0.1 | Text tokenisation (Rust) |
+| `getrandom` | — | getrandom 0.3 | Random `_id` bytes (Rust) |
+| `hex` | — | hex 0.4 | `_id` hex encoding (Rust) |
+| `bincode` | — | bincode 1.x | Index snapshot cache serialisation (Rust) |
+| `fs4` | — | fs4 0.12 | Advisory file locking (Rust) |
+| `rayon` | — | rayon 1.x | Parallel index rebuild (Rust) |
+| `log` | — | log 0.4 | Structured logging (Rust) |
 | `pandas` (opt) | pandas≥1.0 | — | `.to_df()` method |
 
 ### Performance (10K docs, 128d vectors)
@@ -318,7 +326,7 @@ Multiple read-only opens are fine. One writer OR multiple readers, never both. T
 
 Every document has an `_id` field. Rules:
 
-- If not provided on insert, MooFile generates a random 16-byte hex string (Rust) or 24-char hex string (Python). Both are valid.
+- If not provided on insert, MooFile generates a random 24-char hex string (12 random bytes, hex-encoded). Both implementations produce the same format.
 - `_id` is always indexed automatically
 - `_id` must be unique — inserting a duplicate raises `DuplicateKeyError`
 
@@ -470,7 +478,7 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.1.0 | Initial release — pure-Python, basic CRUD, sorted indexes |
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
-| 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception |
+| 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception. **Disposable index snapshot cache** — `mydata.bson.cache` memoises the in-memory index rebuild, validated against the data file's length + mtime and silently ignored on any mismatch |
 
 ---
 

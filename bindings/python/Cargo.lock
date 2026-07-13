@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-core"
-version = "0.3.0"
+version = "0.4.1"
 dependencies = [
  "bson",
  "getrandom 0.3.4",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-py"
-version = "0.3.0"
+version = "0.4.1"
 dependencies = [
  "bson",
  "moofile-core",

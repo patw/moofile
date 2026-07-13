@@ -177,7 +177,7 @@ PYTHONPATH=. python bench_native.py
 ```
 moofile/
 ├── core/                    # Rust engine (cargo build)
-│   ├── src/{lib,storage,index,query,text,errors}.rs
+│   ├── src/{lib,storage,index,query,text,cache,errors}.rs
 │   └── examples/bench.rs    # Pure-Rust benchmark
 ├── bindings/python/         # PyO3 binding (maturin build)
 │   └── src/lib.rs

@@ -26,8 +26,11 @@ with Collection("mydata.bson", indexes=["email", "age"]) as db:
 | No server | ✓ | ✓ | ✗ | **✓** |
 | Document-oriented | ✗ | ✓ | ✓ | **✓** |
 | Indexes | ✓ | ✗ | ✓ | **✓** |
+| Vector search | ✗ | ✗ | ✓ (Atlas) | **✓** |
+| Text search | ✓ (FTS) | ✗ | ✓ | **✓** |
 | Developer-friendly API | ✗ (SQL) | ✓ (raw Python) | ✓ | **✓** |
 | Single-file portability | ✓ | ✓ | ✗ | **✓** |
+| **Rust core available** | ✗ | ✗ | ✗ | **✓ (v0.3+)** |
 
 MooFile is the right tool when you want MongoDB-style ergonomics without running a server: local tooling, embedded applications, tests, small datasets, single-process services.
 
@@ -43,7 +46,7 @@ pip install moofile
 pip install "moofile[pandas]"
 ```
 
-**Dependencies:**  `pymongo` (for BSON encoding) and `sortedcontainers`.
+**Dependencies:** `pymongo` (BSON encoding), `sortedcontainers` (sorted indexes), `numpy` (vector search), and `snowballstemmer` (Porter stemming for text search).
 
 ---
 
@@ -91,7 +94,7 @@ MooFile's API looks like MongoDB but has important differences that can trip up 
 - **update_one/replace_one are strict**: Raise `DocumentNotFoundError` if no match (MongoDB silently no-ops)
 - **delete_one returns bool**: Returns `True`/`False`, NOT a result object like MongoDB
 - **Vector/text search return tuples**: `[(doc, score), ...]` NOT plain document lists like `find()`
-- **Single-threaded only**: No concurrent write safety — serialize writes at application layer
+- **Single-threaded writes**: Concurrent writes from multiple threads are not protected — serialise writes at the application layer. (Cross-process concurrent access is detected and rejected with `ConcurrentAccessError`.)
 - **No nested field indexes**: Only top-level fields can be indexed (no `"user.name"` paths)
 - **No joins or $lookup**: No cross-document references or aggregation pipelines
 - **No async API**: All operations are synchronous
@@ -102,12 +105,16 @@ MooFile's API looks like MongoDB but has important differences that can trip up 
 
 ## File Layout
 
-A MooFile database is two files:
+A MooFile database is three files (plus an optional cache):
 
 ```
 users.bson        ← append-only document store, source of truth
 users.bson.meta   ← index configuration (JSON, human-readable)
+users.bson.lock   ← advisory lock file (prevents concurrent multi-process access)
+users.bson.cache  ← disposable index snapshot (optional, accelerates cold opens)
 ```
+
+The `.lock` file is disposable — safe to delete, re-created on next open. It exists only to detect and reject concurrent access from another process (raising `ConcurrentAccessError`).
 
 The `.meta` file is a small JSON file:
 
@@ -115,11 +122,19 @@ The `.meta` file is a small JSON file:
 {
   "version": 1,
   "indexes": ["email", "status"],
+  "vector_indexes": {"embedding": 384},
+  "text_indexes": ["content"],
   "created_at": "2025-01-01T00:00:00+00:00"
 }
 ```
 
-Indexes are **never persisted** — they are rebuilt in memory on every open by scanning the BSON file.  If the `.meta` file is lost, delete it and reopen; the data is always safe in the `.bson` file.
+Indexes are **never persisted as a source of truth** — they are rebuilt in memory on every open by scanning the BSON file. If the `.meta` file is lost, delete it and reopen; the data is always safe in the `.bson` file.
+
+### Disposable Index Snapshot Cache (v0.4.0)
+
+On close, MooFile may write `users.bson.cache` — a binary snapshot of the in-memory indexes plus the data file's length and modification time. On the next open, if the cache's fingerprint matches the data file exactly (byte length + mtime + index configuration), the pre-built indexes are loaded directly, skipping the BSON scan, decode, tokenisation, stemming, and vector normalisation that a cold rebuild requires.
+
+The cache is **never a source of truth** and **safe to delete at any time** — any mismatch (modified file, corrupt cache, version or schema change) triggers a full rebuild. The worst case is a cache miss, which is exactly the pre-cache behaviour. A cache written by the Rust engine (bincode) is rejected by the Python engine (pickle) and vice versa; cross-implementation portability is maintained through the BSON file, not the cache.
 
 ---
 
@@ -130,6 +145,7 @@ from moofile import (
     Collection,
     count, sum, mean, min, max, collect, first, last,
     MooFileError, DuplicateKeyError, DocumentNotFoundError, ReadOnlyError,
+    ConcurrentAccessError,
 )
 ```
 
@@ -168,6 +184,7 @@ db = Collection(
     text_indexes=[],             # list of field names for full-text search
     readonly=False,              # True to prevent all writes
     schema=None,                 # optional hints, ignored in v1
+    durability="os",             # "none" | "os" (default) | "fsync"
 )
 ```
 
@@ -584,11 +601,35 @@ db.compact()
 # Rebuild indexes from scratch (useful after manual file manipulation)
 db.reindex()
 
+# Force an fsync of the data file (batched durability)
+db.sync()
+
 # Explicit close
 db.close()
 ```
 
 **When to compact:** when `dead_ratio` exceeds ~0.30 (30 %).  Compaction is always explicit — MooFile never compacts automatically.
+
+### Durability
+
+The default `durability="os"` flushes writes to the OS page cache, which survives process crashes but **not** power loss. For power-loss durability, open with `durability="fsync"` (fsync after every write) or `durability="none"` (no flush at all — fastest, lost on crash).
+
+| Mode | Behavior | Survives | Equivalent |
+|---|---|---|---|
+| `"none"` | No flush — data in userspace buffer | Nothing | SQLite `synchronous=OFF` |
+| `"os"` (default) | `flush()` → OS page cache | Process crash | SQLite `synchronous=NORMAL` |
+| `"fsync"` | `sync_all()` after every write | Power loss | SQLite `synchronous=FULL` |
+
+For batched durability (best of both worlds), use the default and call `db.sync()` after a batch of writes to force a single fsync:
+
+```python
+db = Collection("data.bson", durability="os")
+for doc in docs:
+    db.insert(doc)
+db.sync()  # fsync once — all inserts are now durable
+```
+
+Compaction always fsyncs the temporary file and parent directory regardless of the durability setting, because it is a destructive rewrite of the entire file.
 
 ---
 
@@ -596,10 +637,11 @@ db.close()
 
 ```python
 from moofile import (
-    MooFileError,           # base exception
-    DuplicateKeyError,      # _id conflict on insert
-    DocumentNotFoundError,  # update_one / replace_one with no match
-    ReadOnlyError,          # write attempted on read-only collection
+    MooFileError,            # base exception
+    DuplicateKeyError,       # _id conflict on insert
+    DocumentNotFoundError,   # update_one / replace_one with no match
+    ReadOnlyError,           # write attempted on read-only collection
+    ConcurrentAccessError,   # another process already has the file open
 )
 ```
 
@@ -636,7 +678,7 @@ Index rules:
 - **Vector indexes**: Brute-force cosine similarity on all vectors
 - **Text indexes**: BM25 scoring with Porter stemming
 - `_id` is always available for fast lookup regardless of declared indexes
-- All indexes are rebuilt in memory on every open
+- All indexes are rebuilt in memory on every open (or restored from the disposable cache when valid)
 - Declaring additional indexes is cheap — just reopen the collection
 
 ---
@@ -654,15 +696,19 @@ Record types:
 - `0x02` tombstone (delete marker)
 - `0x03` replacement (update marker)
 
-On open, MooFile scans the file once from start to finish.  The last record for any given `_id` wins.  In-memory indexes are built from the live document set.
+On open, MooFile first tries to load a disposable index snapshot from `mydata.bson.cache`. If the cache's fingerprint (data file byte length + modification time + index configuration) matches exactly, the pre-built indexes are loaded directly and the BSON scan is skipped. On any mismatch — or if no cache exists — MooFile scans the file once from start to finish. The last record for any given `_id` wins. In-memory indexes are built from the live document set.
 
-If the file is truncated mid-write (crash during a write), MooFile detects and removes the incomplete trailing record on the next open.  You lose at most the last in-flight write; all prior records are safe.
+If the file is truncated mid-write (crash during a write), MooFile detects and removes the incomplete trailing record on the next open. You lose at most the last in-flight write; all prior records are safe.
+
+On open, MooFile also acquires an advisory lock on `mydata.bson.lock` (exclusive for writers, shared for read-only opens) to detect and reject concurrent multi-process access.
 
 ---
 
-## Thread Safety
+## Thread Safety & Concurrency
 
-Single-threaded only.  Concurrent reads are safe.  Concurrent writes are not protected — serialise writes at the application layer if needed.
+Within a single process, MooFile is single-threaded for writes — concurrent writes from multiple threads are not protected, so serialise writes at the application layer if needed. Concurrent reads from multiple threads are safe.
+
+Across processes, MooFile detects concurrent access via an advisory lock on `mydata.bson.lock` and raises `ConcurrentAccessError` rather than silently corrupting the file. Multiple read-only opens are allowed (shared lock); a writer takes an exclusive lock. One writer **or** multiple readers, never both.
 
 ---
 
@@ -670,7 +716,7 @@ Single-threaded only.  Concurrent reads are safe.  Concurrent writes are not pro
 
 - No server or network interface
 - No replication or clustering
-- No multi-process concurrent writes
+- No multi-process concurrent writes — detected and rejected with `ConcurrentAccessError` rather than silently corrupting data
 - No `$lookup` / joins
 - No nested field indexes
 - No async API
