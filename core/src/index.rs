@@ -7,8 +7,13 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use bson::Document;
+use rayon::prelude::*;
 
 use crate::text::TextIndex;
+
+/// Threshold for switching from sequential to parallel scoring.
+/// Below this, rayon's thread-pool overhead isn't worth it.
+const PARALLEL_THRESHOLD: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Value {
@@ -92,8 +97,37 @@ impl IndexManager {
                 }
             }
         }
+        // Incremental vector update: if vectors are not stale, append the
+        // new row to the existing matrix instead of triggering a full O(n·d)
+        // rebuild on the next search.  Only remove() sets vectors_stale.
+        if !self.vectors_stale {
+            for (field, dim) in &self.vector_fields {
+                if let Some(bson::Bson::Array(arr)) = doc.get(field) {
+                    let vec: Vec<f32> = arr.iter().filter_map(|v| match v {
+                        bson::Bson::Double(f) => Some(*f as f32),
+                        bson::Bson::Int32(i) => Some(*i as f32),
+                        bson::Bson::Int64(i) => Some(*i as f32),
+                        _ => None,
+                    }).collect();
+                    if vec.len() == *dim {
+                        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        let normalized: Vec<f32> = if norm > 0.0 {
+                            vec.iter().map(|x| x / norm).collect()
+                        } else {
+                            vec // zero vector — cosine is 0 regardless
+                        };
+                        if let Some((ids, data, _)) = self.vector_data.get_mut(field) {
+                            ids.push(_id.clone());
+                            data.extend_from_slice(&normalized);
+                        } else {
+                            // Field not yet in vector_data (no prior docs had it) — initialise
+                            self.vector_data.insert(field.clone(), (vec![_id.clone()], normalized, *dim));
+                        }
+                    }
+                }
+            }
+        }
         self.documents.insert(_id, Arc::new(doc));
-        self.vectors_stale = true;
     }
 
     pub fn remove(&mut self, _id: &str) -> Option<Document> {
@@ -257,7 +291,17 @@ impl IndexManager {
                         bson::Bson::Int64(i) => Some(*i as f32),
                         _ => None,
                     }).collect();
-                    if vec.len() == *dim { ids.push(_id.clone()); data.extend_from_slice(&vec); }
+                    if vec.len() == *dim {
+                        // Normalise at build time so cosine similarity collapses
+                        // to a plain dot product at query time (item #1).
+                        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                        let normalized: Vec<f32> = if norm > 0.0 {
+                            vec.iter().map(|x| x / norm).collect()
+                        } else {
+                            vec // zero vector — cosine is 0 regardless
+                        };
+                        ids.push(_id.clone()); data.extend_from_slice(&normalized);
+                    }
                 }
             }
             self.vector_data.insert(field.clone(), (ids, data, *dim));
@@ -269,16 +313,36 @@ impl IndexManager {
 
     pub fn vector_search(&self, field: &str, query: &[f32], limit: usize) -> Vec<(Document, f32)> {
         let (ids, data, dim) = match self.vector_data.get(field) { Some(vd) => vd, None => return Vec::new() };
-        let n = ids.len(); if n == 0 || *dim == 0 { return Vec::new(); }
-        let qn = query.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let n = ids.len(); if n == 0 || *dim == 0 || limit == 0 { return Vec::new(); }
+
+        // Normalise query once — rows are already normalised at build time,
+        // so cosine similarity is just a dot product (item #1).
+        let qn: f32 = query.iter().map(|x| x*x).sum::<f32>().sqrt();
         if qn == 0.0 { return Vec::new(); }
-        let mut scored: Vec<(usize, f32)> = (0..n).map(|i| {
-            let row = &data[i*dim..(i+1)*dim];
-            let dot: f32 = row.iter().zip(query).map(|(a,b)| a*b).sum();
-            let rn = row.iter().map(|x| x*x).sum::<f32>().sqrt();
-            (i, if rn > 0.0 { dot/(qn*rn) } else { 0.0 })
-        }).collect();
-        scored.sort_by(|a,b| b.1.total_cmp(&a.1)); scored.truncate(limit);
+        let q_norm: Vec<f32> = query.iter().map(|x| x / qn).collect();
+
+        // Score: dot product with pre-normalised rows (item #5: parallel for large n)
+        let mut scored: Vec<(usize, f32)> = if n > PARALLEL_THRESHOLD {
+            (0..n).into_par_iter().map(|i| {
+                let row = &data[i*dim..(i+1)*dim];
+                let dot: f32 = row.iter().zip(&q_norm).map(|(a,b)| a*b).sum();
+                (i, dot)
+            }).collect()
+        } else {
+            (0..n).map(|i| {
+                let row = &data[i*dim..(i+1)*dim];
+                let dot: f32 = row.iter().zip(&q_norm).map(|(a,b)| a*b).sum();
+                (i, dot)
+            }).collect()
+        };
+
+        // Bounded top-k: O(n) partition + O(k log k) sort (item #2)
+        if limit < scored.len() {
+            scored.select_nth_unstable_by(limit, |a, b| b.1.total_cmp(&a.1));
+            scored.truncate(limit);
+        }
+        scored.sort_by(|a,b| b.1.total_cmp(&a.1));
+
         scored.into_iter().filter_map(|(i, score)|
             self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
         ).collect()
@@ -286,9 +350,46 @@ impl IndexManager {
 
     pub fn vector_search_filtered(&self, field: &str, query: &[f32], limit: usize,
                                    allowed_ids: &std::collections::HashSet<String>) -> Vec<(Document, f32)> {
-        let mut all = self.vector_search(field, query, usize::MAX);
-        all.retain(|(doc, _)| doc.get("_id").map(|id| allowed_ids.contains(&id.to_string())).unwrap_or(false));
-        all.truncate(limit); all
+        let (ids, data, dim) = match self.vector_data.get(field) { Some(vd) => vd, None => return Vec::new() };
+        let n = ids.len(); if n == 0 || *dim == 0 || limit == 0 { return Vec::new(); }
+
+        // Normalise query once
+        let qn: f32 = query.iter().map(|x| x*x).sum::<f32>().sqrt();
+        if qn == 0.0 { return Vec::new(); }
+        let q_norm: Vec<f32> = query.iter().map(|x| x / qn).collect();
+
+        // Score ONLY allowed documents — avoids computing dot products for
+        // documents that will be filtered out anyway (item #4).
+        let mut scored: Vec<(usize, f32)> = if n > PARALLEL_THRESHOLD {
+            (0..n).into_par_iter()
+                .filter(|&i| allowed_ids.contains(&ids[i]))
+                .map(|i| {
+                    let row = &data[i*dim..(i+1)*dim];
+                    let dot: f32 = row.iter().zip(&q_norm).map(|(a,b)| a*b).sum();
+                    (i, dot)
+                })
+                .collect()
+        } else {
+            (0..n)
+                .filter(|&i| allowed_ids.contains(&ids[i]))
+                .map(|i| {
+                    let row = &data[i*dim..(i+1)*dim];
+                    let dot: f32 = row.iter().zip(&q_norm).map(|(a,b)| a*b).sum();
+                    (i, dot)
+                })
+                .collect()
+        };
+
+        // Bounded top-k (item #2)
+        if limit < scored.len() {
+            scored.select_nth_unstable_by(limit, |a, b| b.1.total_cmp(&a.1));
+            scored.truncate(limit);
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        scored.into_iter().filter_map(|(i, score)|
+            self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
+        ).collect()
     }
 
     pub fn text_search(&self, field: &str, query: &str, limit: usize) -> Vec<(Document, f32)> {
@@ -335,4 +436,111 @@ mod tests {
     #[test] fn vec_basic() { let mut im=m(); im.add(doc!{"_id":"near","embedding":[1.0,0.0,0.0]}); im.add(doc!{"_id":"far","embedding":[0.0,0.0,1.0]}); im.add(doc!{"_id":"mid","embedding":[0.7,0.0,0.7]}); im.rebuild_vector_indexes(); let r=im.vector_search("embedding",&[1.0,0.0,0.0],10); assert_eq!(r.len(),3); assert_eq!(r[0].0.get_str("_id").unwrap(),"near"); assert!(r[0].1>=r[1].1); }
     #[test] fn vec_limit() { let mut im=m(); for i in 0..5{im.add(doc!{"_id":i.to_string(),"embedding":[i as f64,0.0,0.0]});} im.rebuild_vector_indexes(); assert_eq!(im.vector_search("embedding",&[0.0,1.0,0.0],2).len(),2); }
     #[test] fn vec_wrong_dim() { let mut im=m(); im.add(doc!{"_id":"good","embedding":[1.0,0.0,0.0]}); im.add(doc!{"_id":"bad","embedding":[1.0,0.0]}); im.rebuild_vector_indexes(); assert_eq!(im.vector_search("embedding",&[1.0,0.0,0.0],10).len(),1); }
+
+    // --- Tests for items #1–#4: incremental updates, normalised scores, filtered search, top-k ---
+
+    #[test]
+    fn vec_incremental_add_visible() {
+        // After rebuild, new add() calls must be visible in search without
+        // requiring another rebuild (item #3).
+        let mut im = m();
+        im.add(doc!{"_id":"a","embedding":[1.0,0.0,0.0]});
+        im.add(doc!{"_id":"b","embedding":[0.0,1.0,0.0]});
+        im.rebuild_vector_indexes();
+        // Simulate a RAG-style interleaved insert/search workload
+        im.add(doc!{"_id":"c","embedding":[0.9,0.1,0.0]});
+        let r = im.vector_search("embedding",&[1.0,0.0,0.0],10);
+        assert_eq!(r.len(),3);
+        let ids: Vec<_> = r.iter().map(|(d,_)| d.get_str("_id").unwrap()).collect();
+        assert!(ids.contains(&"c"), "incrementally added doc must be visible in search");
+    }
+
+    #[test]
+    fn vec_incremental_after_delete_rebuild() {
+        // Delete sets stale → next search rebuilds → subsequent adds are incremental again
+        let mut im = m();
+        im.add(doc!{"_id":"a","embedding":[1.0,0.0,0.0]});
+        im.add(doc!{"_id":"b","embedding":[0.0,1.0,0.0]});
+        im.rebuild_vector_indexes();
+        im.remove("a"); // sets stale
+        im.ensure_vectors_fresh(); // rebuilds → stale=false
+        im.add(doc!{"_id":"c","embedding":[1.0,0.0,0.0]}); // incremental
+        let r = im.vector_search("embedding",&[1.0,0.0,0.0],10);
+        assert_eq!(r.len(),2); // b and c (a was deleted)
+        let ids: Vec<_> = r.iter().map(|(d,_)| d.get_str("_id").unwrap()).collect();
+        assert!(!ids.contains(&"a"));
+        assert!(ids.contains(&"c"));
+    }
+
+    #[test]
+    fn vec_normalised_scores_cosine() {
+        // Vectors with different magnitudes but same direction should have
+        // cosine similarity 1.0 (item #1: normalise at build time).
+        let mut im = m();
+        im.add(doc!{"_id":"big","embedding":[3.0,0.0,0.0]});
+        im.add(doc!{"_id":"orth","embedding":[0.0,5.0,0.0]});
+        im.rebuild_vector_indexes();
+        let r = im.vector_search("embedding",&[1.0,0.0,0.0],10);
+        assert_eq!(r.len(),2);
+        assert!((r[0].1 - 1.0).abs() < 1e-5, "same-direction vector should have cosine=1.0");
+        assert_eq!(r[0].0.get_str("_id").unwrap(),"big");
+        assert!((r[1].1 - 0.0).abs() < 1e-5, "orthogonal vector should have cosine=0.0");
+    }
+
+    #[test]
+    fn vec_filtered_scores_only_allowed() {
+        // Filtered search must only return allowed docs with correct scores (item #4).
+        let mut im = m();
+        im.add(doc!{"_id":"a","embedding":[1.0,0.0,0.0]});
+        im.add(doc!{"_id":"b","embedding":[0.9,0.1,0.0]});
+        im.add(doc!{"_id":"c","embedding":[0.8,0.2,0.0]});
+        im.rebuild_vector_indexes();
+        let allowed: std::collections::HashSet<String> =
+            vec!["a".to_string(),"c".to_string()].into_iter().collect();
+        let r = im.vector_search_filtered("embedding",&[1.0,0.0,0.0],10,&allowed);
+        assert_eq!(r.len(),2);
+        let ids: Vec<_> = r.iter().map(|(d,_)| d.get_str("_id").unwrap()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"c"));
+        assert!(!ids.contains(&"b"), "filtered-out doc must not appear");
+        // a is closer to [1,0,0] than c
+        assert!(r[0].1 >= r[1].1);
+    }
+
+    #[test]
+    fn vec_filtered_empty_allowed() {
+        let mut im = m();
+        im.add(doc!{"_id":"a","embedding":[1.0,0.0,0.0]});
+        im.rebuild_vector_indexes();
+        let allowed: std::collections::HashSet<String> = vec![].into_iter().collect();
+        let r = im.vector_search_filtered("embedding",&[1.0,0.0,0.0],10,&allowed);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn vec_topk_correctness_large() {
+        // Verify top-k returns the correct top-k elements in order (item #2).
+        let mut im = m();
+        for i in 0..200 {
+            let f = i as f64 / 200.0;
+            im.add(doc!{"_id":i.to_string(),"embedding":[f,1.0-f,0.0]});
+        }
+        im.rebuild_vector_indexes();
+        let r = im.vector_search("embedding",&[1.0,0.0,0.0],5);
+        assert_eq!(r.len(),5);
+        // Descending order
+        for i in 0..4 { assert!(r[i].1 >= r[i+1].1, "scores must be descending"); }
+        // Doc 199 has the highest first component (0.995)
+        assert_eq!(r[0].0.get_str("_id").unwrap(), "199");
+    }
+
+    #[test]
+    fn vec_limit_zero() {
+        let mut im = m();
+        im.add(doc!{"_id":"a","embedding":[1.0,0.0,0.0]});
+        im.rebuild_vector_indexes();
+        assert!(im.vector_search("embedding",&[1.0,0.0,0.0],0).is_empty());
+        let allowed: std::collections::HashSet<String> = vec!["a".to_string()].into_iter().collect();
+        assert!(im.vector_search_filtered("embedding",&[1.0,0.0,0.0],0,&allowed).is_empty());
+    }
 }

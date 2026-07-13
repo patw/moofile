@@ -1292,4 +1292,65 @@ mod tests {
             .unwrap();
         assert!(results.is_empty());
     }
+
+    // --- Vector search regression tests (items #1–#4) ---
+
+    #[test]
+    fn vector_search_after_insert() {
+        // The core regression: docs inserted after the first search must be
+        // visible in subsequent searches without an explicit reindex.
+        let (_dir, path) = setup();
+        let db = Collection::builder(&path)
+            .vector_index("embedding", 3)
+            .open()
+            .unwrap();
+
+        db.insert(doc! { "_id": "a", "embedding": [1.0, 0.0, 0.0] }).unwrap();
+        db.insert(doc! { "_id": "b", "embedding": [0.0, 1.0, 0.0] }).unwrap();
+
+        // First search — triggers initial vector rebuild
+        let r1 = db.find(doc! {})
+            .unwrap()
+            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
+            .to_list()
+            .unwrap();
+        assert_eq!(r1.len(), 2);
+
+        // Insert more docs (incremental append, no rebuild)
+        db.insert(doc! { "_id": "c", "embedding": [0.9, 0.1, 0.0] }).unwrap();
+        db.insert(doc! { "_id": "d", "embedding": [0.8, 0.2, 0.0] }).unwrap();
+
+        // Second search — must see all 4 docs
+        let r2 = db.find(doc! {})
+            .unwrap()
+            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
+            .to_list()
+            .unwrap();
+        assert_eq!(r2.len(), 4, "docs inserted after first search must be visible");
+        let ids: Vec<&str> = r2.iter().map(|(d, _)| d.get_str("_id").unwrap()).collect();
+        assert!(ids.contains(&"c"));
+        assert!(ids.contains(&"d"));
+    }
+
+    #[test]
+    fn vector_search_cosine_magnitude_invariant() {
+        // Cosine similarity must be magnitude-invariant (item #1).
+        let (_dir, path) = setup();
+        let db = Collection::builder(&path)
+            .vector_index("embedding", 2)
+            .open()
+            .unwrap();
+
+        db.insert(doc! { "_id": "big", "embedding": [10.0, 0.0] }).unwrap();
+        db.insert(doc! { "_id": "orth", "embedding": [0.0, 10.0] }).unwrap();
+
+        let r = db.find(doc! {})
+            .unwrap()
+            .vector_search("embedding", vec![1.0, 0.0], 10)
+            .to_list()
+            .unwrap();
+
+        assert_eq!(r[0].0.get_str("_id").unwrap(), "big");
+        assert!((r[0].1 - 1.0).abs() < 1e-5, "cosine of same-direction = 1.0 regardless of magnitude");
+    }
 }

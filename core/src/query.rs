@@ -398,7 +398,7 @@ impl VectorQuery {
             let matching_docs = inner.index_manager.get_matching(&self.pre_filter);
             let allowed_ids: HashSet<String> = matching_docs
                 .iter()
-                .filter_map(|d| d.get("_id").map(|v| v.to_string()))
+                .filter_map(|d| d.get_str("_id").ok().map(String::from))
                 .collect();
 
             Ok(inner.index_manager.vector_search_filtered(
@@ -446,7 +446,7 @@ impl TextQuery {
         let matching_docs = inner.index_manager.get_matching(&self.pre_filter);
         let allowed_ids: HashSet<String> = matching_docs
             .iter()
-            .filter_map(|d| d.get("_id").map(|v| v.to_string()))
+            .filter_map(|d| d.get_str("_id").ok().map(String::from))
             .collect();
 
         let all_results =
@@ -457,8 +457,8 @@ impl TextQuery {
         Ok(all_results
             .into_iter()
             .filter(|(doc, _)| {
-                doc.get("_id")
-                    .map(|id| allowed_ids.contains(&id.to_string()))
+                doc.get_str("_id")
+                    .map(|id| allowed_ids.contains(id))
                     .unwrap_or(false)
             })
             .take(self.limit)

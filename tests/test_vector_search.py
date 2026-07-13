@@ -215,3 +215,135 @@ def test_vector_search_limit():
             os.unlink(path)
         if os.path.exists(path + ".meta"):
             os.unlink(path + ".meta")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for audit items #1–#4 and bonus finding
+# ---------------------------------------------------------------------------
+
+def test_vector_search_after_insert():
+    """Docs inserted after the first search must be visible in subsequent searches.
+    
+    This is the bonus-finding regression test: the old Python implementation
+    never rebuilt vector indexes after the initial build, so new docs were
+    silently excluded from vector search results.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bson") as f:
+        path = f.name
+    
+    db = Collection(path, vector_indexes={"embedding": 3})
+    
+    try:
+        db.insert({"_id": "a", "embedding": [1.0, 0.0, 0.0]})
+        db.insert({"_id": "b", "embedding": [0.0, 1.0, 0.0]})
+
+        # First search — triggers initial vector rebuild
+        r1 = db.find({}).vector_search("embedding", [1.0, 0.0, 0.0], limit=10).to_list()
+        assert len(r1) == 2
+
+        # Insert more docs
+        db.insert({"_id": "c", "embedding": [0.9, 0.1, 0.0]})
+        db.insert({"_id": "d", "embedding": [0.8, 0.2, 0.0]})
+
+        # Second search — MUST see all 4 docs
+        r2 = db.find({}).vector_search("embedding", [1.0, 0.0, 0.0], limit=10).to_list()
+        assert len(r2) == 4, "docs inserted after first search must be visible"
+        ids = {doc["_id"] for doc, _ in r2}
+        assert "c" in ids
+        assert "d" in ids
+
+    finally:
+        db.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        if os.path.exists(path + ".meta"):
+            os.unlink(path + ".meta")
+
+
+def test_vector_search_cosine_magnitude_invariant():
+    """Cosine similarity must be magnitude-invariant (item #1: normalise at build)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bson") as f:
+        path = f.name
+    
+    db = Collection(path, vector_indexes={"embedding": 2})
+    
+    try:
+        # Same direction, very different magnitudes
+        db.insert({"_id": "big", "embedding": [10.0, 0.0]})
+        db.insert({"_id": "orth", "embedding": [0.0, 10.0]})
+
+        results = db.find({}).vector_search("embedding", [1.0, 0.0], limit=10).to_list()
+        
+        assert results[0][0]["_id"] == "big"
+        assert abs(results[0][1] - 1.0) < 1e-5, "cosine=1.0 regardless of magnitude"
+        assert abs(results[1][1] - 0.0) < 1e-5, "orthogonal → cosine=0.0"
+
+    finally:
+        db.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        if os.path.exists(path + ".meta"):
+            os.unlink(path + ".meta")
+
+
+def test_vector_search_filtered_correctness():
+    """Filtered vector search must only return allowed docs with correct scores (item #4)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bson") as f:
+        path = f.name
+    
+    db = Collection(path, vector_indexes={"embedding": 3}, indexes=["category"])
+    
+    try:
+        db.insert({"_id": "a", "category": "x", "embedding": [1.0, 0.0, 0.0]})
+        db.insert({"_id": "b", "category": "y", "embedding": [0.95, 0.05, 0.0]})
+        db.insert({"_id": "c", "category": "x", "embedding": [0.5, 0.5, 0.0]})
+        db.insert({"_id": "d", "category": "y", "embedding": [0.0, 0.0, 1.0]})
+
+        # Filter to category "x" only — should return a and c, not b or d
+        results = db.find({"category": "x"}).vector_search(
+            "embedding", [1.0, 0.0, 0.0], limit=10
+        ).to_list()
+        
+        assert len(results) == 2
+        ids = {doc["_id"] for doc, _ in results}
+        assert ids == {"a", "c"}, "filtered search must only return matching docs"
+        
+        # a should be closer to [1,0,0] than c
+        assert results[0][0]["_id"] == "a"
+        assert results[0][1] > results[1][1]
+
+    finally:
+        db.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        if os.path.exists(path + ".meta"):
+            os.unlink(path + ".meta")
+
+
+def test_vector_search_topk_correctness():
+    """Top-k must return the correct top-k elements in descending order (item #2)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bson") as f:
+        path = f.name
+    
+    db = Collection(path, vector_indexes={"embedding": 2})
+    
+    try:
+        for i in range(100):
+            f_val = i / 100.0
+            db.insert({"_id": str(i), "embedding": [f_val, 1.0 - f_val]})
+        
+        results = db.find({}).vector_search("embedding", [1.0, 0.0], limit=5).to_list()
+        
+        assert len(results) == 5
+        # Scores in descending order
+        for i in range(4):
+            assert results[i][1] >= results[i + 1][1], "scores must be descending"
+        # Doc 99 has highest first component
+        assert results[0][0]["_id"] == "99"
+
+    finally:
+        db.close()
+        if os.path.exists(path):
+            os.unlink(path)
+        if os.path.exists(path + ".meta"):
+            os.unlink(path + ".meta")

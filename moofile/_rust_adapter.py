@@ -4,6 +4,7 @@ Adapter: wraps the Rust NativeCollection to match the Python Collection API.
 Used by moofile/__init__.py when the native extension is available.
 """
 
+import bson as _bson
 from typing import Optional
 
 _NativeCollection = None
@@ -46,7 +47,10 @@ class Collection:
         return _NativeQuery(self._native, filter_dict or {})
 
     def find_one(self, filter_dict=None):
-        return self._native.find_one(filter_dict)
+        raw = self._native.find_one_raw(filter_dict)
+        if raw is None:
+            return None
+        return _bson.BSON(raw).decode()
 
     def count(self, filter_dict=None) -> int:
         return self._native.count(filter_dict)
@@ -116,8 +120,10 @@ class _NativeQuery:
         return self
 
     def to_list(self) -> list:
-        # Single Rust round-trip — all docs returned at once
-        results = self._native.find(self._filter)
+        # Single Rust round-trip — all docs returned as raw BSON bytes,
+        # decoded on the Python side with pymongo's fast C decoder (item #6).
+        raw_docs = self._native.find_raw(self._filter)
+        results = [_bson.BSON(raw).decode() for raw in raw_docs]
 
         if self._sort_key is not None:
             results.sort(

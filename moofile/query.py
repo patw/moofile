@@ -242,18 +242,13 @@ class VectorQuery:
         """Return list of (doc, score) tuples sorted by similarity descending."""
         # Apply pre-filter if any (non-empty filter dict)
         if self._pre_filter and self._pre_filter != {}:
-            # Get documents that match the filter first
+            # Get documents that match the filter first, then score only those
+            # (item #4: avoids scoring all docs then filtering)
             filtered_docs = self._collection._get_docs(self._pre_filter)
-            # Create a temporary collection index with only filtered docs
-            # For simplicity, we'll just do vector search on all docs and then filter
-            all_results = self._collection._index_manager.vector_search(
-                self._field, self._query_vector, limit=None
+            allowed_ids = {doc["_id"] for doc in filtered_docs}
+            return self._collection._index_manager.vector_search_filtered(
+                self._field, self._query_vector, self._limit, allowed_ids
             )
-            # Filter results to only include pre-filtered docs
-            filtered_doc_ids = {doc["_id"] for doc in filtered_docs}
-            results = [(doc, score) for doc, score in all_results 
-                      if doc["_id"] in filtered_doc_ids]
-            return results[:self._limit]
         else:
             return self._collection._index_manager.vector_search(
                 self._field, self._query_vector, self._limit

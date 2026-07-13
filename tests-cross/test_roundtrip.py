@@ -12,6 +12,7 @@ import json
 import os
 
 import pytest
+from bson import Binary
 from moofile import Collection
 
 
@@ -136,3 +137,84 @@ def test_vector_search_basic(make_collection):
     assert len(results) == 2
     assert results[0][0]["_id"] == "near"  # near should be closer
     assert results[0][1] > results[1][1]  # first score > second score
+
+
+def test_bson_type_roundtrip(make_collection, tmp_path):
+    """BSON type round-trip through the backend — catches the lossy
+    ``_ => val.to_string()`` fallback in the PyO3 binding (item #6).
+
+    Datetime, binary, and nested documents must survive a write→read cycle
+    with their types intact, not be stringified.
+    """
+    from datetime import datetime, timezone
+
+    path = tmp_path / "types.bson"
+    db = make_collection(name="types.bson")
+
+    original = {
+        "_id": "type-test",
+        "nested": {"a": 1, "b": [2, 3]},
+        "dt": datetime(2025, 1, 15, 12, 30, 0, tzinfo=timezone.utc),
+        "binary": Binary(b"\x00\x01\x02\x03"),
+        "flag": True,
+        "count": 42,
+        "pi": 3.14,
+        "label": "hello",
+    }
+    db.insert(original)
+
+    found = db.find_one({"_id": "type-test"})
+    assert found is not None
+
+    # Type preservation checks
+    assert isinstance(found["nested"], dict)
+    assert found["nested"]["a"] == 1
+    assert found["nested"]["b"] == [2, 3]
+
+    assert isinstance(found["flag"], bool)
+    assert found["flag"] is True
+
+    assert isinstance(found["count"], int)
+    assert found["count"] == 42
+
+    assert isinstance(found["pi"], float)
+    assert abs(found["pi"] - 3.14) < 1e-6
+
+    assert found["label"] == "hello"
+
+    # Datetime must come back as a datetime, not a string
+    assert isinstance(found["dt"], datetime), \
+        f"datetime must survive round-trip, got {type(found['dt']).__name__}"
+    assert found["dt"].year == 2025
+    assert found["dt"].hour == 12
+
+    # Binary must come back as bytes/binary, not a string
+    assert bytes(found["binary"]) == b"\x00\x01\x02\x03", \
+        f"binary must survive round-trip, got {type(found['binary']).__name__}"
+
+
+def test_vector_search_after_insert(make_collection, tmp_path):
+    """Docs inserted after the first search must appear in subsequent searches.
+
+    Regression test for the bonus finding: the old Python implementation
+    never rebuilt vector indexes after the initial build.
+    """
+    db = make_collection(vector_indexes={"embedding": 3})
+
+    db.insert({"_id": "a", "embedding": [1.0, 0.0, 0.0]})
+    db.insert({"_id": "b", "embedding": [0.0, 1.0, 0.0]})
+
+    # First search triggers initial vector rebuild
+    r1 = db.find({}).vector_search("embedding", [1.0, 0.0, 0.0], limit=10).to_list()
+    assert len(r1) == 2
+
+    # Insert more docs
+    db.insert({"_id": "c", "embedding": [0.9, 0.1, 0.0]})
+    db.insert({"_id": "d", "embedding": [0.8, 0.2, 0.0]})
+
+    # Second search MUST see all 4 docs
+    r2 = db.find({}).vector_search("embedding", [1.0, 0.0, 0.0], limit=10).to_list()
+    assert len(r2) == 4, "docs inserted after first search must be visible"
+    ids = {doc["_id"] for doc, _ in r2}
+    assert "c" in ids
+    assert "d" in ids

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use bson::{Bson, Document};
 use moofile_core::Collection as RustCollection;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 // ---------------------------------------------------------------------------
 // Helpers: PyObject ↔ Bson
@@ -89,6 +89,14 @@ fn doc_to_py(doc: &Document, py: Python<'_>) -> PyObject {
         dict.set_item(k, bson_to_py(v, py)).unwrap();
     }
     dict.into()
+}
+
+/// Encode a BSON document to raw bytes for Python-side decoding (item #6).
+/// Returning raw bytes avoids the slow recursive PyDict building in bson_to_py
+/// and the lossy _ => val.to_string() fallback.
+fn doc_to_bson_bytes(doc: &Document, py: Python<'_>) -> PyObject {
+    let bytes = bson::to_vec(doc).unwrap_or_default();
+    PyBytes::new(py, &bytes).into()
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +200,47 @@ impl NativeCollection {
         })?;
         match result {
             Some(doc) => Ok(doc_to_py(&doc, py)),
+            None => Ok(py.None()),
+        }
+    }
+
+    // --- Raw BSON passthrough (item #6) ---
+    // Returns raw BSON bytes for Python-side decoding with pymongo's C decoder.
+    // This avoids the slow recursive PyDict building in bson_to_py and fixes
+    // the lossy _ => val.to_string() fallback that mangles datetimes, binary,
+    // ObjectIds, etc.
+
+    /// Find all matching documents and return as a list of raw BSON bytes.
+    fn find_raw(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let results = self
+            .inner
+            .find(f)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .to_list()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
+        Ok(list.unwrap().into())
+    }
+
+    /// Find one matching document and return as raw BSON bytes (or None).
+    fn find_one_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let result = self.inner.find_one(f).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })?;
+        match result {
+            Some(doc) => Ok(doc_to_bson_bytes(&doc, py)),
             None => Ok(py.None()),
         }
     }
