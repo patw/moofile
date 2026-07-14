@@ -1,8 +1,9 @@
 # MooFile — Specification v0.4.0
 
-> A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, and a developer-friendly query API.  
+> A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, **on-device autoembedding**, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
-> **Now with a Rust core — 2-24× faster than pure Python.**
+> **Now with a Rust core — 2-24× faster than pure Python.**  
+> **And on-device embeddings — semantic search without external APIs.**
 
 ---
 
@@ -20,6 +21,7 @@ MooFile sits in the gap:
 - **Document-oriented** like MongoDB — JSON-shaped data, flexible schema
 - **Vector search** like modern vector databases — cosine similarity, semantic search
 - **Text search** like Elasticsearch — BM25 ranking, full-text indexing
+- **On-device autoembedding** — run local GGUF embedding models, no external APIs needed
 - **Developer-friendly API** — method chains, not operator dicts
 - **Single-file portability** — your database is a file you can copy, version control, or email
 - **Rust core** (v0.3.0) — 18-24× faster cold open, 10× faster insert, transparent fallback to pure Python
@@ -159,9 +161,10 @@ moofile/
 │       ├── lib.rs           # Collection, CollectionBuilder, public API
 │       ├── storage.rs       # Append-only BSON file I/O
 │       ├── index.rs         # BTreeMap + vector + text indexes
-│       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval
+│       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval, .semantic()
 │       ├── text.rs          # BM25 + Porter stemming (rust-stemmers)
 │       ├── cache.rs         # Disposable index snapshot cache (bincode)
+│       ├── embed.rs         # Autoembedding engine (llama-gguf wrapper, quantization)
 │       └── errors.rs        # MooFileError enum
 │
 ├── bindings/python/         # PyO3 binding (maturin build)
@@ -208,6 +211,8 @@ moofile/
 | `rayon` | — | rayon 1.x | Parallel index rebuild (Rust) |
 | `log` | — | log 0.4 | Structured logging (Rust) |
 | `pandas` (opt) | pandas≥1.0 | — | `.to_df()` method |
+| **`llama-gguf`** | — | **llama-gguf 0.14** | **On-device embedding model inference (Rust)** |
+| **`dirs`** | — | **dirs 6.x** | **Model cache directory detection (Rust)** |
 
 ### Performance (10K docs, 128d vectors)
 
@@ -386,6 +391,100 @@ A document that appears in both the text and vector result lists receives contri
 
 No other embedded single-file document store offers BM25 + cosine + RRF fusion behind a single method call.
 
+### Semantic Search (Autoembedding, v0.5.0)
+
+MooFile v0.5.0 introduces **on-device autoembedding** — run local embedding models (GGUF format) directly from the Rust core, with no external API calls. Models are auto-downloaded from HuggingFace on first use and cached in `~/.cache/moofile/models/`.
+
+**Configuration:**
+
+```python
+from moofile import Collection
+
+db = Collection("docs.bson",
+    vector_indexes={"embedding": 1024},
+    auto_embed={
+        "content": {                              # source text field
+            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            #         ^^ HuggingFace URI scheme: hf:<repo>:<filename>
+            "target": "embedding",                # target vector field
+            "dims": 1024,                         # embedding dimensions
+            "precision": "int8",                  # f32 | int8 | uint8 | binary
+            "normalize": True,
+            "query_prefix": "Represent the query for retrieving supporting documents: ",
+            "doc_prefix": "Represent the document for retrieval: ",
+        },
+    })
+```
+
+**On insert/update:** if the document has a `"content"` field, MooFile automatically prefixes it with the `doc_prefix`, runs the embedding model, quantizes the result to `int8`, dequantizes to f32 for BSON storage, and populates the `"embedding"` field. This happens transparently — the caller just inserts their data.
+
+**On query — `.semantic()`:** the query text is prefixed with `query_prefix`, embedded with the same model, and used for vector search:
+
+```python
+# Auto-embeds "quantum algorithms" and searches the "embedding" field
+results = db.find({"year": 2025}).semantic("content", "quantum algorithms", 5).to_list()
+```
+
+**On hybrid search — auto-embedding:** pass `None` for `query_vector` to auto-embed from `query_text`:
+
+```python
+# The vector leg auto-embeds "quantum" from query_text using the configured model
+results = db.find({}).hybrid_search("content", "content", "quantum", None, 10).to_list()
+```
+
+**Multiple auto-embed sources:** you can configure multiple source fields with different models or the same model:
+
+```python
+auto_embed={
+    "abstract": {
+        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+        "target": "embedding",
+        "dims": 1024,
+        "precision": "int8",
+    },
+    "title": {
+        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+        "target": "title_vec",
+        "dims": 256,                         # MRL truncation
+        "precision": "binary",               # 128 bytes per embedding
+    },
+}
+```
+
+**Precision comparison:**
+
+| Precision | Bytes per 1024-dim | Quality vs f32 |
+|-----------|-------------------|----------------|
+| `f32`     | 4,096 (4.0 KB)    | Baseline       |
+| `int8`    | 1,024 (1.0 KB)    | ~1.0000 cosine |
+| `uint8`   | 1,024 (1.0 KB)    | ~1.0000 cosine |
+| `binary`  | 128 (128 B)       | ~0.9999 cosine |
+
+All precisions use **Quantization-Aware Training (QAT)** — the model was trained to produce good results even after quantization. int8 and uint8 retain essentially perfect quality at 75% storage reduction. Binary retains usable quality at 96.9% storage reduction.
+
+**Model URI scheme:**
+
+```
+hf:user/repo:filename.gguf  → HuggingFace Hub (auto-download + cache)
+./local/model.gguf          → local file path
+/absolute/path/model.gguf   → absolute path
+```
+
+Models are downloaded on first use via `llama-gguf`'s HuggingFace client, cached in `~/.cache/huggingface/hub/` (the standard HF cache), and loaded once per collection open. Subsequent opens are instant.
+
+**Rust implementation:**
+
+The autoembedding engine lives in `core/src/embed.rs`:
+
+- `EmbeddingEngine` — wraps `llama_gguf::Engine` for text → vector
+- `AutoEmbedConfig` — per-source-field configuration (model, target, precision, prefixes)
+- `EmbeddingPrecision` — `F32 | Int8 | Uint8 | Binary`
+- `ModelUri` — parses `hf:...` URIs and resolves to local paths via `HfClient`
+- `quantize()` / `dequantize()` — conversion between f32 and quantized formats
+- `cosine_similarity_quantized()` — compute cosine directly on quantized bytes (XOR + popcount for binary)
+
+The engine is integrated into `CollectionInner` and invoked during `insert()`, `update_one/many()`, and `replace_one()`. For queries, `.semantic()` on `Query` and the updated `.hybrid_search()` (with `None` query_vector) trigger auto-embedding.
+
 ### Atomic Batch Writes
 
 The `batch()` context manager buffers all write operations (insert, update, delete) and applies them atomically on commit — a single storage append, a single flush/fsync, and all index mutations applied together.
@@ -479,6 +578,7 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
 | 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception. **Disposable index snapshot cache** — `mydata.bson.cache` memoises the in-memory index rebuild, validated against the data file's length + mtime and silently ignored on any mismatch |
+| 0.5.0 | **On-device autoembedding** — local GGUF embedding models via `llama-gguf`, auto-downloaded from HuggingFace on first use. `.semantic()` query method. `hybrid_search()` accepts `None` query_vector for auto-embedding. Multiple precision modes: f32, int8, uint8, binary. QAT-trained models retain quality after quantization |
 
 ---
 

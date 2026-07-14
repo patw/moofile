@@ -58,6 +58,22 @@ pub enum MooFileError {
     /// Attempted to start a batch while another batch is already active.
     #[error("a batch is already active — nested batches are not supported")]
     BatchAlreadyActive,
+
+    /// Autoembed model file not found.
+    #[error("autoembed model not found: {0}")]
+    ModelNotFound(PathBuf),
+
+    /// Embedding model failed to load or run.
+    #[error("embedding error: {0}")]
+    EmbeddingError(String),
+
+    /// No autoembed configuration found for a source field.
+    #[error("no autoembed configured for source field '{0}'")]
+    NoAutoEmbed(String),
+
+    /// Network/download error.
+    #[error("download error: {0}")]
+    DownloadError(String),
 }
 
 /// Convenience: wrap a `std::io::Error` alongside the path that caused it.

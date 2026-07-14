@@ -549,7 +549,103 @@ No other embedded single-file document store offers BM25 + cosine + RRF fusion b
 
 ---
 
-### Atomic Batch Writes
+### Autoembedding (Semantic Search, v0.5.0+)
+
+MooFile can run local GGUF embedding models on-device, eliminating the need for external embedding APIs.
+
+**Configuration — `auto_embed` parameter on `Collection`:**
+
+```python
+db = Collection("docs.bson",
+    vector_indexes={"embedding": 1024},
+    auto_embed={
+        "content": {                              # source text field
+            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            "target": "embedding",                # target vector field
+            "dims": 1024,                         # embedding dimensions
+            "precision": "int8",                  # "f32" | "int8" | "uint8" | "binary"
+            "normalize": True,
+            "query_prefix": "Represent the query for retrieving supporting documents: ",
+            "doc_prefix": "Represent the document for retrieval: ",
+        },
+    })
+```
+
+**Model URIs:**
+
+```
+hf:user/repo:filename.gguf  → HuggingFace Hub, auto-downloaded and cached
+./local/model.gguf          → local file path
+/absolute/path/model.gguf   → absolute path
+```
+
+On first open with an `hf:` URI, the model is downloaded from HuggingFace (~355 MB for Q8_0) and cached. Subsequent opens are instant.
+
+**On insert/update:** if a document has a source text field, MooFile automatically generates the embedding and stores it in the target field:
+
+```python
+db.insert({"content": "Machine learning is fascinating"})
+# doc is now: {"content": "Machine learning...", "embedding": [0.01, -0.53, ...]}
+```
+
+**Semantic search — `.semantic()`:**
+
+```python
+results = db.find({"year": {"$gte": 2024}}).semantic("content", "deep learning", 5).to_list()
+# Returns [(doc, score), ...] — same format as vector_search
+```
+
+The query text is automatically prefixed with `query_prefix` and embedded using the configured model.
+
+**Hybrid search with autoembedding — pass `None` for query_vector:**
+
+```python
+results = db.find({}).hybrid_search("content", "content", "deep learning", None, 10).to_list()
+# The vector leg auto-embeds "deep learning" from query_text
+```
+
+**Multiple auto-embed sources:**
+
+```python
+db = Collection("docs.bson",
+    vector_indexes={"embedding": 1024, "title_vec": 256},
+    auto_embed={
+        "abstract": {
+            "model": "hf:...",
+            "target": "embedding",
+            "precision": "int8",
+        },
+        "title": {
+            "model": "hf:...",
+            "target": "title_vec",
+            "dims": 256,           # MRL truncation
+            "precision": "binary", # 128 bytes per embedding
+        },
+    })
+```
+
+**Precision comparison:**
+
+| Precision | Size (1024-dim) | Quality |
+|-----------|----------------|---------|
+| `f32`     | 4.0 KB         | Baseline |
+| `int8`    | 1.0 KB (25%)   | ~1.0000 cosine sim |
+| `uint8`   | 1.0 KB (25%)   | ~1.0000 cosine sim |
+| `binary`  | 128 B (3.1%)   | ~0.9999 cosine sim |
+
+All precisions benefit from the model's Quantization-Aware Training (QAT), which minimizes quality loss after quantization.
+
+**Error handling:**
+
+```python
+# No autoembed configured for this source field
+db.find({}).semantic("unknown_field", "query", 5)
+# → raises MooFileError: No autoembed configured for source field 'unknown_field'
+
+# Model file not found
+Collection("data.bson", auto_embed={"content": {"model": "./missing.gguf"}})
+# → raises MooFileError: ModelNotFound("./missing.gguf")
+```
 
 The `batch()` context manager buffers all write operations and applies them atomically on commit — a single storage append, a single flush/fsync, and all index mutations applied together.
 

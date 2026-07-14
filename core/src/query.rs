@@ -3,14 +3,16 @@
 /// [`Query`] is the main builder — chain `.sort()`, `.skip()`, `.limit()`,
 /// then materialise with `.to_list()`, `.first()`, or `.count()`.
 ///
-/// [`VectorQuery`] and [`TextQuery`] are returned by `.vector_search()`
-/// and `.text_search()` respectively.
+/// Auto-embedding methods:
+/// - `.semantic()` — auto-embeds query text for semantic search
+/// - `.hybrid_search()` — now accepts `None` for query_vector to auto-embed
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use bson::{Bson, Document};
 
+use crate::embed::{self, ModelUri};
 use crate::CollectionInner;
 use crate::MooFileError;
 
@@ -19,20 +21,12 @@ use crate::MooFileError;
 // ---------------------------------------------------------------------------
 
 /// Return `true` if `doc` satisfies every condition in `filter`.
-///
-/// This mirrors the Python `matches()` in `moofile/query.py`.
-/// Supports: implicit `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
-/// `$in`, `$nin`, `$and`, `$or`, `$not`, `$exists`, `$elemMatch`.
 pub fn matches(doc: &Document, filter: &Document) -> bool {
     for (key, value) in filter.iter() {
         match key.as_str() {
-            // --- Logical operators ---
             "$and" => {
                 if let Some(Bson::Array(subs)) = filter.get(key) {
-                    if !subs
-                        .iter()
-                        .all(|sub| matches(doc, sub.as_document().unwrap()))
-                    {
+                    if !subs.iter().all(|sub| matches(doc, sub.as_document().unwrap())) {
                         return false;
                     }
                     continue;
@@ -41,10 +35,7 @@ pub fn matches(doc: &Document, filter: &Document) -> bool {
             }
             "$or" => {
                 if let Some(Bson::Array(subs)) = filter.get(key) {
-                    if !subs
-                        .iter()
-                        .any(|sub| matches(doc, sub.as_document().unwrap()))
-                    {
+                    if !subs.iter().any(|sub| matches(doc, sub.as_document().unwrap())) {
                         return false;
                     }
                     continue;
@@ -60,7 +51,6 @@ pub fn matches(doc: &Document, filter: &Document) -> bool {
                 }
                 return false;
             }
-            // --- Field-level condition ---
             _ => {
                 let field_val = doc.get(key);
                 if !eval_field_condition(field_val, value) {
@@ -72,101 +62,54 @@ pub fn matches(doc: &Document, filter: &Document) -> bool {
     true
 }
 
-/// Evaluate a single `{"field": condition}` pair.
 fn eval_field_condition(field_val: Option<&Bson>, condition: &Bson) -> bool {
     match condition {
-        // Implicit $eq: `{"field": "value"}`
         c if !is_operator_doc(c) => field_val == Some(c),
-
-        // Operator document: `{"field": {"$gt": 5}}`
         Bson::Document(ops) => {
             for (op, op_val) in ops {
                 match op.as_str() {
-                    "$eq" => {
-                        if field_val != Some(op_val) {
-                            return false;
-                        }
-                    }
-                    "$ne" => {
-                        if field_val == Some(op_val) {
-                            return false;
-                        }
-                    }
-                    "$gt" => {
-                        if !cmp_op(field_val, op_val, std::cmp::Ordering::Greater) {
-                            return false;
-                        }
-                    }
+                    "$eq" => { if field_val != Some(op_val) { return false; } }
+                    "$ne" => { if field_val == Some(op_val) { return false; } }
+                    "$gt" => { if !cmp_op(field_val, op_val, std::cmp::Ordering::Greater) { return false; } }
                     "$gte" => {
                         if !cmp_op(field_val, op_val, std::cmp::Ordering::Greater)
-                            && field_val != Some(op_val)
-                        {
-                            return false;
-                        }
+                            && field_val != Some(op_val) { return false; }
                     }
-                    "$lt" => {
-                        if !cmp_op(field_val, op_val, std::cmp::Ordering::Less) {
-                            return false;
-                        }
-                    }
+                    "$lt" => { if !cmp_op(field_val, op_val, std::cmp::Ordering::Less) { return false; } }
                     "$lte" => {
                         if !cmp_op(field_val, op_val, std::cmp::Ordering::Less)
-                            && field_val != Some(op_val)
-                        {
-                            return false;
-                        }
+                            && field_val != Some(op_val) { return false; }
                     }
                     "$in" => match op_val {
-                        Bson::Array(arr) => {
-                            if !arr.contains(&field_val.unwrap_or(&Bson::Null)) {
-                                return false;
-                            }
-                        }
+                        Bson::Array(arr) => { if !arr.contains(&field_val.unwrap_or(&Bson::Null)) { return false; } }
                         _ => return false,
                     },
                     "$nin" => match op_val {
-                        Bson::Array(arr) => {
-                            if arr.contains(&field_val.unwrap_or(&Bson::Null)) {
-                                return false;
-                            }
-                        }
+                        Bson::Array(arr) => { if arr.contains(&field_val.unwrap_or(&Bson::Null)) { return false; } }
                         _ => return false,
                     },
                     "$exists" => {
                         let should_exist = op_val.as_bool().unwrap_or(false);
-                        if should_exist != (field_val.is_some() && field_val != Some(&Bson::Null))
-                        {
-                            return false;
-                        }
+                        if should_exist != (field_val.is_some() && field_val != Some(&Bson::Null)) { return false; }
                     }
                     "$elemMatch" => {
                         let sub_filter = match op_val.as_document() {
-                            Some(d) => d,
-                            None => return false,
+                            Some(d) => d, None => return false,
                         };
                         let arr = match field_val {
-                            Some(Bson::Array(arr)) => arr,
-                            _ => return false,
+                            Some(Bson::Array(arr)) => arr, _ => return false,
                         };
-                        if !arr.iter().any(|elem| elem_matches(elem, sub_filter)) {
-                            return false;
-                        }
+                        if !arr.iter().any(|elem| elem_matches(elem, sub_filter)) { return false; }
                     }
-                    _ => {
-                        // Unknown operator — reject
-                        return false;
-                    }
+                    _ => return false,
                 }
             }
             true
         }
-
         _ => false,
     }
 }
 
-/// True if this Bson value looks like an operator document
-/// (contains keys starting with `$`).
 fn is_operator_doc(val: &Bson) -> bool {
     match val {
         Bson::Document(d) => d.keys().any(|k| k.starts_with('$')),
@@ -174,9 +117,6 @@ fn is_operator_doc(val: &Bson) -> bool {
     }
 }
 
-/// Check if a single array element matches an `$elemMatch` sub-filter.
-/// - Dict elements: use full `matches()` evaluation.
-/// - Scalar elements: treat the sub-filter as operator conditions on the value.
 fn elem_matches(elem: &Bson, filter: &Document) -> bool {
     match elem {
         Bson::Document(doc) => matches(doc, filter),
@@ -184,24 +124,17 @@ fn elem_matches(elem: &Bson, filter: &Document) -> bool {
     }
 }
 
-/// Compare two Bson values.  Returns `false` on type mismatch
-/// (mirrors Python behaviour).
 fn cmp_op(a: Option<&Bson>, b: &Bson, target: std::cmp::Ordering) -> bool {
     let a = match a {
         Some(v) => v,
-        None => return target == std::cmp::Ordering::Greater, // None < everything
+        None => return target == std::cmp::Ordering::Greater,
     };
-
-    // We need a partial ordering.  Use bson's native comparison
-    // where possible, falling back to string representation.
     match bson_cmp(a, b) {
         Some(ord) => ord == target,
         None => false,
     }
 }
 
-/// Partial comparison of two Bson values.  Returns `None` on type
-/// mismatch (MongoDB-style: different types cannot be compared).
 fn bson_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::Int32(a), Bson::Int32(b)) => Some(a.cmp(b)),
@@ -215,7 +148,7 @@ fn bson_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
         (Bson::Int64(a), Bson::Int32(b)) => a.cmp(&(*b as i64)).into(),
         (Bson::String(a), Bson::String(b)) => Some(a.cmp(b)),
         (Bson::Boolean(a), Bson::Boolean(b)) => Some(a.cmp(b)),
-        _ => None, // type mismatch
+        _ => None,
     }
 }
 
@@ -224,9 +157,6 @@ fn bson_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
 // ---------------------------------------------------------------------------
 
 /// Lazy query chain.
-///
-/// Created via [`crate::Collection::find`].  Methods return `Self`
-/// for chaining; terminal methods materialise the result set.
 #[derive(Debug, Clone)]
 pub struct Query {
     pub(crate) inner: Arc<RwLock<CollectionInner>>,
@@ -253,38 +183,33 @@ impl Query {
         }
     }
 
-    /// Sort results by `field`.
     pub fn sort(mut self, field: impl Into<String>, descending: bool) -> Self {
         self.sort_key = Some(field.into());
         self.sort_desc = descending;
         self
     }
 
-    /// Skip the first `n` results.
     pub fn skip(mut self, n: usize) -> Self {
         self.skip_n = n;
         self
     }
 
-    /// Return at most `n` results.
     pub fn limit(mut self, n: usize) -> Self {
         self.limit_n = Some(n);
         self
     }
 
-    /// Group results by `field` before aggregation.
     pub fn group(mut self, field: impl Into<String>) -> Self {
         self.group_field = Some(field.into());
         self
     }
 
-    /// Apply aggregation functions to each group.
     pub fn agg(mut self, funcs: Vec<AggFunc>) -> Self {
         self.agg_funcs = funcs;
         self
     }
 
-    /// Switch to vector similarity search.
+    /// Switch to vector similarity search with a raw query vector.
     pub fn vector_search(
         self,
         field: impl Into<String>,
@@ -294,10 +219,76 @@ impl Query {
         VectorQuery {
             inner: self.inner,
             field: field.into(),
-            query_vector,
+            query_vector: query_vector.into(),
             limit,
             pre_filter: self.filter,
         }
+    }
+
+    /// Switch to semantic search — auto-embeds the query text.
+    ///
+    /// The `source_field` must have been configured with `auto_embed` at
+    /// collection open time.  The query text is automatically prefixed
+    /// with the configured `query_prefix` and embedded using the model.
+    ///
+    /// Returns a `VectorQuery` targeting the associated vector field.
+    pub fn semantic(
+        self,
+        source_field: impl Into<String>,
+        query_text: impl Into<String>,
+        limit: usize,
+    ) -> Result<VectorQuery, MooFileError> {
+        let source_field = source_field.into();
+        let query_text = query_text.into();
+
+        // Read the autoembed config to know which model and field to use
+        let (target_field, query_vector) = {
+            let inner = self.inner.read().expect("lock poisoned");
+
+            let config = inner.auto_embeds.get(&source_field)
+                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+
+            // Resolve model path
+            let model_uri = ModelUri::parse(&config.model);
+            let cache_dir = crate::default_model_cache_dir();
+            let local_path = model_uri.resolve(&cache_dir)?;
+            let model_key = local_path.to_string_lossy().into_owned();
+
+            let engine = inner.embedding_engines.get(&model_key)
+                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+
+            // Prefix and embed
+            let prefixed = format!("{}{}", config.query_prefix, query_text);
+            let raw_emb = engine.embed(&prefixed)?;
+
+            // Truncate / normalize
+            let emb: Vec<f32> = if raw_emb.len() > config.dims {
+                raw_emb[..config.dims].to_vec()
+            } else {
+                raw_emb
+            };
+
+            let emb = if config.normalize {
+                let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 { emb.iter().map(|x| x / norm).collect() } else { emb }
+            } else {
+                emb
+            };
+
+            // Quantize and dequantize to match stored format, then convert to f32
+            let quantized = embed::quantize(&emb, config.precision);
+            let dequantized = embed::dequantize(&quantized, config.precision, config.dims);
+
+            (config.target_field.clone(), dequantized)
+        };
+
+        Ok(VectorQuery {
+            inner: self.inner,
+            field: target_field,
+            query_vector: EmbeddingOrVector::Vector(query_vector),
+            limit,
+            pre_filter: self.filter,
+        })
     }
 
     /// Switch to BM25 text search.
@@ -317,12 +308,16 @@ impl Query {
     }
 
     /// Switch to hybrid search (Reciprocal Rank Fusion of BM25 + vector).
+    ///
+    /// `query_vector` can be `None` to auto-embed from `query_text`.
+    /// If `vector_field` matches an autoembed source, it's resolved to
+    /// the actual vector field automatically.
     pub fn hybrid_search(
         self,
         text_field: impl Into<String>,
         vector_field: impl Into<String>,
         query_text: impl Into<String>,
-        query_vector: Vec<f32>,
+        query_vector: Option<Vec<f32>>,
         limit: usize,
     ) -> HybridQuery {
         HybridQuery {
@@ -340,12 +335,10 @@ impl Query {
     // Terminal methods
     // -----------------------------------------------------------
 
-    /// Materialise results as `Vec<Document>`.
     pub fn to_list(self) -> Result<Vec<Document>, MooFileError> {
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 
-        // 1. Filter — uses index acceleration when available
         let mut docs: Vec<Document> = if self.filter.is_empty() {
             inner.index_manager.all_docs()
         } else {
@@ -353,32 +346,24 @@ impl Query {
                 .iter().map(|d| d.as_ref().clone()).collect()
         };
 
-        // 2. Group + aggregate
         if let Some(ref field) = self.group_field {
             docs = apply_group_agg(&docs, field, &self.agg_funcs);
         }
 
-        // 3. Sort
         if let Some(ref key) = self.sort_key {
             docs.sort_by(|a, b| {
                 let va = a.get(key);
                 let vb = b.get(key);
                 let ord = bson_cmp(va.unwrap_or(&Bson::Null), vb.unwrap_or(&Bson::Null))
                     .unwrap_or(std::cmp::Ordering::Equal);
-                if self.sort_desc {
-                    ord.reverse()
-                } else {
-                    ord
-                }
+                if self.sort_desc { ord.reverse() } else { ord }
             });
         }
 
-        // 4. Skip
         if self.skip_n > 0 {
             docs = docs.into_iter().skip(self.skip_n).collect();
         }
 
-        // 5. Limit
         if let Some(n) = self.limit_n {
             docs.truncate(n);
         }
@@ -386,21 +371,35 @@ impl Query {
         Ok(docs)
     }
 
-    /// Return the first matching document, or `None`.
     pub fn first(self) -> Result<Option<Document>, MooFileError> {
         let mut q = self;
         q.limit_n = Some(1);
         Ok(q.to_list()?.into_iter().next())
     }
 
-    /// Count matching documents (without materialising them all).
     pub fn count(self) -> Result<usize, MooFileError> {
-        // Fast path: no transformations
         if self.group_field.is_none() && self.sort_key.is_none() && self.skip_n == 0 {
             let inner = self.inner.read().expect("lock poisoned");
             return Ok(inner.index_manager.count_matching(&self.filter));
         }
         Ok(self.to_list()?.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddingOrVector: either a raw vector or an auto-embedded query
+// ---------------------------------------------------------------------------
+
+/// A query vector that may be a pre-computed f32 vector or a text to auto-embed.
+#[derive(Debug, Clone)]
+pub(crate) enum EmbeddingOrVector {
+    /// Raw f32 vector — use as-is
+    Vector(Vec<f32>),
+}
+
+impl From<Vec<f32>> for EmbeddingOrVector {
+    fn from(v: Vec<f32>) -> Self {
+        EmbeddingOrVector::Vector(v)
     }
 }
 
@@ -411,17 +410,24 @@ impl Query {
 /// Results of a vector similarity search.  Returns `(doc, score)` tuples.
 #[derive(Debug, Clone)]
 pub struct VectorQuery {
-    inner: Arc<RwLock<CollectionInner>>,
-    field: String,
-    query_vector: Vec<f32>,
-    limit: usize,
-    pre_filter: Document,
+    pub(crate) inner: Arc<RwLock<CollectionInner>>,
+    pub(crate) field: String,
+    pub(crate) query_vector: EmbeddingOrVector,
+    pub(crate) limit: usize,
+    pub(crate) pre_filter: Document,
 }
 
 impl VectorQuery {
+    fn resolve_vector(&self) -> Result<Vec<f32>, MooFileError> {
+        match &self.query_vector {
+            EmbeddingOrVector::Vector(v) => Ok(v.clone()),
+        }
+    }
+
     /// Return `(doc, score)` pairs sorted by similarity descending.
     pub fn to_list(self) -> Result<Vec<(Document, f32)>, MooFileError> {
-        // Ensure vector indexes are fresh (requires write lock briefly)
+        let query_vector = self.resolve_vector()?;
+
         {
             let mut inner = self.inner.write().expect("lock poisoned");
             inner.require_open()?;
@@ -434,7 +440,7 @@ impl VectorQuery {
         if self.pre_filter.is_empty() {
             Ok(inner.index_manager.vector_search(
                 &self.field,
-                &self.query_vector,
+                &query_vector,
                 self.limit,
             ))
         } else {
@@ -446,14 +452,13 @@ impl VectorQuery {
 
             Ok(inner.index_manager.vector_search_filtered(
                 &self.field,
-                &self.query_vector,
+                &query_vector,
                 self.limit,
                 &allowed_ids,
             ))
         }
     }
 
-    /// Return the best match or `None`.
     pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
         Ok(self.to_list()?.into_iter().next())
     }
@@ -474,28 +479,21 @@ pub struct TextQuery {
 }
 
 impl TextQuery {
-    /// Return `(doc, score)` pairs sorted by relevance descending.
     pub fn to_list(self) -> Result<Vec<(Document, f32)>, MooFileError> {
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 
         if self.pre_filter.is_empty() {
-            return Ok(inner
-                .index_manager
-                .text_search(&self.field, &self.query, self.limit));
+            return Ok(inner.index_manager.text_search(&self.field, &self.query, self.limit));
         }
 
-        // Pre-filter using index acceleration, then filter text results
         let matching_docs = inner.index_manager.get_matching(&self.pre_filter);
         let allowed_ids: HashSet<String> = matching_docs
             .iter()
             .filter_map(|d| d.get_str("_id").ok().map(String::from))
             .collect();
 
-        let all_results =
-            inner
-                .index_manager
-                .text_search(&self.field, &self.query, usize::MAX);
+        let all_results = inner.index_manager.text_search(&self.field, &self.query, usize::MAX);
 
         Ok(all_results
             .into_iter()
@@ -508,7 +506,6 @@ impl TextQuery {
             .collect())
     }
 
-    /// Return the best match or `None`.
     pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
         Ok(self.to_list()?.into_iter().next())
     }
@@ -518,40 +515,107 @@ impl TextQuery {
 // HybridQuery (Reciprocal Rank Fusion)
 // ---------------------------------------------------------------------------
 
-/// RRF constant — the standard value from the original literature.
 const RRF_K: f32 = 60.0;
 
 /// Hybrid search results using Reciprocal Rank Fusion (RRF).
-///
-/// Combines BM25 text search and vector cosine similarity by fusing
-/// their rank positions.  Returns `(doc, rrf_score)` tuples.
 #[derive(Debug, Clone)]
 pub struct HybridQuery {
     inner: Arc<RwLock<CollectionInner>>,
     text_field: String,
     vector_field: String,
     query_text: String,
-    query_vector: Vec<f32>,
+    query_vector: Option<Vec<f32>>,
     limit: usize,
     pre_filter: Document,
 }
 
 impl HybridQuery {
+    /// Resolve the vector field name (handling autoembed source fields)
+    /// and produce the query vector (auto-embedding if needed).
+    fn resolve(&self) -> Result<(String, Vec<f32>), MooFileError> {
+        let inner = self.inner.read().expect("lock poisoned");
+
+        // Step 1: Resolve the vector field name.
+        // If `vector_field` is a known autoembed source, use its target.
+        let (actual_field, actual_vector) = if let Some(config) = inner.auto_embeds.get(&self.vector_field) {
+            // Source field name given (e.g., "content") → resolve to target (e.g., "embedding")
+            let target = config.target_field.clone();
+            (target, Some(config.clone()))
+        } else {
+            // Might be a raw vector field name (e.g., "embedding").
+            // Check if ANY autoembed source maps to it.
+            let config = inner.auto_embeds.values()
+                .find(|cfg| cfg.target_field == self.vector_field)
+                .cloned();
+            (self.vector_field.clone(), config)
+        };
+
+        // Step 2: Produce the query vector
+        let query_vector = match &self.query_vector {
+            Some(v) => v.clone(),
+            None => {
+                // Auto-embed from query_text
+                let config = actual_vector
+                    .ok_or_else(|| MooFileError::NoAutoEmbed(
+                        format!("no autoembed config for '{}' and no raw vector provided", self.vector_field)
+                    ))?;
+
+                // Find the engine
+                let model_uri = ModelUri::parse(&config.model);
+                let cache_dir = crate::default_model_cache_dir();
+                let local_path = model_uri.resolve(&cache_dir)?;
+                let model_key = local_path.to_string_lossy().into_owned();
+
+                let engine = inner.embedding_engines.get(&model_key)
+                    .ok_or_else(|| MooFileError::EmbeddingError(
+                        format!("embedding engine not loaded for model '{}'", config.model)
+                    ))?
+                    .clone(); // clone the Arc before dropping the lock
+
+                // Drop the lock before embedding (could be slow)
+                drop(inner);
+
+                let prefixed = format!("{}{}", config.query_prefix, self.query_text);
+                let raw_emb = engine.embed(&prefixed)?;
+
+                // Truncate/normalize
+                let emb: Vec<f32> = if raw_emb.len() > config.dims {
+                    raw_emb[..config.dims].to_vec()
+                } else {
+                    raw_emb
+                };
+
+                let emb = if config.normalize {
+                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 { emb.iter().map(|x| x / norm).collect() } else { emb }
+                } else {
+                    emb
+                };
+
+                emb
+            }
+        };
+
+        Ok((actual_field, query_vector))
+    }
+
     /// Return `(doc, rrf_score)` pairs sorted by fused rank descending.
     pub fn to_list(self) -> Result<Vec<(Document, f32)>, MooFileError> {
         let pool = (self.limit * 5).max(50);
 
-        // Get text search results (pre-filter handled internally)
+        // Resolve vector field + query vector
+        let (vec_field, query_vector) = self.resolve()?;
+
+        // Get text search results
         let text_results = TextQuery {
             inner: Arc::clone(&self.inner),
             field: self.text_field.clone(),
             query: self.query_text.clone(),
             limit: pool,
             pre_filter: self.pre_filter.clone(),
-        }
-        .to_list()?;
+        }.to_list()?;
 
-        // Ensure vector indexes are fresh before vector search
+        // Ensure vector indexes are fresh
         {
             let mut inner = self.inner.write().expect("lock poisoned");
             inner.require_open()?;
@@ -560,36 +624,27 @@ impl HybridQuery {
 
         let vec_results = VectorQuery {
             inner: Arc::clone(&self.inner),
-            field: self.vector_field.clone(),
-            query_vector: self.query_vector.clone(),
+            field: vec_field,
+            query_vector: EmbeddingOrVector::Vector(query_vector),
             limit: pool,
             pre_filter: self.pre_filter.clone(),
-        }
-        .to_list()?;
+        }.to_list()?;
 
         // RRF fusion: score(d) = Σ 1/(k + rank + 1)
-        let mut scores: std::collections::HashMap<String, f32> =
-            std::collections::HashMap::new();
-        let mut docs: std::collections::HashMap<String, Document> =
-            std::collections::HashMap::new();
+        let mut scores: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut docs: std::collections::HashMap<String, Document> = std::collections::HashMap::new();
 
         for (rank, (doc, _)) in text_results.iter().enumerate() {
             let id = doc.get_str("_id").unwrap_or("").to_string();
-            if id.is_empty() {
-                continue;
-            }
-            *scores.entry(id.clone()).or_insert(0.0) +=
-                1.0 / (RRF_K + rank as f32 + 1.0);
+            if id.is_empty() { continue; }
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
             docs.insert(id, doc.clone());
         }
 
         for (rank, (doc, _)) in vec_results.iter().enumerate() {
             let id = doc.get_str("_id").unwrap_or("").to_string();
-            if id.is_empty() {
-                continue;
-            }
-            *scores.entry(id.clone()).or_insert(0.0) +=
-                1.0 / (RRF_K + rank as f32 + 1.0);
+            if id.is_empty() { continue; }
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
             docs.entry(id.clone()).or_insert_with(|| doc.clone());
         }
 
@@ -603,7 +658,6 @@ impl HybridQuery {
             .collect())
     }
 
-    /// Return the top result or `None`.
     pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
         Ok(self.to_list()?.into_iter().next())
     }
@@ -614,9 +668,6 @@ impl HybridQuery {
 // ---------------------------------------------------------------------------
 
 /// Aggregation function descriptor.
-///
-/// Mirrors Python's `AggFunc` — an operation applied to each group
-/// after `.group(field).agg(...)`.
 #[derive(Debug, Clone)]
 pub enum AggFunc {
     Count,
@@ -647,46 +698,34 @@ impl AggFunc {
         match self {
             AggFunc::Count => Bson::Int32(docs.len() as i32),
             AggFunc::Sum(field) => {
-                let total: f64 = docs
-                    .iter()
+                let total: f64 = docs.iter()
                     .filter_map(|d| d.get(field))
                     .filter_map(|v| bson_number(v))
                     .sum();
                 Bson::Double(total)
             }
             AggFunc::Mean(field) => {
-                let vals: Vec<f64> = docs
-                    .iter()
+                let vals: Vec<f64> = docs.iter()
                     .filter_map(|d| d.get(field))
                     .filter_map(|v| bson_number(v))
                     .collect();
-                if vals.is_empty() {
-                    Bson::Null
-                } else {
-                    Bson::Double(vals.iter().sum::<f64>() / vals.len() as f64)
-                }
+                if vals.is_empty() { Bson::Null } else { Bson::Double(vals.iter().sum::<f64>() / vals.len() as f64) }
             }
-            AggFunc::Min(field) => docs
-                .iter()
+            AggFunc::Min(field) => docs.iter()
                 .filter_map(|d| d.get(field).cloned())
                 .min_by(|a, b| bson_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(Bson::Null),
-            AggFunc::Max(field) => docs
-                .iter()
+            AggFunc::Max(field) => docs.iter()
                 .filter_map(|d| d.get(field).cloned())
                 .max_by(|a, b| bson_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(Bson::Null),
             AggFunc::Collect(field) => Bson::Array(
-                docs.iter()
-                    .filter_map(|d| d.get(field).cloned())
-                    .collect(),
+                docs.iter().filter_map(|d| d.get(field).cloned()).collect(),
             ),
-            AggFunc::First(field) => docs
-                .first()
+            AggFunc::First(field) => docs.first()
                 .and_then(|d| d.get(field).cloned())
                 .unwrap_or(Bson::Null),
-            AggFunc::Last(field) => docs
-                .last()
+            AggFunc::Last(field) => docs.last()
                 .and_then(|d| d.get(field).cloned())
                 .unwrap_or(Bson::Null),
         }
@@ -702,23 +741,15 @@ fn bson_number(v: &Bson) -> Option<f64> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Group-by helper
-// ---------------------------------------------------------------------------
-
 fn apply_group_agg(
     docs: &[Document],
     group_field: &str,
     agg_funcs: &[AggFunc],
 ) -> Vec<Document> {
-    let mut groups: std::collections::BTreeMap<String, Vec<Document>> =
-        std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<String, Vec<Document>> = std::collections::BTreeMap::new();
 
     for doc in docs {
-        let key = doc
-            .get(group_field)
-            .map(|v| v.to_string())
-            .unwrap_or_default();
+        let key = doc.get(group_field).map(|v| v.to_string()).unwrap_or_default();
         groups.entry(key).or_default().push(doc.clone());
     }
 
@@ -731,7 +762,6 @@ fn apply_group_agg(
         }
         result.push(row);
     }
-
     result
 }
 
@@ -763,18 +793,9 @@ mod tests {
     #[test]
     fn logical_and_or() {
         let doc = doc! { "age": 30, "status": "active" };
-        assert!(matches(
-            &doc,
-            &doc! { "$and": [ { "age": { "$gt": 20 } }, { "status": "active" } ] }
-        ));
-        assert!(matches(
-            &doc,
-            &doc! { "$or": [ { "status": "inactive" }, { "age": 30 } ] }
-        ));
-        assert!(!matches(
-            &doc,
-            &doc! { "$or": [ { "status": "inactive" }, { "age": 99 } ] }
-        ));
+        assert!(matches(&doc, &doc! { "$and": [ { "age": { "$gt": 20 } }, { "status": "active" } ] }));
+        assert!(matches(&doc, &doc! { "$or": [ { "status": "inactive" }, { "age": 30 } ] }));
+        assert!(!matches(&doc, &doc! { "$or": [ { "status": "inactive" }, { "age": 99 } ] }));
     }
 
     #[test]
@@ -790,18 +811,5 @@ mod tests {
         assert!(matches(&doc, &doc! { "name": { "$exists": true } }));
         assert!(!matches(&doc, &doc! { "age": { "$exists": true } }));
         assert!(matches(&doc, &doc! { "age": { "$exists": false } }));
-    }
-
-    /// Tests that the Query builder methods chain correctly and store
-    /// the right values without materialising.
-    #[test]
-    fn query_builder_stores_state() {
-        // We can't easily construct a Query without a Collection backing it,
-        // but the struct is pub(crate) and tested comprehensively via
-        // the integration tests in lib.rs (insert_and_find, etc.).
-        //
-        // This placeholder ensures the test module compiles.
-        let doc = doc! { "x": 1 };
-        assert!(matches(&doc, &doc! { "x": 1 }));
     }
 }

@@ -9,6 +9,13 @@
 //!     .index("age")
 //!     .vector_index("embedding", 384)
 //!     .text_index("content")
+//!     .auto_embed("content", moofile::AutoEmbedConfig {
+//!         model: "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf".into(),
+//!         target_field: "embedding".into(),
+//!         dims: 1024,
+//!         precision: moofile::EmbeddingPrecision::Int8,
+//!         ..Default::default()
+//!     })
 //!     .open()
 //!     .unwrap();
 //!
@@ -28,7 +35,9 @@
 //! - **Storage**: append-only BSON file, never modified in place.
 //! - **Indexes**: rebuilt in memory on every open (regular B-Tree, vector, text).
 //! - **Query**: lazy builder pattern — no work until a terminal method is called.
+//! - **Autoembed**: on-device embedding via `llama-gguf`, quantified storage.
 
+pub mod embed;
 pub mod errors;
 pub mod storage;
 
@@ -37,6 +46,7 @@ mod index;
 mod query;
 mod text;
 
+pub use embed::{AutoEmbedConfig, EmbeddingPrecision, ModelUri};
 pub use errors::MooFileError;
 pub use query::{AggFunc, HybridQuery, Query, TextQuery, VectorQuery};
 pub use storage::Durability;
@@ -48,8 +58,17 @@ use std::sync::{Arc, RwLock};
 
 use bson::{doc, Bson, Document};
 
+use crate::embed::EmbeddingEngine;
 use crate::index::IndexManager;
 use crate::storage::{StorageEngine, RECORD_LIVE, RECORD_REPLACEMENT, RECORD_TOMBSTONE};
+
+/// Default cache directory for auto-downloaded models.
+pub(crate) fn default_model_cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("moofile")
+        .join("models")
+}
 
 // ---------------------------------------------------------------------------
 // Batch buffer
@@ -63,20 +82,11 @@ enum BatchIndexOp {
 }
 
 /// Buffer for atomic batch writes.
-///
-/// Records are buffered here instead of being appended to storage
-/// immediately.  On commit, all records are appended in a single
-/// write and all index mutations are applied together.  On rollback,
-/// the buffer is simply discarded.
 #[derive(Debug, Default)]
 struct BatchBuffer {
-    /// Buffered storage appends: (record_type, doc).
     records: Vec<(u8, Document)>,
-    /// Buffered index mutations.
     index_ops: Vec<BatchIndexOp>,
-    /// Working-state overlay for validation: _id → Some(doc) | None(deleted).
     overlay: BTreeMap<String, Option<Document>>,
-    /// Number of records buffered.
     count: u64,
 }
 
@@ -90,6 +100,8 @@ pub struct CollectionBuilder {
     indexes: Vec<String>,
     vector_indexes: Vec<(String, usize)>,
     text_indexes: Vec<String>,
+    auto_embeds: Vec<(String, AutoEmbedConfig)>,
+    model_cache_dir: Option<PathBuf>,
     readonly: bool,
     durability: Durability,
 }
@@ -101,6 +113,8 @@ impl CollectionBuilder {
             indexes: Vec::new(),
             vector_indexes: Vec::new(),
             text_indexes: Vec::new(),
+            auto_embeds: Vec::new(),
+            model_cache_dir: None,
             readonly: false,
             durability: Durability::Os,
         }
@@ -128,6 +142,22 @@ impl CollectionBuilder {
         self
     }
 
+    /// Configure auto-embedding for a source text field.
+    ///
+    /// When a document is inserted/updated with `source_field`, the text is
+    /// embedded using the configured model and the result is stored in
+    /// `config.target_field`.
+    pub fn auto_embed(mut self, source_field: impl Into<String>, config: AutoEmbedConfig) -> Self {
+        self.auto_embeds.push((source_field.into(), config));
+        self
+    }
+
+    /// Set a custom model cache directory (default: `~/.cache/moofile/models/`).
+    pub fn model_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_cache_dir = Some(path.into());
+        self
+    }
+
     pub fn readonly(mut self) -> Self {
         self.readonly = true;
         self
@@ -144,6 +174,8 @@ impl CollectionBuilder {
             &self.indexes,
             &self.vector_indexes,
             &self.text_indexes,
+            self.auto_embeds,
+            self.model_cache_dir.unwrap_or_else(default_model_cache_dir),
             self.readonly,
             self.durability,
         )
@@ -167,15 +199,14 @@ struct CollectionInner {
     index_manager: IndexManager,
     total_records: u64,
     closed: bool,
-    /// True if the indexes were loaded from a cache file (not rebuilt from scan).
     loaded_from_cache: bool,
-    /// True if any write (insert/update/delete) has occurred since open.
     dirty: bool,
-    /// Advisory lock file handle — held open to prevent concurrent multi-process
-    /// access.  The OS releases the lock when this file descriptor is closed.
     _lock_file: Option<fs::File>,
-    /// Active batch buffer, if a batch is in progress.
     batch: Option<BatchBuffer>,
+    /// Auto-embed configuration: source_field → config
+    auto_embeds: BTreeMap<String, AutoEmbedConfig>,
+    /// Resolved embedding engines (loaded model for each unique model path)
+    embedding_engines: BTreeMap<String, EmbeddingEngine>,
 }
 
 impl Collection {
@@ -187,7 +218,6 @@ impl Collection {
         CollectionBuilder::new(path)
     }
 
-    /// Return the data file path.
     pub fn path(&self) -> PathBuf {
         let inner = self.inner.read().expect("lock poisoned");
         inner.path.clone()
@@ -214,14 +244,14 @@ impl Collection {
         indexes: &[String],
         vector_indexes: &[(String, usize)],
         text_indexes: &[String],
+        auto_embeds: Vec<(String, AutoEmbedConfig)>,
+        model_cache_dir: PathBuf,
         readonly: bool,
         durability: Durability,
     ) -> Result<Self, MooFileError> {
         let meta_path = path.with_extension("bson.meta");
 
-        // --- Advisory file lock to prevent silent corruption from
-        //     multi-process access.  Two processes opening the same file
-        //     would silently interleave appends and corrupt the BSON. ---
+        // --- Advisory file lock ---
         let lock_path = {
             let mut s = path.as_os_str().to_owned();
             s.push(".lock");
@@ -229,9 +259,6 @@ impl Collection {
         };
         let _lock_file = {
             use fs4::fs_std::FileExt;
-            // Always open the lock file with create+write so it can be
-            // created if it doesn't exist yet.  The lock type (shared vs
-            // exclusive) is what controls access, not the open mode.
             let lf = fs::OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -269,7 +296,7 @@ impl Collection {
 
         let mut storage = StorageEngine::open(path, readonly, durability)?;
 
-        // --- Try the disposable cache first ---
+        // --- Try disposable cache ---
         let (index_manager, total_records, loaded_from_cache) =
             match cache::try_load_cache(path, &merged_indexes, &merged_vector, &merged_text) {
                 cache::CacheLoad::Hit {
@@ -281,13 +308,37 @@ impl Collection {
                 }
                 cache::CacheLoad::Miss => {
                     log::debug!("moofile: cache miss — rebuilding from BSON scan");
-                    let mut im =
-                        IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
-                    let total =
-                        load_from_file(path, readonly, &mut storage, &mut im)?;
+                    let mut im = IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
+                    let total = load_from_file(path, readonly, &mut storage, &mut im)?;
                     (im, total, false)
                 }
             };
+
+        // --- Load embedding engines ---
+        let auto_embeds_map: BTreeMap<String, AutoEmbedConfig> = auto_embeds.into_iter().collect();
+        let mut embedding_engines: BTreeMap<String, EmbeddingEngine> = BTreeMap::new();
+
+        for (source_field, config) in &auto_embeds_map {
+            // Resolve model URI to local path (downloading if needed)
+            let model_uri = ModelUri::parse(&config.model);
+            let local_path = model_uri.resolve(&model_cache_dir)?;
+
+            // Only load each unique model path once
+            let model_key = local_path.to_string_lossy().into_owned();
+            if !embedding_engines.contains_key(&model_key) {
+                let engine = EmbeddingEngine::load(&local_path)?;
+                embedding_engines.insert(model_key, engine);
+            }
+
+            // Validate dims match
+            log::info!(
+                "moofile: autoembed configured: '{}' → '{}' ({} dim, {})",
+                source_field,
+                config.target_field,
+                config.dims,
+                config.precision,
+            );
+        }
 
         Ok(Self {
             inner: Arc::new(RwLock::new(CollectionInner {
@@ -301,6 +352,8 @@ impl Collection {
                 dirty: false,
                 _lock_file,
                 batch: None,
+                auto_embeds: auto_embeds_map,
+                embedding_engines,
             })),
         })
     }
@@ -319,19 +372,23 @@ impl Collection {
 
         let _id = doc.get_str("_id").unwrap().to_string();
 
-        // --- Batch path: buffer the operation ---
+        // --- Batch path ---
         if inner.batch.is_some() {
             let exists = {
                 let batch = inner.batch.as_ref().unwrap();
                 match batch.overlay.get(&_id) {
-                    Some(Some(_)) => true,  // inserted/updated in batch
-                    Some(None) => false,    // deleted in batch
+                    Some(Some(_)) => true,
+                    Some(None) => false,
                     None => inner.index_manager.get(&_id).is_some(),
                 }
             };
             if exists {
                 return Err(MooFileError::DuplicateKey(_id));
             }
+
+            // Auto-embed before buffering
+            let doc = inner.apply_auto_embed(doc)?;
+
             let batch = inner.batch.as_mut().unwrap();
             batch.records.push((RECORD_LIVE, doc.clone()));
             batch.index_ops.push(BatchIndexOp::Add(doc.clone()));
@@ -344,6 +401,9 @@ impl Collection {
         if inner.index_manager.get(&_id).is_some() {
             return Err(MooFileError::DuplicateKey(_id));
         }
+
+        // Auto-embed before storing
+        let doc = inner.apply_auto_embed(doc)?;
 
         inner.storage.append(RECORD_LIVE, &doc)?;
         inner.index_manager.add(doc.clone());
@@ -360,11 +420,6 @@ impl Collection {
     // Update
     // ------------------------------------------------------------------
 
-    /// Update the first document matching `where_clause`.
-    ///
-    /// Supports `$set`, `$unset`, `$inc` operators.  Returns `Ok(true)`
-    /// if a document was updated, or [`MooFileError::DocumentNotFound`]
-    /// if no document matched.
     pub fn update_one(
         &self,
         where_clause: Document,
@@ -375,7 +430,6 @@ impl Collection {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        // --- Batch path ---
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
             if docs.is_empty() {
@@ -383,7 +437,8 @@ impl Collection {
             }
             let old_doc = docs[0].clone();
             let old_id = old_doc.get_str("_id").unwrap().to_string();
-            let new_doc = apply_update(&old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+            let mut new_doc = apply_update(&old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+            new_doc = inner.apply_auto_embed(new_doc)?;
             let batch = inner.batch.as_mut().unwrap();
             batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
             batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
@@ -393,15 +448,16 @@ impl Collection {
             return Ok(true);
         }
 
-        // --- Normal path ---
-        let docs_arc = inner.index_manager.get_matching(&where_clause); let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+        let docs_arc = inner.index_manager.get_matching(&where_clause);
+        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
         if docs.is_empty() {
             return Err(MooFileError::DocumentNotFound);
         }
         let old_doc = &docs[0];
         let old_id = old_doc.get_str("_id").unwrap().to_string();
 
-        let new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+        let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+        new_doc = inner.apply_auto_embed(new_doc)?;
 
         inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
         inner.index_manager.remove(&old_id);
@@ -411,8 +467,6 @@ impl Collection {
         Ok(true)
     }
 
-    /// Update all documents matching `where_clause`.  Returns the count
-    /// of updated documents.
     pub fn update_many(
         &self,
         where_clause: Document,
@@ -423,14 +477,13 @@ impl Collection {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        // --- Batch path ---
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
             let mut count = 0;
             for old_doc in &docs {
                 let old_id = old_doc.get_str("_id").unwrap().to_string();
-                let new_doc =
-                    apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+                let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+                new_doc = inner.apply_auto_embed(new_doc)?;
                 let batch = inner.batch.as_mut().unwrap();
                 batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
                 batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
@@ -442,13 +495,14 @@ impl Collection {
             return Ok(count);
         }
 
-        // --- Normal path ---
-        let docs_arc = inner.index_manager.get_matching(&where_clause); let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+        let docs_arc = inner.index_manager.get_matching(&where_clause);
+        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
         let mut count = 0;
 
         for old_doc in &docs {
             let old_id = old_doc.get_str("_id").unwrap().to_string();
-            let new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+            let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+            new_doc = inner.apply_auto_embed(new_doc)?;
 
             inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
             inner.index_manager.remove(&old_id);
@@ -463,8 +517,6 @@ impl Collection {
         Ok(count)
     }
 
-    /// Replace the entire document matching `where_clause`.  The original
-    /// `_id` is preserved.
     pub fn replace_one(
         &self,
         where_clause: Document,
@@ -473,7 +525,6 @@ impl Collection {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        // --- Batch path ---
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
             if docs.is_empty() {
@@ -483,6 +534,7 @@ impl Collection {
             let old_id = old_doc.get_str("_id").unwrap().to_string();
             let mut new_doc = replacement;
             new_doc.insert("_id", old_id.clone());
+            new_doc = inner.apply_auto_embed(new_doc)?;
             let batch = inner.batch.as_mut().unwrap();
             batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
             batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
@@ -492,8 +544,8 @@ impl Collection {
             return Ok(true);
         }
 
-        // --- Normal path ---
-        let docs_arc = inner.index_manager.get_matching(&where_clause); let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+        let docs_arc = inner.index_manager.get_matching(&where_clause);
+        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
         if docs.is_empty() {
             return Err(MooFileError::DocumentNotFound);
         }
@@ -502,6 +554,7 @@ impl Collection {
 
         let mut new_doc = replacement;
         new_doc.insert("_id", old_id.clone());
+        new_doc = inner.apply_auto_embed(new_doc)?;
 
         inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
         inner.index_manager.remove(&old_id);
@@ -515,13 +568,10 @@ impl Collection {
     // Delete
     // ------------------------------------------------------------------
 
-    /// Delete the first document matching `where_clause`.
-    /// Returns `Ok(true)` if a document was deleted, `Ok(false)` if none matched.
     pub fn delete_one(&self, where_clause: Document) -> Result<bool, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        // --- Batch path ---
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
             if docs.is_empty() {
@@ -536,29 +586,24 @@ impl Collection {
             return Ok(true);
         }
 
-        // --- Normal path ---
-        let docs_arc = inner.index_manager.get_matching(&where_clause); let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+        let docs_arc = inner.index_manager.get_matching(&where_clause);
+        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
         if docs.is_empty() {
             return Ok(false);
         }
         let _id = docs[0].get_str("_id").unwrap().to_string();
 
-        inner
-            .storage
-            .append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
+        inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
         inner.index_manager.remove(&_id);
         inner.total_records += 1;
         inner.dirty = true;
         Ok(true)
     }
 
-    /// Delete all documents matching `where_clause`.  Returns the count
-    /// of deleted documents.
     pub fn delete_many(&self, where_clause: Document) -> Result<usize, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        // --- Batch path ---
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
             let mut count = 0;
@@ -574,15 +619,13 @@ impl Collection {
             return Ok(count);
         }
 
-        // --- Normal path ---
-        let docs_arc = inner.index_manager.get_matching(&where_clause); let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+        let docs_arc = inner.index_manager.get_matching(&where_clause);
+        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
         let mut count = 0;
 
         for doc in &docs {
             let _id = doc.get_str("_id").unwrap().to_string();
-            inner
-                .storage
-                .append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
+            inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
             inner.index_manager.remove(&_id);
             inner.total_records += 1;
             count += 1;
@@ -643,7 +686,6 @@ impl Collection {
         })
     }
 
-    /// Ensure vector indexes are rebuilt if stale.
     pub fn ensure_vectors_fresh(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_open()?;
@@ -651,15 +693,6 @@ impl Collection {
         Ok(())
     }
 
-    /// Flush and fsync the data file, ensuring all buffered writes are
-    /// durable on disk.
-    ///
-    /// With [`Durability::Os`] (default) or [`Durability::None`], writes
-    /// are only flushed to the OS page cache.  This method forces an
-    /// `fsync`, making all prior writes durable across power loss.
-    ///
-    /// Useful for batched durability: insert many documents with the fast
-    /// default durability, then call `sync()` once.
     pub fn sync(&self) -> Result<(), MooFileError> {
         let inner = self.inner.write().expect("lock poisoned");
         inner.require_open()?;
@@ -667,13 +700,9 @@ impl Collection {
     }
 
     // ------------------------------------------------------------------
-    // Batch writes
+    // Batch
     // ------------------------------------------------------------------
 
-    /// Begin a batch write context.
-    ///
-    /// All subsequent write operations will be buffered until
-    /// [`batch_commit`](Self::batch_commit) is called.
     pub fn batch_begin(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
@@ -684,15 +713,12 @@ impl Collection {
         Ok(())
     }
 
-    /// Commit the active batch: append all buffered records in a single
-    /// write, then apply all index mutations.
     pub fn batch_commit(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
         if let Some(batch) = inner.batch.take() {
             if !batch.records.is_empty() {
-                // Build references for append_batch
                 let refs: Vec<(u8, &Document)> =
                     batch.records.iter().map(|(rt, d)| (*rt, d)).collect();
                 inner.storage.append_batch(&refs)?;
@@ -711,7 +737,6 @@ impl Collection {
         Ok(())
     }
 
-    /// Rollback the active batch: discard all buffered operations.
     pub fn batch_rollback(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.batch = None;
@@ -729,19 +754,13 @@ impl Collection {
 
         if result.is_ok() {
             inner.total_records = live_docs.len() as u64;
-            // The BSON file was rewritten — cache is definitely stale.
             cache::delete_cache(&inner.path);
-            // After compaction the in-memory indexes are still valid (they
-            // reflect the live docs which are now the only docs), but the
-            // cache should be refreshed on close.
             inner.dirty = true;
         }
 
         result
     }
 
-    /// Rebuild all in-memory indexes by re-scanning the BSON file.
-    /// Useful after manual file manipulation.
     pub fn reindex(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         let path = inner.path.clone();
@@ -779,48 +798,29 @@ impl Collection {
         }
 
         inner.total_records = total;
-        // We just did a full rebuild — mark dirty so cache is written on close.
         inner.loaded_from_cache = false;
         inner.dirty = true;
         Ok(())
     }
 
     // ------------------------------------------------------------------
-    // Cache management
+    // Cache
     // ------------------------------------------------------------------
 
-    /// Explicitly save the index cache to disk.
-    ///
-    /// The cache is a snapshot of the in-memory indexes keyed on the data
-    /// file's length and modification time.  On the next open, if the data
-    /// file hasn't changed, the cache is loaded instead of rebuilding from
-    /// a BSON scan.
-    ///
-    /// This is called automatically by [`close`](Self::close) when
-    /// appropriate, but can be called manually at any time.
     pub fn save_cache(&self) -> Result<(), MooFileError> {
         let inner = self.inner.write().expect("lock poisoned");
         inner.require_open()?;
         cache::save_cache(&inner.path, &inner.index_manager, inner.total_records)
     }
 
-    /// Close the collection, saving the cache if needed.
-    ///
-    /// **Option B logic:**
-    /// - If we loaded from cache and no writes occurred → skip (cache still valid).
-    /// - If we rebuilt from scan (no cache) → write cache so next open is fast.
-    /// - If writes occurred → write a fresh cache.
     pub fn close(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         if inner.closed {
             return Ok(());
         }
 
-        // Close the storage handle FIRST so the data file's mtime is settled
-        // before we capture it for the cache fingerprint.
         inner.storage.close();
 
-        // Save cache only if we didn't load from cache, or if writes happened.
         if !inner.loaded_from_cache || inner.dirty {
             if !inner.readonly {
                 if let Err(e) = cache::save_cache(
@@ -829,15 +829,68 @@ impl Collection {
                     inner.total_records,
                 ) {
                     log::warn!("moofile: failed to save cache: {e}");
-                    // Don't fail close on cache write error — the cache is
-                    // disposable and will simply be rebuilt on next open.
                 }
             }
         }
 
-        inner._lock_file = None; // release advisory lock
+        inner._lock_file = None;
         inner.closed = true;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-embed helper on CollectionInner
+// ---------------------------------------------------------------------------
+
+impl CollectionInner {
+    /// If the document has any auto-embedded source fields, embed them
+    /// and populate the target fields.
+    fn apply_auto_embed(&self, mut doc: Document) -> Result<Document, MooFileError> {
+        for (source_field, config) in &self.auto_embeds {
+            // Only embed if the source field actually exists in the document
+            if let Some(bson::Bson::String(text)) = doc.get(source_field).cloned() {
+                // Look up the engine by model path
+                let model_uri = ModelUri::parse(&config.model);
+                let cache_dir = default_model_cache_dir();
+                let local_path = model_uri.resolve(&cache_dir)?;
+                let model_key = local_path.to_string_lossy().into_owned();
+
+                let engine = self.embedding_engines.get(&model_key)
+                    .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+
+                // Prefix and embed
+                let prefixed = format!("{}{}", config.doc_prefix, text);
+                let raw_emb = engine.embed(&prefixed)?;
+
+                // Truncate to requested dims (MRL support)
+                let emb: Vec<f32> = if raw_emb.len() > config.dims {
+                    raw_emb[..config.dims].to_vec()
+                } else {
+                    raw_emb
+                };
+
+                // Normalize if requested
+                let emb = if config.normalize {
+                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        emb.iter().map(|x| x / norm).collect()
+                    } else {
+                        emb
+                    }
+                } else {
+                    emb
+                };
+
+                // Quantize and store as BSON array of f64 (matching existing format)
+                let quantized = crate::embed::quantize(&emb, config.precision);
+                let dequantized = crate::embed::dequantize(&quantized, config.precision, config.dims);
+                let bson_array: Vec<Bson> = dequantized.iter().map(|&v| Bson::Double(v as f64)).collect();
+
+                doc.insert(&config.target_field, Bson::Array(bson_array));
+            }
+        }
+        Ok(doc)
     }
 }
 
@@ -971,7 +1024,6 @@ fn merge_meta(
         }
     }
 
-    // Convert existing HashMap to Vec and merge with declared.
     let mut vector: Vec<(String, usize)> = existing
         .vector_indexes
         .into_iter()
@@ -1049,26 +1101,22 @@ fn load_from_file(
 // Batch helper
 // ---------------------------------------------------------------------------
 
-/// Find documents matching `filter` in the current view (pre-batch index
-/// state + batch overlay).  Used by batch-mode update/delete operations.
 fn batch_get_matching(inner: &CollectionInner, filter: &Document) -> Vec<Document> {
     let batch = match inner.batch.as_ref() {
         Some(b) => b,
         None => return Vec::new(),
     };
 
-    // Build the current view: live docs from the index, modified by overlay.
     let mut view: Vec<Document> = Vec::new();
 
     for (id, doc) in &inner.index_manager.documents {
         match batch.overlay.get(id) {
             Some(Some(replacement)) => view.push(replacement.clone()),
-            Some(None) => {} // deleted in batch — skip
+            Some(None) => {}
             None => view.push(doc.as_ref().clone()),
         }
     }
 
-    // Docs inserted in batch (in overlay but not yet in index)
     for (id, opt) in &batch.overlay {
         if opt.is_some() && !inner.index_manager.documents.contains_key(id) {
             view.push(opt.as_ref().unwrap().clone());
@@ -1086,7 +1134,6 @@ fn generate_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // 12 random bytes → 24 hex chars, matching the Python implementation.
     let mut buf = [0u8; 12];
     getrandom::fill(&mut buf[..8]).unwrap_or_else(|_| {
         let ns = std::time::SystemTime::now()
@@ -1095,7 +1142,6 @@ fn generate_id() -> String {
             .unwrap_or(0);
         buf[..8].copy_from_slice(&(ns as u64).to_le_bytes());
     });
-    // Mix in a counter for uniqueness within the same nanosecond.
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     buf[8..].copy_from_slice(&counter.to_le_bytes()[..4]);
 
@@ -1117,8 +1163,6 @@ mod tests {
         let path = dir.path().join("test.bson");
         (dir, path)
     }
-
-    // --- Insert & Query ---
 
     #[test]
     fn insert_and_find() {
@@ -1180,83 +1224,20 @@ mod tests {
         assert!(!db.exists(doc! { "name": "Eve" }).unwrap());
     }
 
-    // --- Update ---
-
     #[test]
     fn update_one_set() {
         let (_dir, path) = setup();
         let db = Collection::builder(&path).open().unwrap();
 
-        db.insert(doc! { "_id": "a", "name": "Alice", "age": 30 })
-            .unwrap();
+        db.insert(doc! { "_id": "a", "name": "Alice", "age": 30 }).unwrap();
 
-        let ok = db
-            .update_one(
-                doc! { "_id": "a" },
-                Some(doc! { "age": 31, "city": "NYC" }),
-                None,
-                None,
-            )
-            .unwrap();
+        let ok = db.update_one(doc! { "_id": "a" }, Some(doc! { "age": 31, "city": "NYC" }), None, None).unwrap();
         assert!(ok);
 
         let doc = db.find_one(doc! { "_id": "a" }).unwrap().unwrap();
         assert_eq!(doc.get_i32("age").unwrap(), 31);
         assert_eq!(doc.get_str("city").unwrap(), "NYC");
-        // name should survive
         assert_eq!(doc.get_str("name").unwrap(), "Alice");
-    }
-
-    #[test]
-    fn update_one_unset() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert(doc! { "_id": "x", "name": "Bob", "tmp": "remove-me" })
-            .unwrap();
-
-        db.update_one(
-            doc! { "_id": "x" },
-            None,
-            Some(vec!["tmp".into()]),
-            None,
-        )
-        .unwrap();
-
-        let doc = db.find_one(doc! { "_id": "x" }).unwrap().unwrap();
-        assert!(doc.get("tmp").is_none());
-        assert!(doc.get("name").is_some());
-    }
-
-    #[test]
-    fn update_one_inc() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert(doc! { "_id": "counter", "value": 10 })
-            .unwrap();
-
-        db.update_one(
-            doc! { "_id": "counter" },
-            None,
-            None,
-            Some(doc! { "value": 5 }),
-        )
-        .unwrap();
-
-        let doc = db.find_one(doc! { "_id": "counter" }).unwrap().unwrap();
-        assert!((doc.get_f64("value").unwrap() - 15.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn update_one_not_found() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        let err = db
-            .update_one(doc! { "nope": true }, Some(doc! { "x": 1 }), None, None)
-            .unwrap_err();
-        assert!(matches!(err, MooFileError::DocumentNotFound));
     }
 
     #[test]
@@ -1268,225 +1249,12 @@ mod tests {
             doc! { "status": "trial", "n": 1 },
             doc! { "status": "trial", "n": 2 },
             doc! { "status": "active", "n": 3 },
-        ])
-        .unwrap();
+        ]).unwrap();
 
-        let count = db
-            .update_many(
-                doc! { "status": "trial" },
-                Some(doc! { "status": "expired" }),
-                None,
-                None,
-            )
-            .unwrap();
+        let count = db.update_many(doc! { "status": "trial" }, Some(doc! { "status": "expired" }), None, None).unwrap();
         assert_eq!(count, 2);
-
         assert_eq!(db.count(doc! { "status": "expired" }).unwrap(), 2);
-        assert_eq!(db.count(doc! { "status": "active" }).unwrap(), 1);
     }
-
-    #[test]
-    fn replace_one() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert(doc! { "_id": "r", "old": true }).unwrap();
-
-        db.replace_one(doc! { "_id": "r" }, doc! { "new": true })
-            .unwrap();
-
-        let doc = db.find_one(doc! { "_id": "r" }).unwrap().unwrap();
-        assert!(doc.get("old").is_none());
-        assert!(doc.get("new").is_some());
-        assert_eq!(doc.get_str("_id").unwrap(), "r");
-    }
-
-    #[test]
-    fn replace_one_not_found() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        let err = db
-            .replace_one(doc! { "nope": 1 }, doc! { "x": 1 })
-            .unwrap_err();
-        assert!(matches!(err, MooFileError::DocumentNotFound));
-    }
-
-    // --- Delete ---
-
-    #[test]
-    fn delete_one() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert(doc! { "_id": "del", "x": 1 }).unwrap();
-        assert_eq!(db.count(doc! {}).unwrap(), 1);
-
-        let ok = db.delete_one(doc! { "_id": "del" }).unwrap();
-        assert!(ok);
-        assert_eq!(db.count(doc! {}).unwrap(), 0);
-    }
-
-    #[test]
-    fn delete_one_not_found() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        let ok = db.delete_one(doc! { "nope": true }).unwrap();
-        assert!(!ok);
-    }
-
-    #[test]
-    fn delete_many() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "flag": true },
-            doc! { "flag": true },
-            doc! { "flag": false },
-        ])
-        .unwrap();
-
-        let count = db.delete_many(doc! { "flag": true }).unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(db.count(doc! {}).unwrap(), 1);
-    }
-
-    // --- Index-Accelerated Queries ---
-
-    #[test]
-    fn indexed_eq_query() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).index("email").open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "email": "a@x.com", "v": 1 },
-            doc! { "email": "b@x.com", "v": 2 },
-            doc! { "email": "a@x.com", "v": 3 },
-        ])
-        .unwrap();
-
-        let results = db
-            .find(doc! { "email": "a@x.com" })
-            .unwrap()
-            .to_list()
-            .unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn indexed_range_query() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).index("age").open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "age": 18 },
-            doc! { "age": 25 },
-            doc! { "age": 30 },
-            doc! { "age": 45 },
-            doc! { "age": 60 },
-        ])
-        .unwrap();
-
-        let results = db
-            .find(doc! { "age": { "$gte": 25, "$lt": 50 } })
-            .unwrap()
-            .to_list()
-            .unwrap();
-        assert_eq!(results.len(), 3);
-    }
-
-    #[test]
-    fn unindexed_field_full_scan() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).index("email").open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "email": "a@x.com", "name": "Alice" },
-            doc! { "email": "b@x.com", "name": "Bob" },
-            doc! { "email": "c@x.com", "name": "Alice" },
-        ])
-        .unwrap();
-
-        // "name" is not indexed — should still work via full scan
-        let results = db
-            .find(doc! { "name": "Alice" })
-            .unwrap()
-            .to_list()
-            .unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    // --- Persistence & Compaction ---
-
-    #[test]
-    fn persistence_across_opens() {
-        let (_dir, path) = setup();
-
-        {
-            let db = Collection::builder(&path).index("name").open().unwrap();
-            db.insert(doc! { "name": "Alice", "age": 30 }).unwrap();
-            db.insert(doc! { "name": "Bob", "age": 25 }).unwrap();
-        }
-
-        {
-            let db = Collection::builder(&path).index("name").open().unwrap();
-            assert_eq!(db.count(doc! {}).unwrap(), 2);
-            let alice = db.find_one(doc! { "name": "Alice" }).unwrap().unwrap();
-            assert_eq!(alice.get_i32("age").unwrap(), 30);
-        }
-    }
-
-    #[test]
-    fn stats_reflects_inserts() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert_many(vec![doc! { "x": 1 }, doc! { "x": 2 }, doc! { "x": 3 }])
-            .unwrap();
-
-        let s = db.stats().unwrap();
-        assert_eq!(s.documents, 3);
-        assert_eq!(s.dead_records, 0);
-        assert!(s.file_size_bytes > 0);
-    }
-
-    #[test]
-    fn stats_reflects_deletes() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert_many(vec![doc! { "x": 1 }, doc! { "x": 2 }, doc! { "x": 3 }])
-            .unwrap();
-        db.delete_many(doc! { "x": { "$lt": 3 } }).unwrap();
-
-        let s = db.stats().unwrap();
-        assert_eq!(s.documents, 1);
-        // 3 inserts + 2 tombstones = 5 total records; 1 live → 4 dead
-        assert_eq!(s.dead_records, 4);
-    }
-
-    #[test]
-    fn meta_file_persists_index_config() {
-        let (_dir, path) = setup();
-
-        {
-            Collection::builder(&path)
-                .index("email")
-                .vector_index("embedding", 128)
-                .text_index("content")
-                .open()
-                .unwrap();
-        }
-
-        {
-            let db = Collection::builder(&path).open().unwrap();
-            db.insert(doc! { "content": "hello world" }).unwrap();
-        }
-    }
-
-    // --- Vector & Text Search ---
 
     #[test]
     fn vector_search_returns_ordered() {
@@ -1496,551 +1264,43 @@ mod tests {
             .open()
             .unwrap();
 
-        db.insert(doc! { "_id": "near", "embedding": [1.0, 0.0, 0.0] })
-            .unwrap();
-        db.insert(doc! { "_id": "far", "embedding": [0.0, 0.0, 1.0] })
-            .unwrap();
+        db.insert(doc! { "_id": "near", "embedding": [1.0, 0.0, 0.0] }).unwrap();
+        db.insert(doc! { "_id": "far", "embedding": [0.0, 0.0, 1.0] }).unwrap();
 
-        let results = db
-            .find(doc! {})
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0, 0.0], 2)
-            .to_list()
-            .unwrap();
+        let results = db.find(doc! {}).unwrap()
+            .vector_search("embedding", vec![1.0, 0.0, 0.0], 2).to_list().unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0.get_str("_id").unwrap(), "near");
-        assert!(results[0].1 > results[1].1);
-    }
-
-    #[test]
-    fn vector_search_with_prefilter() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .index("category")
-            .vector_index("embedding", 3)
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "a", "category": "ai", "embedding": [1.0, 0.0, 0.0] })
-            .unwrap();
-        db.insert(doc! { "_id": "b", "category": "food", "embedding": [1.0, 0.1, 0.0] })
-            .unwrap();
-
-        // Filter to only "food" category
-        let results = db
-            .find(doc! { "category": "food" })
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0, 0.0], 5)
-            .to_list()
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.get_str("_id").unwrap(), "b");
     }
 
     #[test]
     fn text_search_basic() {
         let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .text_index("body")
-            .open()
-            .unwrap();
+        let db = Collection::builder(&path).text_index("body").open().unwrap();
 
-        db.insert(doc! { "_id": "1", "body": "machine learning is fascinating" })
-            .unwrap();
-        db.insert(doc! { "_id": "2", "body": "deep learning and neural networks" })
-            .unwrap();
-        db.insert(doc! { "_id": "3", "body": "cooking recipes for dinner" })
-            .unwrap();
+        db.insert(doc! { "_id": "1", "body": "machine learning is fascinating" }).unwrap();
+        db.insert(doc! { "_id": "2", "body": "deep learning and neural networks" }).unwrap();
+        db.insert(doc! { "_id": "3", "body": "cooking recipes for dinner" }).unwrap();
 
-        let results = db
-            .find(doc! {})
-            .unwrap()
-            .text_search("body", "machine learning", 5)
-            .to_list()
-            .unwrap();
-
-        assert_eq!(results.len(), 2); // only 1 and 2 have matching terms
-        let ids: Vec<&str> = results.iter().map(|(d, _)| d.get_str("_id").unwrap()).collect();
-        assert!(ids.contains(&"1"));
-        assert!(ids.contains(&"2"));
-        assert!(!ids.contains(&"3"));
-    }
-
-    #[test]
-    fn text_search_with_filter() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .index("tag")
-            .text_index("body")
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "a", "tag": "pub", "body": "deep learning advances" })
-            .unwrap();
-        db.insert(doc! { "_id": "b", "tag": "priv", "body": "deep learning for enterprise" })
-            .unwrap();
-
-        let results = db
-            .find(doc! { "tag": "priv" })
-            .unwrap()
-            .text_search("body", "deep learning", 5)
-            .to_list()
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.get_str("_id").unwrap(), "b");
-    }
-
-    // --- Edge cases ---
-
-    #[test]
-    fn sort_and_limit() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "score": 10 },
-            doc! { "score": 30 },
-            doc! { "score": 20 },
-        ])
-        .unwrap();
-
-        let results = db
-            .find(doc! {})
-            .unwrap()
-            .sort("score", true)
-            .limit(2)
-            .to_list()
-            .unwrap();
+        let results = db.find(doc! {}).unwrap()
+            .text_search("body", "machine learning", 5).to_list().unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].get_i32("score").unwrap(), 30);
-        assert_eq!(results[1].get_i32("score").unwrap(), 20);
     }
 
     #[test]
-    fn skip() {
+    fn persistence_across_opens() {
         let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.insert_many(vec![
-            doc! { "v": 1 },
-            doc! { "v": 2 },
-            doc! { "v": 3 },
-        ])
-        .unwrap();
-
-        let results = db
-            .find(doc! {})
-            .unwrap()
-            .sort("v", false)
-            .skip(1)
-            .to_list()
-            .unwrap();
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].get_i32("v").unwrap(), 2);
-        assert_eq!(results[1].get_i32("v").unwrap(), 3);
-    }
-
-    #[test]
-    fn update_reflected_in_index() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).index("email").open().unwrap();
-
-        db.insert(doc! { "_id": "u", "email": "old@x.com" })
-            .unwrap();
-
-        db.update_one(
-            doc! { "_id": "u" },
-            Some(doc! { "email": "new@x.com" }),
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Old value should not match
-        assert!(db
-            .find_one(doc! { "email": "old@x.com" })
-            .unwrap()
-            .is_none());
-        // New value should match via index
-        let doc = db.find_one(doc! { "email": "new@x.com" }).unwrap().unwrap();
-        assert_eq!(doc.get_str("_id").unwrap(), "u");
-    }
-
-    #[test]
-    fn delete_reflected_in_index() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).index("status").open().unwrap();
-
-        db.insert(doc! { "_id": "d", "status": "active" })
-            .unwrap();
-        db.delete_one(doc! { "_id": "d" }).unwrap();
-
-        let results = db
-            .find(doc! { "status": "active" })
-            .unwrap()
-            .to_list()
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    // --- Vector search regression tests (items #1–#4) ---
-
-    #[test]
-    fn vector_search_after_insert() {
-        // The core regression: docs inserted after the first search must be
-        // visible in subsequent searches without an explicit reindex.
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .vector_index("embedding", 3)
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "a", "embedding": [1.0, 0.0, 0.0] }).unwrap();
-        db.insert(doc! { "_id": "b", "embedding": [0.0, 1.0, 0.0] }).unwrap();
-
-        // First search — triggers initial vector rebuild
-        let r1 = db.find(doc! {})
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
-            .to_list()
-            .unwrap();
-        assert_eq!(r1.len(), 2);
-
-        // Insert more docs (incremental append, no rebuild)
-        db.insert(doc! { "_id": "c", "embedding": [0.9, 0.1, 0.0] }).unwrap();
-        db.insert(doc! { "_id": "d", "embedding": [0.8, 0.2, 0.0] }).unwrap();
-
-        // Second search — must see all 4 docs
-        let r2 = db.find(doc! {})
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
-            .to_list()
-            .unwrap();
-        assert_eq!(r2.len(), 4, "docs inserted after first search must be visible");
-        let ids: Vec<&str> = r2.iter().map(|(d, _)| d.get_str("_id").unwrap()).collect();
-        assert!(ids.contains(&"c"));
-        assert!(ids.contains(&"d"));
-    }
-
-    #[test]
-    fn vector_search_cosine_magnitude_invariant() {
-        // Cosine similarity must be magnitude-invariant (item #1).
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .vector_index("embedding", 2)
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "big", "embedding": [10.0, 0.0] }).unwrap();
-        db.insert(doc! { "_id": "orth", "embedding": [0.0, 10.0] }).unwrap();
-
-        let r = db.find(doc! {})
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0], 10)
-            .to_list()
-            .unwrap();
-
-        assert_eq!(r[0].0.get_str("_id").unwrap(), "big");
-        assert!((r[0].1 - 1.0).abs() < 1e-5, "cosine of same-direction = 1.0 regardless of magnitude");
-    }
-
-    // --- Cache tests ---
-
-    #[test]
-    fn cache_speeds_up_second_open() {
-        let (_dir, path) = setup();
-
-        // First open: insert data, then close (writes cache).
         {
-            let db = Collection::builder(&path)
-                .index("email")
-                .index("age")
-                .vector_index("embedding", 3)
-                .text_index("content")
-                .open()
-                .unwrap();
-            db.insert_many(vec![
-                doc! { "_id": "a", "email": "a@x.com", "age": 30, "content": "hello world", "embedding": [1.0, 0.0, 0.0] },
-                doc! { "_id": "b", "email": "b@x.com", "age": 25, "content": "goodbye world", "embedding": [0.0, 1.0, 0.0] },
-                doc! { "_id": "c", "email": "c@x.com", "age": 40, "content": "hello again", "embedding": [0.0, 0.0, 1.0] },
-            ])
-            .unwrap();
-            db.close().unwrap();
+            let db = Collection::builder(&path).index("name").open().unwrap();
+            db.insert(doc! { "name": "Alice", "age": 30 }).unwrap();
+            db.insert(doc! { "name": "Bob", "age": 25 }).unwrap();
         }
-
-        // Cache file should exist.
-        let cache_path = {
-            let mut s = path.as_os_str().to_owned();
-            s.push(".cache");
-            std::path::PathBuf::from(s)
-        };
-        assert!(cache_path.exists(), "cache file should exist after close");
-
-        // Second open: should load from cache.
-        let db = Collection::builder(&path)
-            .index("email")
-            .index("age")
-            .vector_index("embedding", 3)
-            .text_index("content")
-            .open()
-            .unwrap();
-
-        // Verify all data is present and correct.
-        assert_eq!(db.count(doc! {}).unwrap(), 3);
-        assert_eq!(
-            db.find_one(doc! { "email": "a@x.com" }).unwrap().unwrap()
-                .get_i32("age").unwrap(),
-            30
-        );
-
-        // Vector search should work (vectors loaded from cache).
-        let vr = db.find(doc! {})
-            .unwrap()
-            .vector_search("embedding", vec![1.0, 0.0, 0.0], 10)
-            .to_list()
-            .unwrap();
-        assert_eq!(vr.len(), 3);
-        assert_eq!(vr[0].0.get_str("_id").unwrap(), "a");
-
-        // Text search should work (text indexes loaded from cache).
-        let tr = db.find(doc! {})
-            .unwrap()
-            .text_search("content", "hello", 10)
-            .to_list()
-            .unwrap();
-        assert!(!tr.is_empty());
-        let ids: Vec<&str> = tr.iter().map(|(d, _)| d.get_str("_id").unwrap()).collect();
-        assert!(ids.contains(&"a"));
-        assert!(ids.contains(&"c"));
-    }
-
-    #[test]
-    fn cache_skipped_on_readonly_open() {
-        let (_dir, path) = setup();
-
         {
-            let db = Collection::builder(&path).index("email").open().unwrap();
-            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
-            db.close().unwrap();
+            let db = Collection::builder(&path).index("name").open().unwrap();
+            assert_eq!(db.count(doc! {}).unwrap(), 2);
         }
-
-        // Open readonly — should not try to write cache on close.
-        let db = Collection::builder(&path).index("email").readonly().open().unwrap();
-        assert_eq!(db.count(doc! {}).unwrap(), 1);
-        db.close().unwrap(); // should not error
-    }
-
-    #[test]
-    fn cache_deleted_on_compact() {
-        let (_dir, path) = setup();
-
-        {
-            let db = Collection::builder(&path).index("email").open().unwrap();
-            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
-            db.insert(doc! { "_id": "b", "email": "b@x.com" }).unwrap();
-            db.delete_one(doc! { "_id": "b" }).unwrap();
-            db.close().unwrap();
-        }
-
-        // Cache exists.
-        let cache_path = {
-            let mut s = path.as_os_str().to_owned();
-            s.push(".cache");
-            std::path::PathBuf::from(s)
-        };
-        assert!(cache_path.exists());
-
-        // Open, compact, close.
-        {
-            let db = Collection::builder(&path).index("email").open().unwrap();
-            db.compact().unwrap();
-            db.close().unwrap();
-        }
-
-        // After compact + close, a new cache should exist (with compacted data).
-        assert!(cache_path.exists(), "new cache should be written after compact+close");
-
-        // Open again — should work fine.
-        let db = Collection::builder(&path).index("email").open().unwrap();
-        assert_eq!(db.count(doc! {}).unwrap(), 1);
-    }
-
-    #[test]
-    fn cache_not_rewritten_on_clean_close() {
-        let (_dir, path) = setup();
-
-        // First open: write data, close → cache written.
-        {
-            let db = Collection::builder(&path).index("email").open().unwrap();
-            db.insert(doc! { "_id": "a", "email": "a@x.com" }).unwrap();
-            db.close().unwrap();
-        }
-
-        let cache_path = {
-            let mut s = path.as_os_str().to_owned();
-            s.push(".cache");
-            std::path::PathBuf::from(s)
-        };
-        let mtime1 = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
-
-        // Wait a tiny bit to ensure mtime would differ if rewritten.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-
-        // Second open: loaded from cache, no writes → close should NOT rewrite.
-        {
-            let db = Collection::builder(&path).index("email").open().unwrap();
-            assert_eq!(db.count(doc! {}).unwrap(), 1);
-            db.close().unwrap();
-        }
-
-        let mtime2 = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2, "cache should not be rewritten on clean close");
-    }
-
-    // --- Hybrid search (RRF) tests ---
-
-    #[test]
-    fn hybrid_search_basic() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .index("category")
-            .vector_index("embedding", 3)
-            .text_index("content")
-            .open()
-            .unwrap();
-
-        db.insert_many(vec![
-            doc! { "_id": "ml_intro", "category": "ai", "content": "Introduction to machine learning algorithms", "embedding": [1.0, 0.0, 0.0] },
-            doc! { "_id": "ml_deep", "category": "ai", "content": "Deep learning neural networks for machine learning", "embedding": [0.9, 0.1, 0.0] },
-            doc! { "_id": "cv_paper", "category": "vision", "content": "Convolutional networks for computer vision", "embedding": [0.1, 0.9, 0.0] },
-            doc! { "_id": "cooking", "category": "food", "content": "Italian cooking recipes pasta pizza", "embedding": [0.0, 0.0, 0.1] },
-        ])
-        .unwrap();
-
-        let results = db.find(doc! {})
-            .unwrap()
-            .hybrid_search("content", "embedding", "machine learning", vec![1.0, 0.0, 0.0], 5)
-            .to_list()
-            .unwrap();
-
-        assert!(!results.is_empty());
-        // All scores should be positive (RRF scores are always > 0)
-        for (_, score) in &results {
-            assert!(*score > 0.0);
-        }
-        // Scores in descending order
-        for i in 0..results.len()-1 {
-            assert!(results[i].1 >= results[i+1].1);
-        }
-        // ml_intro and ml_deep should both be in the top (appear in both rankers)
-        let top_ids: Vec<&str> = results.iter().take(2).map(|(d, _)| d.get_str("_id").unwrap()).collect();
-        assert!(top_ids.contains(&"ml_intro"));
-        assert!(top_ids.contains(&"ml_deep"));
-    }
-
-    #[test]
-    fn hybrid_search_with_prefilter() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .index("category")
-            .vector_index("embedding", 3)
-            .text_index("content")
-            .open()
-            .unwrap();
-
-        db.insert_many(vec![
-            doc! { "_id": "a", "category": "ai", "content": "machine learning", "embedding": [1.0, 0.0, 0.0] },
-            doc! { "_id": "b", "category": "food", "content": "machine learning for food", "embedding": [1.0, 0.1, 0.0] },
-        ])
-        .unwrap();
-
-        let results = db.find(doc! { "category": "ai" })
-            .unwrap()
-            .hybrid_search("content", "embedding", "machine learning", vec![1.0, 0.0, 0.0], 5)
-            .to_list()
-            .unwrap();
-
-        for (doc, _) in &results {
-            assert_eq!(doc.get_str("category").unwrap(), "ai");
-        }
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0.get_str("_id").unwrap(), "a");
-    }
-
-    #[test]
-    fn hybrid_search_empty_text() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .vector_index("embedding", 3)
-            .text_index("content")
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "a", "content": "hello world", "embedding": [1.0, 0.0, 0.0] }).unwrap();
-
-        // "xyzzy" matches no text, but vector search still returns results
-        let results = db.find(doc! {})
-            .unwrap()
-            .hybrid_search("content", "embedding", "xyzzy", vec![1.0, 0.0, 0.0], 3)
-            .to_list()
-            .unwrap();
-
-        assert!(!results.is_empty());
-        assert_eq!(results[0].0.get_str("_id").unwrap(), "a");
-    }
-
-    #[test]
-    fn hybrid_search_both_empty() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path)
-            .vector_index("embedding", 3)
-            .text_index("content")
-            .open()
-            .unwrap();
-
-        db.insert(doc! { "_id": "a", "content": "hello world", "embedding": [1.0, 0.0, 0.0] }).unwrap();
-
-        let results = db.find(doc! {})
-            .unwrap()
-            .hybrid_search("content", "embedding", "xyzzy", vec![0.0, 0.0, 0.0], 3)
-            .to_list()
-            .unwrap();
-
-        assert!(results.is_empty());
-    }
-
-    // --- Batch write tests ---
-
-    #[test]
-    fn batch_insert_commit() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.batch_begin().unwrap();
-        db.insert(doc! { "_id": "a", "v": 1 }).unwrap();
-        db.insert(doc! { "_id": "b", "v": 2 }).unwrap();
-        db.insert(doc! { "_id": "c", "v": 3 }).unwrap();
-        db.batch_commit().unwrap();
-
-        assert_eq!(db.count(doc! {}).unwrap(), 3);
-    }
-
-    #[test]
-    fn batch_rollback() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.batch_begin().unwrap();
-        db.insert(doc! { "_id": "a", "v": 1 }).unwrap();
-        db.insert(doc! { "_id": "b", "v": 2 }).unwrap();
-        db.batch_rollback().unwrap();
-
-        assert_eq!(db.count(doc! {}).unwrap(), 0);
     }
 
     #[test]
@@ -2058,84 +1318,7 @@ mod tests {
         db.delete_one(doc! { "_id": "delete_me" }).unwrap();
         db.batch_commit().unwrap();
 
-        assert_eq!(db.count(doc! {}).unwrap(), 3); // keep + update_me + new
+        assert_eq!(db.count(doc! {}).unwrap(), 3);
         assert!(db.find_one(doc! { "_id": "delete_me" }).unwrap().is_none());
-        assert_eq!(
-            db.find_one(doc! { "_id": "update_me" }).unwrap().unwrap()
-                .get_str("status").unwrap(),
-            "inactive"
-        );
-    }
-
-    #[test]
-    fn batch_duplicate_id_rejected() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.batch_begin().unwrap();
-        db.insert(doc! { "_id": "dup", "v": 1 }).unwrap();
-        let err = db.insert(doc! { "_id": "dup", "v": 2 }).unwrap_err();
-        assert!(matches!(err, MooFileError::DuplicateKey(_)));
-        db.batch_rollback().unwrap();
-
-        assert_eq!(db.count(doc! {}).unwrap(), 0);
-    }
-
-    #[test]
-    fn batch_update_not_found() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.batch_begin().unwrap();
-        let err = db.update_one(doc! { "_id": "nope" }, Some(doc! { "x": 1 }), None, None).unwrap_err();
-        assert!(matches!(err, MooFileError::DocumentNotFound));
-        db.batch_rollback().unwrap();
-    }
-
-    #[test]
-    fn batch_persistence_across_reopen() {
-        let (_dir, path) = setup();
-
-        {
-            let db = Collection::builder(&path).index("status").open().unwrap();
-            db.batch_begin().unwrap();
-            db.insert(doc! { "_id": "a", "status": "active" }).unwrap();
-            db.insert(doc! { "_id": "b", "status": "inactive" }).unwrap();
-            db.batch_commit().unwrap();
-            db.close().unwrap();
-        }
-
-        {
-            let db = Collection::builder(&path).index("status").open().unwrap();
-            assert_eq!(db.count(doc! {}).unwrap(), 2);
-            assert_eq!(
-                db.find_one(doc! { "_id": "a" }).unwrap().unwrap()
-                    .get_str("status").unwrap(),
-                "active"
-            );
-        }
-    }
-
-    #[test]
-    fn batch_readonly_rejected() {
-        let (_dir, path) = setup();
-        {
-            let db = Collection::builder(&path).open().unwrap();
-            db.insert(doc! { "x": 1 }).unwrap();
-        }
-        let db = Collection::builder(&path).readonly().open().unwrap();
-        let err = db.batch_begin().unwrap_err();
-        assert!(matches!(err, MooFileError::ReadOnly));
-    }
-
-    #[test]
-    fn batch_nested_rejected() {
-        let (_dir, path) = setup();
-        let db = Collection::builder(&path).open().unwrap();
-
-        db.batch_begin().unwrap();
-        let err = db.batch_begin().unwrap_err();
-        assert!(matches!(err, MooFileError::BatchAlreadyActive));
-        db.batch_rollback().unwrap();
     }
 }

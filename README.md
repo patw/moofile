@@ -4,32 +4,46 @@
 
 > A lightweight, embedded, single-file document store with a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
-> **🦀 Rust core available — 2-24× faster than pure Python.**
+> **🦀 Rust core available — 2-24× faster than pure Python.**  
+> **🧠 On-device autoembedding — local embedding models for semantic search.**
 
 ```python
 from moofile import Collection, count, mean
 
 with Collection("mydata.bson", 
                 indexes=["email", "age"],
-                vector_indexes={"embedding": 384},
-                text_indexes=["content"]) as db:
+                vector_indexes={"embedding": 1024},
+                text_indexes=["content"],
+                auto_embed={
+                    "content": {
+                        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+                        "target": "embedding",
+                        "precision": "int8",
+                    },
+                }) as db:
     
+    # Insert — auto-embeds content into embedding (int8, 1KB/doc)
     db.insert({
         "name": "Alice", 
         "email": "alice@example.com", 
         "age": 30,
         "content": "Machine learning and data science expert",
-        "embedding": [0.1, 0.2, ...]
     })
 
     # Traditional query
     results = db.find({"age": {"$gt": 25}}).sort("age").to_list()
     
-    # Vector similarity search
+    # Vector similarity search (raw vector)
     similar = db.find({}).vector_search("embedding", query_vector, limit=5).to_list()
+    
+    # Semantic search — auto-embeds query text
+    similar = db.find({}).semantic("content", "data science", limit=5).to_list()
     
     # BM25 text search
     text = db.find({}).text_search("content", "machine learning", limit=10).to_list()
+    
+    # Hybrid search — auto-embeds query vector from query text
+    results = db.find({}).hybrid_search("content", "content", "data science", None, 10).to_list()
 ```
 
 ---
@@ -42,6 +56,7 @@ with Collection("mydata.bson",
 | Document-oriented | ✗ | ✓ | ✓ | **✓** |
 | Indexes | ✓ | ✗ | ✓ | **✓** |
 | Vector search | ✗ | ✗ | ✓ (Atlas) | **✓** |
+| On-device autoembedding | ✗ | ✗ | ✗ | **✓** |
 | Text search | ✓ (FTS) | ✗ | ✓ | **✓** |
 | Developer API | ✗ (SQL) | ✓ (raw) | ✓ | **✓** |
 | Single-file portable | ✓ | ✓ | ✗ | **✓** |
@@ -93,6 +108,37 @@ db.update_one({"email": "a@ex.com"}, set={"age": 31})
 db.update_many({"status": "trial"}, set={"status": "expired"})
 db.delete_one({"email": "c@ex.com"})
 db.delete_many({"status": "expired"})
+```
+
+### With Autoembedding
+
+```python
+from moofile import Collection
+
+# Autoembedding: text in "abstract" is automatically embedded into
+# "embedding" on insert, using a local GGUF model (downloaded on first use).
+db = Collection("papers.bson",
+    indexes=["year", "category"],
+    vector_indexes={"embedding": 1024},
+    auto_embed={
+        "abstract": {
+            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            "target": "embedding",
+            "dims": 1024,
+            "precision": "int8",
+        },
+    })
+
+# Insert — auto-embeds abstract → embedding (1 KB, int8 quantized)
+db.insert({"title": "Quantum ML", "abstract": "Quantum computing for ML...", "year": 2025})
+
+# Semantic search — query text is auto-embedded using the same model
+results = db.find({"year": 2025}).semantic("abstract", "quantum algorithms", 5).to_list()
+for doc, score in results:
+    print(f"{doc['title']}: {score:.3f}")
+
+# Hybrid search — auto-embeds query_text for the vector leg
+results = db.find({}).hybrid_search("abstract", "abstract", "quantum", None, 10).to_list()
 ```
 
 ---
@@ -177,7 +223,7 @@ PYTHONPATH=. python bench_native.py
 ```
 moofile/
 ├── core/                    # Rust engine (cargo build)
-│   ├── src/{lib,storage,index,query,text,cache,errors}.rs
+│   ├── src/{lib,storage,index,query,text,cache,embed,errors}.rs
 │   └── examples/bench.rs    # Pure-Rust benchmark
 ├── bindings/python/         # PyO3 binding (maturin build)
 │   └── src/lib.rs
