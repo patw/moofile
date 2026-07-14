@@ -22,7 +22,7 @@ from .errors import (
     ReadOnlyError,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.1"
 
 # --- Try the Rust native backend first ---
 _NATIVE_LOADED = False

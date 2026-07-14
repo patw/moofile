@@ -40,13 +40,6 @@ pub(crate) enum IndexResult {
     Candidates(Vec<String>),
 }
 
-impl IndexResult {
-    pub fn ids(&self) -> &[String] {
-        match self { IndexResult::Exact(ids) | IndexResult::Candidates(ids) => ids.as_slice() }
-    }
-    pub fn is_exact(&self) -> bool { matches!(self, IndexResult::Exact(_)) }
-}
-
 pub(crate) struct IndexManager {
     pub(crate) regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
     pub(crate) regular_fields: Vec<String>,
@@ -458,9 +451,9 @@ mod tests {
         let mut im = m(); im.add(doc!{"_id":"a","age":20}); im.add(doc!{"_id":"b","age":30}); im.add(doc!{"_id":"c","age":40});
         assert_eq!(im.lookup_range_ids("age",Some(&bson::Bson::Int32(25)),true,Some(&bson::Bson::Int32(35)),true).unwrap(), vec!["b"]);
     }
-    #[test] fn try_exact_eq() { let mut im=m(); im.add(doc!{"_id":"x","email":"x@y.com"}); let r=im.try_index(&doc!{"email":"x@y.com"}).unwrap(); assert!(r.is_exact()); assert_eq!(r.ids(),&["x"]); }
-    #[test] fn try_exact_range() { let mut im=m(); for i in 0..10{im.add(doc!{"_id":i.to_string(),"age":i*10});} let r=im.try_index(&doc!{"age":{"$gt":25,"$lt":55}}).unwrap(); assert!(r.is_exact()); let mut v:Vec<_>=r.ids().to_vec();v.sort();assert_eq!(v,vec!["3","4","5"]);}
-    #[test] fn try_candidates_multi() { let mut im=m(); im.add(doc!{"_id":"a","email":"x@y.com","status":"active"}); let r=im.try_index(&doc!{"email":"x@y.com","status":"active"}).unwrap(); assert!(!r.is_exact()); }
+    #[test] fn try_exact_eq() { let mut im=m(); im.add(doc!{"_id":"x","email":"x@y.com"}); let r=im.try_index(&doc!{"email":"x@y.com"}).unwrap(); assert!(matches!(&r, IndexResult::Exact(_))); assert_eq!(match &r { IndexResult::Exact(ids) | IndexResult::Candidates(ids) => ids.as_slice() }, &["x"]); }
+    #[test] fn try_exact_range() { let mut im=m(); for i in 0..10{im.add(doc!{"_id":i.to_string(),"age":i*10});} let r=im.try_index(&doc!{"age":{"$gt":25,"$lt":55}}).unwrap(); assert!(matches!(&r, IndexResult::Exact(_))); let mut v:Vec<_>=match &r { IndexResult::Exact(ids)|IndexResult::Candidates(ids) => ids.clone() };v.sort();assert_eq!(v,vec!["3","4","5"]);}
+    #[test] fn try_candidates_multi() { let mut im=m(); im.add(doc!{"_id":"a","email":"x@y.com","status":"active"}); let r=im.try_index(&doc!{"email":"x@y.com","status":"active"}).unwrap(); assert!(matches!(&r, IndexResult::Candidates(_))); }
     #[test] fn try_fallback() { let mut im=m(); im.add(doc!{"_id":"a","email":"x@y.com"}); assert!(im.try_index(&doc!{"$or":[{"email":"x@y.com"},{"age":99}]}).is_none()); }
     #[test] fn matching_exact() { let mut im=m(); for i in 0..10{im.add(doc!{"_id":i.to_string(),"age":i*10});} assert_eq!(im.get_matching(&doc!{"age":{"$gte":30,"$lte":50}}).len(),3); }
     #[test] fn vec_basic() { let mut im=m(); im.add(doc!{"_id":"near","embedding":[1.0,0.0,0.0]}); im.add(doc!{"_id":"far","embedding":[0.0,0.0,1.0]}); im.add(doc!{"_id":"mid","embedding":[0.7,0.0,0.7]}); im.rebuild_vector_indexes(); let r=im.vector_search("embedding",&[1.0,0.0,0.0],10); assert_eq!(r.len(),3); assert_eq!(r[0].0.get_str("_id").unwrap(),"near"); assert!(r[0].1>=r[1].1); }

@@ -406,7 +406,7 @@ impl NativeCollection {
             .inner
             .find(f)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            .hybrid_search(text_field, vector_field, query_text, query_vector, limit)
+            .hybrid_search(text_field, vector_field, query_text, Some(query_vector), limit)
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
