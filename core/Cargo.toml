@@ -1,9 +1,9 @@
 [package]
 name = "moofile-core"
-version = "0.5.1"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
-license = "MIT"
+license.workspace = true
 repository = "https://github.com/patw/moofile"
 keywords = ["database", "embedded", "document-store", "bson", "vector-search"]
 categories = ["database-implementations", "embedded"]

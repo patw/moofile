@@ -22,7 +22,12 @@ from .errors import (
     ReadOnlyError,
 )
 
-__version__ = "0.5.1"
+from importlib.metadata import PackageNotFoundError, version as _package_version
+
+try:
+    __version__ = _package_version("moofile")
+except PackageNotFoundError:
+    __version__ = "0.0.0-dev"  # not installed — running from source
 
 # --- Try the Rust native backend first ---
 _NATIVE_LOADED = False
