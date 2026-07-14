@@ -108,7 +108,8 @@ class Collection:
             doc["_id"] = _generate_id()
         if self._index_manager.get(doc["_id"]) is not None:
             raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
-        self._storage.append(RECORD_LIVE, doc)
+        with self._with_write_lock():
+            self._storage.append(RECORD_LIVE, doc)
         self._index_manager.add(doc)
         self._total_records += 1
         self._dirty = True
@@ -148,7 +149,8 @@ class Collection:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
         old_doc = docs[0]
         new_doc = _apply_update(old_doc, set, unset, inc)
-        self._storage.append(RECORD_REPLACEMENT, new_doc)
+        with self._with_write_lock():
+            self._storage.append(RECORD_REPLACEMENT, new_doc)
         self._index_manager.remove(old_doc["_id"])
         self._index_manager.add(new_doc)
         self._total_records += 1
@@ -172,13 +174,14 @@ class Collection:
             return self._batch.update_many(where, set, unset, inc)
         docs = self._get_docs(where)
         count = 0
-        for old_doc in docs:
-            new_doc = _apply_update(old_doc, set, unset, inc)
-            self._storage.append(RECORD_REPLACEMENT, new_doc)
-            self._index_manager.remove(old_doc["_id"])
-            self._index_manager.add(new_doc)
-            self._total_records += 1
-            count += 1
+        with self._with_write_lock():
+            for old_doc in docs:
+                new_doc = _apply_update(old_doc, set, unset, inc)
+                self._storage.append(RECORD_REPLACEMENT, new_doc)
+                self._index_manager.remove(old_doc["_id"])
+                self._index_manager.add(new_doc)
+                self._total_records += 1
+                count += 1
         if count > 0:
             self._dirty = True
         return count
@@ -199,7 +202,8 @@ class Collection:
         old_doc = docs[0]
         replacement = dict(new_doc)
         replacement["_id"] = old_doc["_id"]
-        self._storage.append(RECORD_REPLACEMENT, replacement)
+        with self._with_write_lock():
+            self._storage.append(RECORD_REPLACEMENT, replacement)
         self._index_manager.remove(old_doc["_id"])
         self._index_manager.add(replacement)
         self._total_records += 1
@@ -223,7 +227,8 @@ class Collection:
         if not docs:
             return False
         doc = docs[0]
-        self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
+        with self._with_write_lock():
+            self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
         self._index_manager.remove(doc["_id"])
         self._total_records += 1
         self._dirty = True
@@ -240,11 +245,12 @@ class Collection:
             return self._batch.delete_many(where)
         docs = self._get_docs(where)
         count = 0
-        for doc in docs:
-            self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
-            self._index_manager.remove(doc["_id"])
-            self._total_records += 1
-            count += 1
+        with self._with_write_lock():
+            for doc in docs:
+                self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
+                self._index_manager.remove(doc["_id"])
+                self._total_records += 1
+                count += 1
         if count > 0:
             self._dirty = True
         return count
@@ -305,7 +311,8 @@ class Collection:
         live_docs = self._index_manager.all_docs()
         self._storage.close()
         try:
-            compact(self._path, live_docs)
+            with self._with_write_lock():
+                compact(self._path, live_docs)
         finally:
             self._storage.reopen()
         # After compaction total_records == live document count
@@ -474,23 +481,49 @@ class Collection:
     # -----------------------------------------------------------------------
 
     def _acquire_lock(self) -> None:
-        """Acquire an advisory lock on a .lock file to detect concurrent access."""
+        """Open the lock file handle for later use during writes.
+
+        No lock is held during normal operation — this allows multiple
+        processes to open the same file simultaneously (e.g. a web UI
+        and multiple bot readers).  An exclusive lock is acquired only
+        briefly inside ``_with_write_lock`` to serialize concurrent
+        multi-process appends.
+        """
         try:
-            import fcntl
+            import fcntl  # noqa: F401 — check availability
         except ImportError:
-            return  # Windows — best-effort, no locking in pure-Python fallback
+            self._lock_fd = None  # Windows — no file locking available
+            return
 
         try:
             self._lock_fd = open(self._lock_path, "a+")
-            if self._readonly:
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-            else:
-                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, IOError):
-            from .errors import ConcurrentAccessError
-            raise ConcurrentAccessError(
-                f"File is already open by another process: {self._lock_path}"
-            )
+            self._lock_fd = None  # best-effort — writes won't be serialized
+
+    def _with_write_lock(self):
+        """Context manager: acquire an exclusive lock for the duration of
+        a write operation, then release it.
+
+        Uses blocking mode (no ``LOCK_NB``) so the write waits for any
+        other process that is currently writing.  Since no process holds
+        a lock during normal operation, this only blocks briefly during
+        concurrent writes.
+        """
+        from contextlib import contextmanager
+        import fcntl
+
+        @contextmanager
+        def _cm():
+            if self._lock_fd is None:
+                yield
+                return
+            fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
+
+        return _cm()
 
     def _release_lock(self) -> None:
         """Release the advisory lock."""
@@ -870,7 +903,8 @@ class BatchContext:
         if not self._records:
             return
         # Append all records in a single write with one flush
-        self._collection._storage.append_batch(self._records)
+        with self._collection._with_write_lock():
+            self._collection._storage.append_batch(self._records)
         # Apply all index mutations in order
         for op in self._index_ops:
             if op[0] == "add":

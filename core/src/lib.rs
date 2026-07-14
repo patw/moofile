@@ -201,7 +201,11 @@ struct CollectionInner {
     closed: bool,
     loaded_from_cache: bool,
     dirty: bool,
-    _lock_file: Option<fs::File>,
+    /// Advisory lock file handle — used to serialize concurrent multi-process
+    /// writes. No lock is held during normal operation; an exclusive lock is
+    /// acquired only briefly during write operations via `with_write_lock`.
+    lock_file: Option<fs::File>,
+    /// Active batch buffer, if a batch is in progress.
     batch: Option<BatchBuffer>,
     /// Auto-embed configuration: source_field → config
     auto_embeds: BTreeMap<String, AutoEmbedConfig>,
@@ -251,28 +255,27 @@ impl Collection {
     ) -> Result<Self, MooFileError> {
         let meta_path = path.with_extension("bson.meta");
 
-        // --- Advisory file lock ---
+// --- Advisory file lock for serializing concurrent multi-process writes.
+        //     No lock is held here — this allows multiple processes to open
+        //     the same file simultaneously. An exclusive lock is acquired
+        //     only briefly during write operations (see `with_write_lock`). ---
         let lock_path = {
             let mut s = path.as_os_str().to_owned();
             s.push(".lock");
             PathBuf::from(s)
         };
-        let _lock_file = {
-            use fs4::fs_std::FileExt;
-            let lf = fs::OpenOptions::new()
+        let lock_file = {
+            // Open the lock file with create+read+write so it can be
+            // created if it doesn't exist yet.  No lock is acquired here.
+            match fs::OpenOptions::new()
                 .create(true)
                 .read(true)
                 .write(true)
                 .open(&lock_path)
-                .map_err(|e| crate::errors::io_err(&lock_path, e))?;
-            if readonly {
-                lf.try_lock_shared()
-                    .map_err(|_| MooFileError::ConcurrentAccess(lock_path.clone()))?;
-            } else {
-                lf.try_lock_exclusive()
-                    .map_err(|_| MooFileError::ConcurrentAccess(lock_path.clone()))?;
+            {
+                Ok(lf) => Some(lf),
+                Err(_) => None, // best-effort — writes won't be serialized
             }
-            Some(lf)
         };
 
         if !readonly && !path.exists() {
@@ -350,7 +353,7 @@ impl Collection {
                 closed: false,
                 loaded_from_cache,
                 dirty: false,
-                _lock_file,
+                lock_file,
                 batch: None,
                 auto_embeds: auto_embeds_map,
                 embedding_engines,
@@ -402,10 +405,10 @@ impl Collection {
             return Err(MooFileError::DuplicateKey(_id));
         }
 
-        // Auto-embed before storing
+// Auto-embed before storing
         let doc = inner.apply_auto_embed(doc)?;
 
-        inner.storage.append(RECORD_LIVE, &doc)?;
+        inner.with_write_lock(|inner| inner.storage.append(RECORD_LIVE, &doc))?;
         inner.index_manager.add(doc.clone());
         inner.total_records += 1;
         inner.dirty = true;
@@ -459,7 +462,7 @@ impl Collection {
         let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
         new_doc = inner.apply_auto_embed(new_doc)?;
 
-        inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+        inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
         inner.index_manager.remove(&old_id);
         inner.index_manager.add(new_doc);
         inner.total_records += 1;
@@ -504,7 +507,7 @@ impl Collection {
             let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
             new_doc = inner.apply_auto_embed(new_doc)?;
 
-            inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+            inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
             inner.index_manager.remove(&old_id);
             inner.index_manager.add(new_doc);
             inner.total_records += 1;
@@ -556,7 +559,7 @@ impl Collection {
         new_doc.insert("_id", old_id.clone());
         new_doc = inner.apply_auto_embed(new_doc)?;
 
-        inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+        inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
         inner.index_manager.remove(&old_id);
         inner.index_manager.add(new_doc);
         inner.total_records += 1;
@@ -593,7 +596,9 @@ impl Collection {
         }
         let _id = docs[0].get_str("_id").unwrap().to_string();
 
-        inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
+inner.with_write_lock(|inner| {
+            inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })
+        })?;
         inner.index_manager.remove(&_id);
         inner.total_records += 1;
         inner.dirty = true;
@@ -625,7 +630,9 @@ impl Collection {
 
         for doc in &docs {
             let _id = doc.get_str("_id").unwrap().to_string();
-            inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
+            inner.with_write_lock(|inner| {
+                inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })
+            })?;
             inner.index_manager.remove(&_id);
             inner.total_records += 1;
             count += 1;
@@ -721,7 +728,7 @@ impl Collection {
             if !batch.records.is_empty() {
                 let refs: Vec<(u8, &Document)> =
                     batch.records.iter().map(|(rt, d)| (*rt, d)).collect();
-                inner.storage.append_batch(&refs)?;
+                inner.with_write_lock(|inner| inner.storage.append_batch(&refs))?;
             }
             for op in batch.index_ops {
                 match op {
@@ -749,7 +756,7 @@ impl Collection {
 
         let live_docs = inner.index_manager.all_docs();
         inner.storage.close();
-        let result = storage::compact(&inner.path, &live_docs);
+        let result = inner.with_write_lock(|inner| storage::compact(&inner.path, &live_docs));
         inner.storage.reopen()?;
 
         if result.is_ok() {
@@ -833,7 +840,7 @@ impl Collection {
             }
         }
 
-        inner._lock_file = None;
+inner.lock_file = None; // drop lock file handle
         inner.closed = true;
         Ok(())
     }
@@ -923,6 +930,34 @@ impl CollectionInner {
             return Err(MooFileError::ReadOnly);
         }
         Ok(())
+    }
+
+    /// Acquire an exclusive advisory lock on the lock file, run the
+    /// closure, then release the lock.  Uses blocking mode so the
+    /// write waits for any other process currently writing.  Since no
+    /// process holds a lock during normal operation, this only blocks
+    /// briefly during concurrent writes.
+    fn with_write_lock<F, R>(&mut self, f: F) -> Result<R, MooFileError>
+    where
+        F: FnOnce(&mut Self) -> Result<R, MooFileError>,
+    {
+        use fs4::fs_std::FileExt;
+
+        let locked = if let Some(ref lf) = self.lock_file {
+            lf.lock_exclusive().is_ok()
+        } else {
+            false
+        };
+
+        let result = f(self);
+
+        if locked {
+            if let Some(ref lf) = self.lock_file {
+                let _ = lf.unlock();
+            }
+        }
+
+        result
     }
 }
 
