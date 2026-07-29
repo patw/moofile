@@ -219,10 +219,17 @@ pub(crate) fn try_load_cache(
 ///
 /// Writes to a `.tmp` file first, then atomically renames — safe to
 /// interrupt (a partial cache file is simply rejected on next open).
+/// `basis` is the (length, mtime_ns) of the data file that `index_manager`
+/// actually describes — **not** the file's current state.  With multiple
+/// processes those differ: another writer may have appended since this handle
+/// last read.  Stamping the current state would produce a cache that passes
+/// validation while silently omitting the other writer's records; stamping the
+/// basis makes the next open see a mismatch and rescan instead.
 pub(crate) fn save_cache(
     data_path: &Path,
     index_manager: &IndexManager,
     total_records: u64,
+    basis: (u64, u64),
 ) -> Result<(), MooFileError> {
     let cache_path = cache_path(data_path);
     let tmp_path = {
@@ -231,7 +238,7 @@ pub(crate) fn save_cache(
         p
     };
 
-    let (data_len, data_mtime_ns) = file_fingerprint(data_path).unwrap_or((0, 0));
+    let (data_len, data_mtime_ns) = basis;
 
     // Extract the field lists directly from the IndexManager (not derived
     // from data) so configured-but-empty indexes are preserved.
@@ -396,7 +403,7 @@ mod tests {
         im.rebuild_vector_indexes();
 
         // Save the cache
-        save_cache(&data_path, &im, 2).unwrap();
+        save_cache(&data_path, &im, 2, file_fingerprint(&data_path).unwrap()).unwrap();
 
         // Load the cache — should hit
         match try_load_cache(
@@ -436,7 +443,7 @@ mod tests {
 
         let mut im = IndexManager::new(&["email".into()], &[], &[]);
         im.add(doc1);
-        save_cache(&data_path, &im, 1).unwrap();
+        save_cache(&data_path, &im, 1, file_fingerprint(&data_path).unwrap()).unwrap();
 
         // Append to the file (simulating a write)
         let doc2 = doc! { "_id": "b", "email": "b@x.com" };
@@ -465,7 +472,7 @@ mod tests {
 
         let mut im = IndexManager::new(&["email".into()], &[], &[]);
         im.add(doc1);
-        save_cache(&data_path, &im, 1).unwrap();
+        save_cache(&data_path, &im, 1, file_fingerprint(&data_path).unwrap()).unwrap();
 
         // Try to load with a different index config (added "age")
         match try_load_cache(

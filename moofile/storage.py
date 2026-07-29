@@ -31,10 +31,28 @@ def scan_file(path: str) -> tuple:
         (offset, record_type, doc) tuples.  truncate_to is the byte
         offset of any partial trailing write (None if file is intact).
     """
+    return scan_from(path, 0)
+
+
+def scan_from(path: str, start: int = 0) -> tuple:
+    """
+    Scan a BSON file starting at byte offset *start*.
+
+    The format is append-only, so records written by another process after
+    this handle last read are always a contiguous suffix.  That lets a handle
+    catch up on someone else's writes in O(new bytes) rather than re-reading
+    and re-indexing the whole file.
+
+    *start* must be a record boundary — pass an offset previously scanned to.
+
+    Returns the same (records, truncate_to) pair as scan_file.
+    """
     records = []
     truncate_to = None
 
     with open(path, "rb") as f:
+        if start:
+            f.seek(start)
         while True:
             offset = f.tell()
             header_bytes = f.read(_HEADER_SIZE)

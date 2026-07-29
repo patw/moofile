@@ -88,6 +88,22 @@ pub(crate) fn encode_record(record_type: u8, doc: &Document) -> Vec<u8> {
 /// Returns every complete record found and, if the file ends with a partial
 /// write, the byte offset where truncation should occur.
 pub(crate) fn scan_file(path: &Path) -> Result<(Vec<Record>, Option<u64>), MooFileError> {
+    scan_from(path, 0)
+}
+
+/// Scan a BSON file starting at `start` bytes.
+///
+/// The file format is append-only, so records written by another process
+/// after this handle last read are always a contiguous suffix.  That lets a
+/// handle catch up on someone else's writes in O(new bytes) instead of
+/// re-reading and re-indexing the whole file.
+///
+/// `start` must be a record boundary — pass an offset this handle has
+/// previously scanned up to.
+pub(crate) fn scan_from(
+    path: &Path,
+    start: u64,
+) -> Result<(Vec<Record>, Option<u64>), MooFileError> {
     let mut f = File::open(path).map_err(|e| errors::io_err(path, e))?;
     let file_len = f
         .metadata()
@@ -97,9 +113,14 @@ pub(crate) fn scan_file(path: &Path) -> Result<(Vec<Record>, Option<u64>), MooFi
     let mut records = Vec::new();
     let mut buf = [0u8; HEADER_SIZE];
 
-    // If the file is empty, return cleanly.
-    if file_len == 0 {
+    // Nothing new (or an empty file) — return cleanly.
+    if file_len == 0 || start >= file_len {
         return Ok((records, None));
+    }
+
+    if start > 0 {
+        f.seek(std::io::SeekFrom::Start(start))
+            .map_err(|e| errors::io_err(path, e))?;
     }
 
     loop {

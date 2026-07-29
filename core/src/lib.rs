@@ -205,6 +205,23 @@ struct CollectionInner {
     /// writes. No lock is held during normal operation; an exclusive lock is
     /// acquired only briefly during write operations via `with_write_lock`.
     lock_file: Option<fs::File>,
+    /// Byte offset of the data file that this handle's in-memory index has
+    /// replayed up to, plus the mtime observed at that point.
+    ///
+    /// Another process can append to the file at any time (see
+    /// `with_write_lock`).  The format is append-only, so their records are
+    /// always a suffix and this handle can catch up by scanning from
+    /// `known_len` — see `catch_up`.  Every operation that trusts the
+    /// in-memory index must catch up first, and the index cache must be
+    /// stamped with *this* offset rather than the file's current length,
+    /// or it will claim to describe records it never saw.
+    known_len: u64,
+    known_mtime_ns: u64,
+    /// Identity of the file this handle's storage fd refers to.  compact()
+    /// renames a fresh file over the path, so any other handle keeps writing
+    /// into the now-unlinked old inode and loses everything it appends.
+    /// Detecting the swap forces a reload *and* a storage reopen.
+    known_ino: u64,
     /// Active batch buffer, if a batch is in progress.
     batch: Option<BatchBuffer>,
     /// Auto-embed configuration: source_field → config
@@ -343,6 +360,28 @@ impl Collection {
             );
         }
 
+        // The index we just built (from cache or scan) describes the file as
+        // it stands right now; record that as our sync point.
+        let (known_len, known_mtime_ns, known_ino) = fs::metadata(path)
+            .ok()
+            .map(|m| {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                #[cfg(unix)]
+                let ino = {
+                    use std::os::unix::fs::MetadataExt;
+                    m.ino()
+                };
+                #[cfg(not(unix))]
+                let ino = 0u64;
+                (m.len(), mtime, ino)
+            })
+            .unwrap_or((0, 0, 0));
+
         Ok(Self {
             inner: Arc::new(RwLock::new(CollectionInner {
                 path: path.to_path_buf(),
@@ -354,6 +393,9 @@ impl Collection {
                 loaded_from_cache,
                 dirty: false,
                 lock_file,
+                known_len,
+                known_mtime_ns,
+                known_ino,
                 batch: None,
                 auto_embeds: auto_embeds_map,
                 embedding_engines,
@@ -415,22 +457,58 @@ impl Collection {
         }
 
         // --- Normal path ---
-        if inner.index_manager.get(&_id).is_some() {
-            return Err(MooFileError::DuplicateKey(_id));
-        }
-
-// Auto-embed before storing
-        let doc = inner.apply_auto_embed(doc)?;
-
-        inner.with_write_lock(|inner| inner.storage.append(RECORD_LIVE, &doc))?;
-        inner.index_manager.add(doc.clone());
-        inner.total_records += 1;
+        // The duplicate check must happen under the same lock hold as the
+        // append, and after catch_up, or a concurrent writer's record for this
+        // _id is invisible and we write a second one for the same key.
+        let doc = inner.with_write_lock(|inner| insert_locked(inner, doc, &_id))?;
         inner.dirty = true;
         Ok(doc)
     }
 
+    /// Insert many documents under a *single* file-lock hold.
+    ///
+    /// Going through `insert()` per document meant one flock/unflock pair and
+    /// one reconciliation per document, which dominated bulk loads.
     pub fn insert_many(&self, docs: Vec<Document>) -> Result<Vec<Document>, MooFileError> {
-        docs.into_iter().map(|d| self.insert(d)).collect()
+        let mut inner = self.inner.write().expect("lock poisoned");
+        inner.require_write()?;
+
+        // With a batch open the per-document path buffers instead of writing,
+        // so keep using it.
+        if inner.batch.is_some() {
+            drop(inner);
+            return docs.into_iter().map(|d| self.insert(d)).collect();
+        }
+
+        let prepared: Vec<(Document, String)> = docs
+            .into_iter()
+            .map(|mut doc| {
+                if !doc.contains_key("_id") {
+                    doc.insert("_id", generate_id());
+                }
+                match doc.get("_id") {
+                    Some(Bson::String(s)) => {
+                        let id = s.clone();
+                        Ok((doc, id))
+                    }
+                    Some(other) => Err(MooFileError::InvalidId(format!(
+                        "{:?}",
+                        other.element_type()
+                    ))),
+                    None => unreachable!("_id was just inserted if absent"),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+
+        let out = inner.with_write_lock(|inner| {
+            let mut out = Vec::with_capacity(prepared.len());
+            for (doc, id) in prepared {
+                out.push(insert_locked(inner, doc, &id)?);
+            }
+            Ok(out)
+        })?;
+        inner.dirty = true;
+        Ok(out)
     }
 
     // ------------------------------------------------------------------
@@ -466,21 +544,26 @@ impl Collection {
             return Ok(true);
         }
 
-        let docs_arc = inner.index_manager.get_matching(&where_clause);
-        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-        if docs.is_empty() {
-            return Err(MooFileError::DocumentNotFound);
-        }
-        let old_doc = &docs[0];
-        let old_id = old_doc.get_str("_id").unwrap().to_string();
+        // Match and write under a single lock hold, so the document we picked
+        // is still the one we update.
+        inner.with_write_lock(|inner| {
+            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            if docs.is_empty() {
+                return Err(MooFileError::DocumentNotFound);
+            }
+            let old_doc = &docs[0];
+            let old_id = old_doc.get_str("_id").unwrap().to_string();
 
-        let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
-        new_doc = inner.apply_auto_embed(new_doc)?;
+            let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+            new_doc = inner.apply_auto_embed(new_doc)?;
 
-        inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
-        inner.index_manager.remove(&old_id);
-        inner.index_manager.add(new_doc);
-        inner.total_records += 1;
+            inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+            inner.index_manager.remove(&old_id);
+            inner.index_manager.add(new_doc);
+            inner.total_records += 1;
+            Ok(())
+        })?;
         inner.dirty = true;
         Ok(true)
     }
@@ -514,21 +597,28 @@ impl Collection {
             return Ok(count);
         }
 
-        let docs_arc = inner.index_manager.get_matching(&where_clause);
-        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-        let mut count = 0;
+        // One lock hold for the whole operation: taking it per document meant
+        // N flock/unflock pairs and N reconciliations, and let another writer
+        // interleave in the middle of a bulk update.
+        let count = inner.with_write_lock(|inner| {
+            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            let mut count = 0;
 
-        for old_doc in &docs {
-            let old_id = old_doc.get_str("_id").unwrap().to_string();
-            let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
-            new_doc = inner.apply_auto_embed(new_doc)?;
+            for old_doc in &docs {
+                let old_id = old_doc.get_str("_id").unwrap().to_string();
+                let mut new_doc =
+                    apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
+                new_doc = inner.apply_auto_embed(new_doc)?;
 
-            inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
-            inner.index_manager.remove(&old_id);
-            inner.index_manager.add(new_doc);
-            inner.total_records += 1;
-            count += 1;
-        }
+                inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+                inner.index_manager.remove(&old_id);
+                inner.index_manager.add(new_doc);
+                inner.total_records += 1;
+                count += 1;
+            }
+            Ok(count)
+        })?;
 
         if count > 0 {
             inner.dirty = true;
@@ -564,22 +654,25 @@ impl Collection {
             return Ok(true);
         }
 
-        let docs_arc = inner.index_manager.get_matching(&where_clause);
-        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-        if docs.is_empty() {
-            return Err(MooFileError::DocumentNotFound);
-        }
-        let old_doc = &docs[0];
-        let old_id = old_doc.get_str("_id").unwrap().to_string();
+        inner.with_write_lock(|inner| {
+            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            if docs.is_empty() {
+                return Err(MooFileError::DocumentNotFound);
+            }
+            let old_doc = &docs[0];
+            let old_id = old_doc.get_str("_id").unwrap().to_string();
 
-        let mut new_doc = replacement;
-        new_doc.insert("_id", old_id.clone());
-        new_doc = inner.apply_auto_embed(new_doc)?;
+            let mut new_doc = replacement;
+            new_doc.insert("_id", old_id.clone());
+            new_doc = inner.apply_auto_embed(new_doc)?;
 
-        inner.with_write_lock(|inner| inner.storage.append(RECORD_REPLACEMENT, &new_doc))?;
-        inner.index_manager.remove(&old_id);
-        inner.index_manager.add(new_doc);
-        inner.total_records += 1;
+            inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+            inner.index_manager.remove(&old_id);
+            inner.index_manager.add(new_doc);
+            inner.total_records += 1;
+            Ok(())
+        })?;
         inner.dirty = true;
         Ok(true)
     }
@@ -607,20 +700,23 @@ impl Collection {
             return Ok(true);
         }
 
-        let docs_arc = inner.index_manager.get_matching(&where_clause);
-        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-        if docs.is_empty() {
-            return Ok(false);
-        }
-        let _id = docs[0].get_str("_id").unwrap().to_string();
+        let deleted = inner.with_write_lock(|inner| {
+            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            if docs.is_empty() {
+                return Ok(false);
+            }
+            let _id = docs[0].get_str("_id").unwrap().to_string();
 
-inner.with_write_lock(|inner| {
-            inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })
+            inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
+            inner.index_manager.remove(&_id);
+            inner.total_records += 1;
+            Ok(true)
         })?;
-        inner.index_manager.remove(&_id);
-        inner.total_records += 1;
-        inner.dirty = true;
-        Ok(true)
+        if deleted {
+            inner.dirty = true;
+        }
+        Ok(deleted)
     }
 
     pub fn delete_many(&self, where_clause: Document) -> Result<usize, MooFileError> {
@@ -643,19 +739,22 @@ inner.with_write_lock(|inner| {
             return Ok(count);
         }
 
-        let docs_arc = inner.index_manager.get_matching(&where_clause);
-        let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-        let mut count = 0;
-
-        for doc in &docs {
-            let _id = doc.get_str("_id").unwrap().to_string();
-            inner.with_write_lock(|inner| {
-                inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })
-            })?;
-            inner.index_manager.remove(&_id);
-            inner.total_records += 1;
-            count += 1;
-        }
+        // One lock hold for the whole delete, as in update_many.
+        let count = inner.with_write_lock(|inner| {
+            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let ids: Vec<String> = docs_arc
+                .iter()
+                .filter_map(|d| d.get_str("_id").ok().map(String::from))
+                .collect();
+            let mut count = 0;
+            for _id in &ids {
+                inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": _id })?;
+                inner.index_manager.remove(_id);
+                inner.total_records += 1;
+                count += 1;
+            }
+            Ok(count)
+        })?;
 
         if count > 0 {
             inner.dirty = true;
@@ -667,10 +766,22 @@ inner.with_write_lock(|inner| {
     // Query
     // ------------------------------------------------------------------
 
+    /// Reconcile the in-memory index with the file before a read.
+    ///
+    /// Another process may have appended since we last looked; without this a
+    /// long-lived reader would never observe a writer's records.  Costs one
+    /// `stat` when nothing has changed.
+    pub(crate) fn refresh(&self) -> Result<(), MooFileError> {
+        let mut inner = self.inner.write().expect("lock poisoned");
+        inner.require_open()?;
+        inner.catch_up()
+    }
+
     pub fn find(&self, filter: Document) -> Result<Query, MooFileError> {
+        query::validate_filter(&filter)?;
+        self.refresh()?;
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
-        query::validate_filter(&filter)?;
         Ok(Query::new(Arc::clone(&self.inner), filter))
     }
 
@@ -679,9 +790,10 @@ inner.with_write_lock(|inner| {
     }
 
     pub fn count(&self, filter: Document) -> Result<usize, MooFileError> {
+        query::validate_filter(&filter)?;
+        self.refresh()?;
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
-        query::validate_filter(&filter)?;
         Ok(inner.index_manager.count_matching(&filter))
     }
 
@@ -775,15 +887,22 @@ inner.with_write_lock(|inner| {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
 
-        let live_docs = inner.index_manager.all_docs();
         inner.storage.close();
-        let result = inner.with_write_lock(|inner| storage::compact(&inner.path, &live_docs));
+        // The live set must be computed *after* catch_up (which with_write_lock
+        // runs under the exclusive lock), or compaction rewrites the file from
+        // a stale snapshot and permanently destroys another process's records.
+        let result = inner.with_write_lock(|inner| {
+            let live_docs = inner.index_manager.all_docs();
+            storage::compact(&inner.path, &live_docs)?;
+            inner.total_records = live_docs.len() as u64;
+            Ok(())
+        });
         inner.storage.reopen()?;
 
         if result.is_ok() {
-            inner.total_records = live_docs.len() as u64;
             cache::delete_cache(&inner.path);
             inner.dirty = true;
+            inner.mark_synced();
         }
 
         result
@@ -838,7 +957,12 @@ inner.with_write_lock(|inner| {
     pub fn save_cache(&self) -> Result<(), MooFileError> {
         let inner = self.inner.write().expect("lock poisoned");
         inner.require_open()?;
-        cache::save_cache(&inner.path, &inner.index_manager, inner.total_records)
+        cache::save_cache(
+            &inner.path,
+            &inner.index_manager,
+            inner.total_records,
+            (inner.known_len, inner.known_mtime_ns),
+        )
     }
 
     pub fn close(&self) -> Result<(), MooFileError> {
@@ -855,6 +979,7 @@ inner.with_write_lock(|inner| {
                     &inner.path,
                     &inner.index_manager,
                     inner.total_records,
+                    (inner.known_len, inner.known_mtime_ns),
                 ) {
                     log::warn!("moofile: failed to save cache: {e}");
                 }
@@ -958,6 +1083,98 @@ impl CollectionInner {
     /// write waits for any other process currently writing.  Since no
     /// process holds a lock during normal operation, this only blocks
     /// briefly during concurrent writes.
+    /// Current (length, mtime_ns, inode) of the data file, if it can be stat'd.
+    /// The inode is 0 on platforms that don't expose one; there we fall back
+    /// to detecting a replacement by the file shrinking.
+    fn file_state(&self) -> Option<(u64, u64, u64)> {
+        let meta = fs::metadata(&self.path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        };
+        #[cfg(not(unix))]
+        let ino = 0u64;
+        Some((meta.len(), mtime, ino))
+    }
+
+    /// Reconcile the in-memory index with the data file.
+    ///
+    /// Three cases:
+    ///   * unchanged  — one `stat`, no work (the overwhelmingly common path)
+    ///   * grew       — another writer appended; replay just the new suffix
+    ///   * shrank     — the file was compacted out from under us; full reload
+    ///
+    /// A partially written record at the tail is *not* truncated here: with
+    /// multiple processes it most likely means another writer is mid-append,
+    /// and truncating would destroy their record.  We simply stop before it
+    /// and pick it up on the next catch-up.
+    fn catch_up(&mut self) -> Result<(), MooFileError> {
+        if self.closed || self.batch.is_some() {
+            // Mid-batch the index deliberately reflects pre-batch state.
+            return Ok(());
+        }
+        let (len, mtime, ino) = match self.file_state() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        // A different inode means the file was replaced (compaction) — our
+        // storage fd points at a dead inode and must be reopened.
+        if ino != self.known_ino || len < self.known_len {
+            return self.full_reload();
+        }
+        if len == self.known_len && mtime == self.known_mtime_ns {
+            return Ok(());
+        }
+
+        let (records, partial) = storage::scan_from(&self.path, self.known_len)?;
+        for record in &records {
+            apply_record(&mut self.index_manager, record);
+        }
+        self.total_records += records.len() as u64;
+        // Resume from the start of any partial record next time.
+        self.known_len = partial.unwrap_or(len);
+        self.known_mtime_ns = mtime;
+        self.known_ino = ino;
+        Ok(())
+    }
+
+    /// Rebuild the whole index from the file (used when it was rewritten).
+    fn full_reload(&mut self) -> Result<(), MooFileError> {
+        // Repoint the storage handle at the current file: after a compaction
+        // our fd refers to the unlinked old inode, so appends would be lost.
+        self.storage.reopen()?;
+        self.index_manager.clear();
+        let (records, partial) = storage::scan_file(&self.path)?;
+        for record in &records {
+            apply_record(&mut self.index_manager, record);
+        }
+        self.index_manager.rebuild_vector_indexes();
+        self.total_records = records.len() as u64;
+        let (len, mtime, ino) = self.file_state().unwrap_or((0, 0, 0));
+        self.known_len = partial.unwrap_or(len);
+        self.known_mtime_ns = mtime;
+        self.known_ino = ino;
+        self.loaded_from_cache = false;
+        Ok(())
+    }
+
+    /// Record that this handle is in sync with the file as it stands now.
+    /// Called after our own writes, which we have already applied in memory.
+    fn mark_synced(&mut self) {
+        if let Some((len, mtime, ino)) = self.file_state() {
+            self.known_len = len;
+            self.known_mtime_ns = mtime;
+            self.known_ino = ino;
+        }
+    }
+
     fn with_write_lock<F, R>(&mut self, f: F) -> Result<R, MooFileError>
     where
         F: FnOnce(&mut Self) -> Result<R, MooFileError>,
@@ -970,7 +1187,12 @@ impl CollectionInner {
             false
         };
 
-        let result = f(self);
+        // Pick up anyone else's writes before appending our own, so our index
+        // (and the cache we derive from it) reflects the whole file.
+        let result = self.catch_up().and_then(|()| f(self));
+        if result.is_ok() {
+            self.mark_synced();
+        }
 
         if locked {
             if let Some(ref lf) = self.lock_file {
@@ -1103,6 +1325,43 @@ fn merge_meta(
 // ---------------------------------------------------------------------------
 // BSON file loader
 // ---------------------------------------------------------------------------
+
+/// Insert one document. The caller must already hold the exclusive file lock
+/// and have reconciled the index (see `with_write_lock`).
+fn insert_locked(
+    inner: &mut CollectionInner,
+    doc: Document,
+    _id: &str,
+) -> Result<Document, MooFileError> {
+    if inner.index_manager.get(_id).is_some() {
+        return Err(MooFileError::DuplicateKey(_id.to_string()));
+    }
+    let doc = inner.apply_auto_embed(doc)?;
+    inner.storage.append(RECORD_LIVE, &doc)?;
+    inner.index_manager.add(doc.clone());
+    inner.total_records += 1;
+    Ok(doc)
+}
+
+/// Apply one scanned record to the index (last write wins per `_id`).
+fn apply_record(index_manager: &mut IndexManager, record: &storage::Record) {
+    let _id = match record.doc.get("_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+    match record.record_type {
+        RECORD_LIVE | RECORD_REPLACEMENT => {
+            if index_manager.get(&_id).is_some() {
+                index_manager.remove(&_id);
+            }
+            index_manager.add(record.doc.clone());
+        }
+        RECORD_TOMBSTONE => {
+            index_manager.remove(&_id);
+        }
+        _ => {}
+    }
+}
 
 fn load_from_file(
     path: &Path,

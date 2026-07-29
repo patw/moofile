@@ -16,6 +16,15 @@ use crate::embed::{self, ModelUri};
 use crate::CollectionInner;
 use crate::MooFileError;
 
+
+/// Reconcile the collection's index with the data file before reading.
+/// See `Collection::refresh` — another process may have appended.
+pub(crate) fn refresh_inner(inner: &Arc<RwLock<CollectionInner>>) -> Result<(), MooFileError> {
+    let mut guard = inner.write().expect("lock poisoned");
+    guard.require_open()?;
+    guard.catch_up()
+}
+
 // ---------------------------------------------------------------------------
 // Filter evaluation
 // ---------------------------------------------------------------------------
@@ -416,6 +425,7 @@ impl Query {
     // -----------------------------------------------------------
 
     pub fn to_list(self) -> Result<Vec<Document>, MooFileError> {
+        refresh_inner(&self.inner)?;
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 
@@ -459,6 +469,7 @@ impl Query {
 
     pub fn count(self) -> Result<usize, MooFileError> {
         if self.group_field.is_none() && self.sort_key.is_none() && self.skip_n == 0 {
+            refresh_inner(&self.inner)?;
             let inner = self.inner.read().expect("lock poisoned");
             return Ok(inner.index_manager.count_matching(&self.filter));
         }
@@ -511,6 +522,7 @@ impl VectorQuery {
         {
             let mut inner = self.inner.write().expect("lock poisoned");
             inner.require_open()?;
+            inner.catch_up()?;
             inner.index_manager.ensure_vectors_fresh();
         }
 
@@ -560,6 +572,7 @@ pub struct TextQuery {
 
 impl TextQuery {
     pub fn to_list(self) -> Result<Vec<(Document, f32)>, MooFileError> {
+        refresh_inner(&self.inner)?;
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 

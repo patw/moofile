@@ -18,6 +18,7 @@ from .storage import (
     StorageEngine,
     compact,
     scan_file,
+    scan_from,
 )
 
 
@@ -82,6 +83,19 @@ class Collection:
         self._loaded_from_cache: bool = False
         self._dirty: bool = False
         self._lock_fd = None
+        # Byte offset / mtime of the data file that the in-memory index has
+        # replayed up to.  Another process may append at any time; the format
+        # is append-only, so their records are always a suffix and _catch_up
+        # replays just that.  The cache must be stamped with THIS basis, not
+        # the file's current size, or it will claim to describe records this
+        # handle never saw.
+        self._known_len = 0
+        self._known_mtime_ns = 0
+        # Identity of the file our storage fd refers to.  compact() renames a
+        # fresh file over the path, so any other handle keeps writing into the
+        # now-unlinked old inode and loses everything it appends.  Detecting
+        # the swap forces a reload *and* a storage reopen.
+        self._known_ino = None
         self._batch: "BatchContext | None" = None
 
         declared = list(indexes or [])
@@ -126,18 +140,50 @@ class Collection:
         if "_id" not in doc:
             doc["_id"] = _generate_id()
         _check_id(doc["_id"])
-        if self._index_manager.get(doc["_id"]) is not None:
-            raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
+        # The duplicate check must happen under the same lock hold as the
+        # append, and after _catch_up, or a concurrent writer's record for this
+        # _id is invisible and we write a second one for the same key.
         with self._with_write_lock():
+            if self._index_manager.get(doc["_id"]) is not None:
+                raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
             self._storage.append(RECORD_LIVE, doc)
-        self._index_manager.add(doc)
-        self._total_records += 1
+            self._index_manager.add(doc)
+            self._total_records += 1
         self._dirty = True
         return doc
 
     def insert_many(self, docs: list) -> list:
-        """Insert multiple documents. Returns a list of inserted documents."""
-        return [self.insert(doc) for doc in docs]
+        """Insert multiple documents. Returns a list of inserted documents.
+
+        Holds the file lock once for the whole batch: going through insert()
+        per document meant one flock/unflock pair and one reconciliation each,
+        which dominated bulk loads.
+        """
+        self._require_write()
+        if self._batch is not None:
+            # With a batch open the per-document path buffers instead of
+            # writing, so keep using it.
+            return [self.insert(doc) for doc in docs]
+
+        prepared = []
+        for doc in docs:
+            doc = copy_doc(doc)
+            if "_id" not in doc:
+                doc["_id"] = _generate_id()
+            _check_id(doc["_id"])
+            prepared.append(doc)
+
+        out = []
+        with self._with_write_lock():
+            for doc in prepared:
+                if self._index_manager.get(doc["_id"]) is not None:
+                    raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
+                self._storage.append(RECORD_LIVE, doc)
+                self._index_manager.add(doc)
+                self._total_records += 1
+                out.append(doc)
+        self._dirty = True
+        return out
 
     # -----------------------------------------------------------------------
     # Update
@@ -165,16 +211,18 @@ class Collection:
         validate_filter(where)
         if self._batch is not None:
             return self._batch.update_one(where, set, unset, inc)
-        docs = self._get_docs(where)
-        if not docs:
-            raise DocumentNotFoundError(f"No document matches: {where!r}")
-        old_doc = docs[0]
-        new_doc = _apply_update(old_doc, set, unset, inc)
+        # Match and write under a single lock hold, so the document we picked
+        # is still the one we update.
         with self._with_write_lock():
+            docs = self._get_docs(where)
+            if not docs:
+                raise DocumentNotFoundError(f"No document matches: {where!r}")
+            old_doc = docs[0]
+            new_doc = _apply_update(old_doc, set, unset, inc)
             self._storage.append(RECORD_REPLACEMENT, new_doc)
-        self._index_manager.remove(old_doc["_id"])
-        self._index_manager.add(new_doc)
-        self._total_records += 1
+            self._index_manager.remove(old_doc["_id"])
+            self._index_manager.add(new_doc)
+            self._total_records += 1
         self._dirty = True
         return True
 
@@ -194,9 +242,9 @@ class Collection:
         validate_filter(where)
         if self._batch is not None:
             return self._batch.update_many(where, set, unset, inc)
-        docs = self._get_docs(where)
         count = 0
         with self._with_write_lock():
+            docs = self._get_docs(where)
             for old_doc in docs:
                 new_doc = _apply_update(old_doc, set, unset, inc)
                 self._storage.append(RECORD_REPLACEMENT, new_doc)
@@ -219,17 +267,17 @@ class Collection:
         validate_filter(where)
         if self._batch is not None:
             return self._batch.replace_one(where, new_doc)
-        docs = self._get_docs(where)
-        if not docs:
-            raise DocumentNotFoundError(f"No document matches: {where!r}")
-        old_doc = docs[0]
-        replacement = copy_doc(new_doc)
-        replacement["_id"] = old_doc["_id"]
         with self._with_write_lock():
+            docs = self._get_docs(where)
+            if not docs:
+                raise DocumentNotFoundError(f"No document matches: {where!r}")
+            old_doc = docs[0]
+            replacement = copy_doc(new_doc)
+            replacement["_id"] = old_doc["_id"]
             self._storage.append(RECORD_REPLACEMENT, replacement)
-        self._index_manager.remove(old_doc["_id"])
-        self._index_manager.add(replacement)
-        self._total_records += 1
+            self._index_manager.remove(old_doc["_id"])
+            self._index_manager.add(replacement)
+            self._total_records += 1
         self._dirty = True
         return True
 
@@ -247,14 +295,14 @@ class Collection:
         validate_filter(where)
         if self._batch is not None:
             return self._batch.delete_one(where)
-        docs = self._get_docs(where)
-        if not docs:
-            return False
-        doc = docs[0]
         with self._with_write_lock():
+            docs = self._get_docs(where)
+            if not docs:
+                return False
+            doc = docs[0]
             self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
-        self._index_manager.remove(doc["_id"])
-        self._total_records += 1
+            self._index_manager.remove(doc["_id"])
+            self._total_records += 1
         self._dirty = True
         return True
 
@@ -268,9 +316,9 @@ class Collection:
         validate_filter(where)
         if self._batch is not None:
             return self._batch.delete_many(where)
-        docs = self._get_docs(where)
         count = 0
         with self._with_write_lock():
+            docs = self._get_docs(where)
             for doc in docs:
                 self._storage.append(RECORD_TOMBSTONE, {"_id": doc["_id"]})
                 self._index_manager.remove(doc["_id"])
@@ -337,15 +385,18 @@ class Collection:
         Safe to interrupt — if it fails the original file is untouched.
         """
         self._require_write()
-        live_docs = self._index_manager.all_docs()
         self._storage.close()
         try:
+            # The live set must be computed *after* _catch_up (which
+            # _with_write_lock runs under the exclusive lock), or compaction
+            # rewrites the file from a stale snapshot and permanently destroys
+            # another process's records.
             with self._with_write_lock():
+                live_docs = self._index_manager.all_docs()
                 compact(self._path, live_docs)
+                self._total_records = len(live_docs)
         finally:
             self._storage.reopen()
-        # After compaction total_records == live document count
-        self._total_records = len(live_docs)
         # The BSON file was rewritten — cache is definitely stale.
         self._delete_cache()
         self._dirty = True
@@ -440,6 +491,10 @@ class Collection:
 
     def _get_docs(self, filter_dict: dict) -> list:
         """Return all documents matching filter_dict, using indexes when possible."""
+        # Another process may have appended since we last looked; without this
+        # a long-lived reader never observes a writer's records.  Costs one
+        # stat when nothing changed.
+        self._catch_up()
         if not filter_dict:
             return self._index_manager.all_docs()
 
@@ -455,6 +510,7 @@ class Collection:
         ]
 
     def _count_docs(self, filter_dict: dict) -> int:
+        self._catch_up()
         if not filter_dict:
             return len(self._index_manager._documents)
         return len(self._get_docs(filter_dict))
@@ -544,11 +600,17 @@ class Collection:
         @contextmanager
         def _cm():
             if self._lock_fd is None:
+                self._catch_up()
                 yield
+                self._mark_synced()
                 return
             fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_EX)
             try:
+                # Pick up anyone else's writes before appending our own, so the
+                # index (and the cache derived from it) covers the whole file.
+                self._catch_up()
                 yield
+                self._mark_synced()
             finally:
                 fcntl.flock(self._lock_fd.fileno(), fcntl.LOCK_UN)
 
@@ -563,6 +625,77 @@ class Collection:
                 pass
             self._lock_fd = None
 
+    def _apply_record(self, record_type: int, doc: dict) -> None:
+        """Apply one scanned record to the index (last write wins per _id)."""
+        _id = doc.get("_id")
+        if _id is None:
+            return
+        if record_type in (RECORD_LIVE, RECORD_REPLACEMENT):
+            if self._index_manager.get(_id) is not None:
+                self._index_manager.remove(_id)
+            self._index_manager.add(doc)
+        elif record_type == RECORD_TOMBSTONE:
+            self._index_manager.remove(_id)
+
+    def _catch_up(self) -> None:
+        """Reconcile the in-memory index with the data file.
+
+        Three cases: unchanged (one stat, no work), grew (replay just the new
+        suffix), or shrank (someone compacted — full reload).
+
+        A partial record at the tail is NOT truncated here: with multiple
+        processes it most likely means another writer is mid-append, and
+        truncating would destroy their record.  We stop before it and pick it
+        up next time.
+        """
+        if self._batch is not None or self._storage is None:
+            # Mid-batch the index deliberately reflects pre-batch state.
+            return
+        ident = self._file_identity()
+        if ident is None:
+            return
+        length, mtime_ns, ino = ident
+        # A different inode means the file was replaced (compaction) — our
+        # storage fd points at a dead inode and must be reopened.
+        if ino != self._known_ino or length < self._known_len:
+            self._full_reload()
+            return
+        if length == self._known_len and mtime_ns == self._known_mtime_ns:
+            return
+
+        records, truncate_to = scan_from(self._path, self._known_len)
+        for _offset, record_type, doc in records:
+            self._apply_record(record_type, doc)
+        self._total_records += len(records)
+        self._known_len = truncate_to if truncate_to is not None else length
+        self._known_mtime_ns = mtime_ns
+        self._known_ino = ino
+
+    def _full_reload(self) -> None:
+        """Rebuild the whole index from the file (used when it was rewritten)."""
+        # Repoint the storage handle at the current file: after a compaction
+        # our fd refers to the unlinked old inode, so appends would be lost.
+        if self._storage is not None:
+            self._storage.reopen()
+        self._index_manager.clear()
+        records, truncate_to = scan_file(self._path)
+        for _offset, record_type, doc in records:
+            self._apply_record(record_type, doc)
+        self._index_manager.rebuild_vector_indexes()
+        self._total_records = len(records)
+        ident = self._file_identity() or (0, 0, None)
+        self._known_len = truncate_to if truncate_to is not None else ident[0]
+        self._known_mtime_ns = ident[1]
+        self._known_ino = ident[2]
+        self._loaded_from_cache = False
+
+    def _mark_synced(self) -> None:
+        """Record that this handle is in sync with the file as it stands now.
+        Called after our own writes, which are already applied in memory."""
+        ident = self._file_identity()
+        if ident is not None:
+            self._known_len, self._known_mtime_ns, self._known_ino = ident
+
     def _load_from_file(self) -> None:
         """Scan the BSON file and build in-memory indexes from scratch,
         or load from cache if valid."""
@@ -575,6 +708,7 @@ class Collection:
         # --- Try the disposable cache first ---
         if self._try_load_cache():
             self._loaded_from_cache = True
+            self._mark_synced()
             return
         self._loaded_from_cache = False
 
@@ -605,16 +739,25 @@ class Collection:
 
         # Rebuild vector indexes after loading all documents
         self._index_manager.rebuild_vector_indexes()
+        self._mark_synced()
 
     # ------------------------------------------------------------------
     # Cache management
     # ------------------------------------------------------------------
 
-    def _file_fingerprint(self) -> tuple[int, float] | None:
+    def _file_fingerprint(self) -> tuple[int, int] | None:
         """Return (size, mtime_ns) for the data file, or None if unreadable."""
         try:
             stat = os.stat(self._path)
             return (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return None
+
+    def _file_identity(self):
+        """Return (size, mtime_ns, (dev, ino)) or None if unreadable."""
+        try:
+            st = os.stat(self._path)
+            return (st.st_size, st.st_mtime_ns, (st.st_dev, st.st_ino))
         except OSError:
             return None
 
@@ -671,10 +814,11 @@ class Collection:
         if self._readonly:
             return
 
-        fp = self._file_fingerprint()
-        if fp is None:
-            return
-        data_len, data_mtime_ns = fp
+        # Stamp the file state the index actually describes.  With multiple
+        # processes that differs from the current state: another writer may
+        # have appended since. Stamping the current state would produce a cache
+        # that passes validation while silently omitting their records.
+        data_len, data_mtime_ns = self._known_len, self._known_mtime_ns
 
         cache = {
             "_magic": b"MOOF",
