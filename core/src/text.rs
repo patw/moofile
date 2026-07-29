@@ -182,7 +182,11 @@ impl TextIndex {
         }
 
         let mut scored: Vec<(String, f32)> = doc_scores.into_iter().collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Break ties on doc_id so the ranking is a total order.  Scores come
+        // out of a HashMap, whose iteration order is randomised per process,
+        // so equal-scoring documents otherwise came back in a different order
+        // on every run -- and in a different order from the Python impl.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(limit);
         scored
     }
@@ -200,8 +204,10 @@ impl TextIndex {
 // ---------------------------------------------------------------------------
 
 fn tokenize_and_stem(stemmer: &Stemmer, text: &str) -> Vec<String> {
-    // Simple regex: match runs of ASCII letters.
-    let re = regex_lite::Regex::new(r"[a-zA-Z]+").unwrap();
+    // Compiled once: this runs for every document indexed and every query,
+    // and recompiling the regex each call dominated tokenisation cost.
+    static TOKEN_RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
+    let re = TOKEN_RE.get_or_init(|| regex_lite::Regex::new(r"[a-zA-Z]+").unwrap());
     re.find_iter(text)
         .map(|m| m.as_str().to_lowercase())
         .filter(|t| t.len() > 1)

@@ -16,6 +16,16 @@ pub enum MooFileError {
     #[error("no document matches filter")]
     DocumentNotFound,
 
+    /// Inserted a document whose `_id` is not a string.  `_id` is used as
+    /// the in-memory index key and must be a BSON string.
+    #[error("_id must be a string, got {0}")]
+    InvalidId(String),
+
+    /// A query filter is malformed (e.g. a `$or` element that is not a
+    /// document, or an unknown operator).
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
+
     /// Attempted a write on a read-only collection.
     #[error("collection is open in read-only mode")]
     ReadOnly,

@@ -24,9 +24,17 @@ use crate::MooFileError;
 pub fn matches(doc: &Document, filter: &Document) -> bool {
     for (key, value) in filter.iter() {
         match key.as_str() {
+            // A non-document element inside `$and`/`$or` is malformed.  It is
+            // treated as non-matching rather than unwrapped — a panic here
+            // would poison the collection's RwLock and brick the handle.
+            // `validate_filter` rejects such filters at the API boundary so
+            // callers get a real error instead of silently empty results.
             "$and" => {
                 if let Some(Bson::Array(subs)) = filter.get(key) {
-                    if !subs.iter().all(|sub| matches(doc, sub.as_document().unwrap())) {
+                    if !subs
+                        .iter()
+                        .all(|sub| sub.as_document().is_some_and(|d| matches(doc, d)))
+                    {
                         return false;
                     }
                     continue;
@@ -35,7 +43,10 @@ pub fn matches(doc: &Document, filter: &Document) -> bool {
             }
             "$or" => {
                 if let Some(Bson::Array(subs)) = filter.get(key) {
-                    if !subs.iter().any(|sub| matches(doc, sub.as_document().unwrap())) {
+                    if !subs
+                        .iter()
+                        .any(|sub| sub.as_document().is_some_and(|d| matches(doc, d)))
+                    {
                         return false;
                     }
                     continue;
@@ -117,6 +128,70 @@ fn is_operator_doc(val: &Bson) -> bool {
     }
 }
 
+/// Field-level operators understood by [`eval_field_condition`].
+const FIELD_OPERATORS: &[&str] = &[
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$elemMatch",
+];
+
+/// Check a filter for structural errors before it is evaluated.
+///
+/// `matches()` is total — it never panics and treats anything malformed as
+/// non-matching.  That is the right behaviour deep in a scan loop, but it
+/// would silently return "no results" for a typo'd query.  Every public
+/// entry point that accepts a filter runs this first so the caller gets a
+/// [`MooFileError::InvalidFilter`] instead.
+pub(crate) fn validate_filter(filter: &Document) -> Result<(), MooFileError> {
+    for (key, value) in filter.iter() {
+        match key.as_str() {
+            "$and" | "$or" => match value {
+                Bson::Array(subs) => {
+                    for sub in subs {
+                        match sub.as_document() {
+                            Some(d) => validate_filter(d)?,
+                            None => {
+                                return Err(MooFileError::InvalidFilter(format!(
+                                    "'{key}' elements must be documents, got {sub:?}"
+                                )))
+                            }
+                        }
+                    }
+                }
+                other => {
+                    return Err(MooFileError::InvalidFilter(format!(
+                        "'{key}' requires an array, got {other:?}"
+                    )))
+                }
+            },
+            "$not" => match value.as_document() {
+                Some(d) => validate_filter(d)?,
+                None => {
+                    return Err(MooFileError::InvalidFilter(format!(
+                        "'$not' requires a document, got {value:?}"
+                    )))
+                }
+            },
+            _ if key.starts_with('$') => {
+                return Err(MooFileError::InvalidFilter(format!(
+                    "unknown top-level operator '{key}'"
+                )))
+            }
+            _ => {
+                if is_operator_doc(value) {
+                    // Safe: is_operator_doc only returns true for documents.
+                    for op in value.as_document().unwrap().keys() {
+                        if !FIELD_OPERATORS.contains(&op.as_str()) {
+                            return Err(MooFileError::InvalidFilter(format!(
+                                "unknown operator '{op}' on field '{key}'"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn elem_matches(elem: &Bson, filter: &Document) -> bool {
     match elem {
         Bson::Document(doc) => matches(doc, filter),
@@ -126,8 +201,13 @@ fn elem_matches(elem: &Bson, filter: &Document) -> bool {
 
 fn cmp_op(a: Option<&Bson>, b: &Bson, target: std::cmp::Ordering) -> bool {
     let a = match a {
+        // A missing field is not comparable to anything, so it satisfies no
+        // range operator.  Returning `true` here would make `$gt` match every
+        // document lacking the field, and would also disagree with the
+        // index path (`lookup_range_ids`), which only ever sees documents
+        // that actually have the field.
         Some(v) => v,
-        None => return target == std::cmp::Ordering::Greater,
+        None => return false,
     };
     match bson_cmp(a, b) {
         Some(ord) => ord == target,
@@ -811,5 +891,73 @@ mod tests {
         assert!(matches(&doc, &doc! { "name": { "$exists": true } }));
         assert!(!matches(&doc, &doc! { "age": { "$exists": true } }));
         assert!(matches(&doc, &doc! { "age": { "$exists": false } }));
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use bson::doc;
+
+    // --- Missing fields are not comparable (regression) ---
+
+    #[test]
+    fn missing_field_never_satisfies_range_ops() {
+        let d = doc! { "name": "Alice" }; // no "age"
+        assert!(!matches(&d, &doc! { "age": { "$gt": 10 } }));
+        assert!(!matches(&d, &doc! { "age": { "$gte": 10 } }));
+        assert!(!matches(&d, &doc! { "age": { "$lt": 10 } }));
+        assert!(!matches(&d, &doc! { "age": { "$lte": 10 } }));
+    }
+
+    #[test]
+    fn present_field_still_compares() {
+        let d = doc! { "age": 30 };
+        assert!(matches(&d, &doc! { "age": { "$gt": 10 } }));
+        assert!(!matches(&d, &doc! { "age": { "$gt": 30 } }));
+        assert!(matches(&d, &doc! { "age": { "$gte": 30 } }));
+    }
+
+    // --- matches() is total: malformed input must never panic ---
+
+    #[test]
+    fn malformed_logical_operators_do_not_panic() {
+        let d = doc! { "a": 1 };
+        assert!(!matches(&d, &doc! { "$or": ["not a document"] }));
+        assert!(!matches(&d, &doc! { "$and": [42] }));
+        assert!(!matches(&d, &doc! { "$or": "not an array" }));
+        // A valid element alongside an invalid one still evaluates.
+        assert!(matches(&d, &doc! { "$or": [ { "a": 1 }, "junk" ] }));
+    }
+
+    // --- validate_filter ---
+
+    #[test]
+    fn validate_accepts_well_formed_filters() {
+        assert!(validate_filter(&doc! {}).is_ok());
+        assert!(validate_filter(&doc! { "a": 1, "b": { "$gt": 2 } }).is_ok());
+        assert!(validate_filter(&doc! { "$or": [ { "a": 1 }, { "b": 2 } ] }).is_ok());
+        assert!(validate_filter(&doc! { "$and": [ { "$or": [ { "a": 1 } ] } ] }).is_ok());
+        assert!(validate_filter(&doc! { "$not": { "a": 1 } }).is_ok());
+        // A nested document that is not an operator doc is a plain equality.
+        assert!(validate_filter(&doc! { "a": { "nested": 1 } }).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_filters() {
+        for bad in [
+            doc! { "$or": ["x"] },
+            doc! { "$and": [1] },
+            doc! { "$or": "x" },
+            doc! { "$not": 5 },
+            doc! { "$bogus": [] },
+            doc! { "age": { "$bogus": 1 } },
+            doc! { "$or": [ { "age": { "$nope": 1 } } ] },
+        ] {
+            assert!(
+                matches!(validate_filter(&bad), Err(MooFileError::InvalidFilter(_))),
+                "expected InvalidFilter for {bad:?}"
+            );
+        }
     }
 }

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from .errors import DocumentNotFoundError, DuplicateKeyError, ReadOnlyError
 from .index import IndexManager
-from .query import Query, matches
+from .query import Query, copy_doc, matches, validate_filter
 from .storage import (
     RECORD_LIVE,
     RECORD_REPLACEMENT,
@@ -21,9 +21,28 @@ from .storage import (
 )
 
 
+#: Pickle cache layout version.  Bumped when the in-memory index structures
+#: change shape, so stale caches are rejected instead of misread.
+#:   1 -> 2: posting lists changed from list to insertion-ordered dict
+_CACHE_VERSION = 2
+
+
 def _generate_id() -> str:
     """Generate a random 12-byte hex string for use as _id."""
     return binascii.hexlify(os.urandom(12)).decode()
+
+
+def _check_id(_id) -> None:
+    """Reject a non-string _id.
+
+    The Rust engine skips records whose _id is not a BSON string when it
+    replays the file, so accepting one here would write a document to disk
+    that silently disappears the next time the collection is opened by the
+    native backend.  Both implementations reject it up front instead.
+    """
+    if not isinstance(_id, str):
+        from .errors import InvalidIdError
+        raise InvalidIdError(f"_id must be a string, got {type(_id).__name__}")
 
 
 class Collection:
@@ -103,9 +122,10 @@ class Collection:
         self._require_write()
         if self._batch is not None:
             return self._batch.insert(doc)
-        doc = dict(doc)
+        doc = copy_doc(doc)
         if "_id" not in doc:
             doc["_id"] = _generate_id()
+        _check_id(doc["_id"])
         if self._index_manager.get(doc["_id"]) is not None:
             raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
         self._storage.append(RECORD_LIVE, doc)
@@ -141,6 +161,7 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
+        validate_filter(where)
         if self._batch is not None:
             return self._batch.update_one(where, set, unset, inc)
         docs = self._get_docs(where)
@@ -168,6 +189,7 @@ class Collection:
         Returns the count of updated documents.
         """
         self._require_write()
+        validate_filter(where)
         if self._batch is not None:
             return self._batch.update_many(where, set, unset, inc)
         docs = self._get_docs(where)
@@ -191,13 +213,14 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
+        validate_filter(where)
         if self._batch is not None:
             return self._batch.replace_one(where, new_doc)
         docs = self._get_docs(where)
         if not docs:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
         old_doc = docs[0]
-        replacement = dict(new_doc)
+        replacement = copy_doc(new_doc)
         replacement["_id"] = old_doc["_id"]
         self._storage.append(RECORD_REPLACEMENT, replacement)
         self._index_manager.remove(old_doc["_id"])
@@ -217,6 +240,7 @@ class Collection:
         Returns True if a document was deleted, False if nothing matched.
         """
         self._require_write()
+        validate_filter(where)
         if self._batch is not None:
             return self._batch.delete_one(where)
         docs = self._get_docs(where)
@@ -236,6 +260,7 @@ class Collection:
         Returns the count of deleted documents.
         """
         self._require_write()
+        validate_filter(where)
         if self._batch is not None:
             return self._batch.delete_many(where)
         docs = self._get_docs(where)
@@ -255,7 +280,9 @@ class Collection:
 
     def find(self, filter_dict: dict = None) -> Query:
         """Return a lazy Query object. No work is done until a terminal method is called."""
-        return Query(self, filter_dict or {})
+        filter_dict = filter_dict or {}
+        validate_filter(filter_dict)
+        return Query(self, filter_dict)
 
     def find_one(self, filter_dict: dict = None):
         """Return the first matching document, or None."""
@@ -263,7 +290,9 @@ class Collection:
 
     def count(self, filter_dict: dict = None) -> int:
         """Count documents matching *filter_dict* (all documents if omitted)."""
-        return self._count_docs(filter_dict or {})
+        filter_dict = filter_dict or {}
+        validate_filter(filter_dict)
+        return self._count_docs(filter_dict)
 
     def exists(self, filter_dict: dict) -> bool:
         """Return True if at least one document matches *filter_dict*."""
@@ -574,7 +603,7 @@ class Collection:
             return False  # corrupt or wrong format
 
         # Validate magic + version
-        if cache.get("_magic") != b"MOOF" or cache.get("_version") != 1:
+        if cache.get("_magic") != b"MOOF" or cache.get("_version") != _CACHE_VERSION:
             return False
 
         # Validate data file fingerprint
@@ -616,7 +645,7 @@ class Collection:
 
         cache = {
             "_magic": b"MOOF",
-            "_version": 1,
+            "_version": _CACHE_VERSION,
             "_data_file_length": data_len,
             "_data_file_mtime_ns": data_mtime_ns,
             "_total_records": self._total_records,
@@ -775,9 +804,10 @@ class BatchContext:
     # --- Buffered write operations ---
 
     def insert(self, doc: dict) -> dict:
-        doc = dict(doc)
+        doc = copy_doc(doc)
         if "_id" not in doc:
             doc["_id"] = _generate_id()
+        _check_id(doc["_id"])
         if self._get(doc["_id"]) is not None:
             raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
         self._records.append((RECORD_LIVE, doc))
@@ -832,7 +862,7 @@ class BatchContext:
         if not docs:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
         old_doc = docs[0]
-        replacement = dict(new_doc)
+        replacement = copy_doc(new_doc)
         replacement["_id"] = old_doc["_id"]
         self._records.append((RECORD_REPLACEMENT, replacement))
         self._index_ops.append(("remove", old_doc["_id"]))
@@ -903,7 +933,7 @@ def _apply_update(
     inc_dict: dict | None,
 ) -> dict:
     """Apply $set / $unset / $inc operators to a copy of *doc*."""
-    new_doc = dict(doc)
+    new_doc = copy_doc(doc)
     if set_dict:
         new_doc.update(set_dict)
     if unset_list:

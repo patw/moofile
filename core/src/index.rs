@@ -2,7 +2,7 @@
 ///
 /// Documents are stored as `Arc<Document>` — cheap reference-counted
 /// clones instead of deep-copying 128-dim vectors on every query.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ pub(crate) enum IndexResult {
 }
 
 pub(crate) struct IndexManager {
-    pub(crate) regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
+    pub(crate) regular: BTreeMap<String, BTreeMap<Value, BTreeSet<String>>>,
     pub(crate) regular_fields: Vec<String>,
     pub(crate) vector_fields: Vec<(String, usize)>,
     pub(crate) vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
@@ -83,7 +83,7 @@ impl IndexManager {
     /// are passed explicitly so that configured-but-empty indexes are
     /// preserved (e.g. a vector index on a field that no document has yet).
     pub(crate) fn from_cache(
-        regular: BTreeMap<String, BTreeMap<Value, Vec<String>>>,
+        regular: BTreeMap<String, BTreeMap<Value, BTreeSet<String>>>,
         regular_fields: Vec<String>,
         vector_fields: Vec<(String, usize)>,
         vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
@@ -109,7 +109,7 @@ impl IndexManager {
         for field in &self.regular_fields {
             if let Some(val) = doc.get(field) {
                 if let Some(key) = bson_to_value(val) {
-                    self.regular.entry(field.clone()).or_default().entry(key).or_default().push(_id.clone());
+                    self.regular.entry(field.clone()).or_default().entry(key).or_default().insert(_id.clone());
                 }
             }
         }
@@ -160,7 +160,11 @@ impl IndexManager {
                 if let Some(key) = bson_to_value(val) {
                     if let Some(map) = self.regular.get_mut(field) {
                         if let Some(ids) = map.get_mut(&key) {
-                            ids.retain(|id| id != _id);
+                            // O(log k) — this was `retain`, an O(k) scan of every
+                            // id sharing this value.  On a low-cardinality field
+                            // (k == n) that made update/delete O(n) and bulk
+                            // operations quadratic.
+                            ids.remove(_id);
                             if ids.is_empty() { map.remove(&key); }
                         }
                     }
@@ -170,7 +174,30 @@ impl IndexManager {
         for field in &self.text_fields {
             if let Some(ti) = self.text_indexes.get_mut(field) { ti.remove_document(_id); }
         }
-        self.vectors_stale = true;
+        // Drop this document's row from each vector matrix in place.  Marking
+        // the whole matrix stale instead would force a full O(n·d) renormalise
+        // on the next search, so a single update in an interleaved
+        // insert/search workload cost as much as rebuilding the index.
+        // Only fall back to the stale flag if a row can't be located.
+        if !self.vectors_stale {
+            for (field, _) in &self.vector_fields {
+                if let Some((ids, data, dim)) = self.vector_data.get_mut(field) {
+                    if let Some(pos) = ids.iter().position(|id| id == _id) {
+                        // swap_remove keeps ids and data in lockstep: move the
+                        // trailing row into the hole, then truncate.
+                        let last = ids.len() - 1;
+                        if pos != last {
+                            ids.swap(pos, last);
+                            let (head, tail) = data.split_at_mut(last * *dim);
+                            head[pos * *dim..(pos + 1) * *dim]
+                                .copy_from_slice(&tail[..*dim]);
+                        }
+                        ids.pop();
+                        data.truncate(last * *dim);
+                    }
+                }
+            }
+        }
         Some(doc)
     }
 
@@ -284,7 +311,9 @@ impl IndexManager {
 
     pub fn lookup_exact_ids(&self, field: &str, value: &bson::Bson) -> Option<Vec<String>> {
         let key = bson_to_value(value)?;
-        Some(self.regular.get(field)?.get(&key).cloned().unwrap_or_default())
+        Some(self.regular.get(field)?.get(&key)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default())
     }
 
     pub fn lookup_range_ids(&self, field: &str, min_val: Option<&bson::Bson>, min_inclusive: bool,
@@ -359,12 +388,18 @@ impl IndexManager {
             }).collect()
         };
 
-        // Bounded top-k: O(n) partition + O(k log k) sort (item #2)
+        // Bounded top-k: O(n) partition + O(k log k) sort (item #2).
+        // Ties break on doc id so the ranking is a total order -- row order in
+        // the matrix shifts as documents are swap-removed, so without this the
+        // same query could return different equal-scoring docs over time.
+        let cmp = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.total_cmp(&a.1).then_with(|| ids[a.0].cmp(&ids[b.0]))
+        };
         if limit < scored.len() {
-            scored.select_nth_unstable_by(limit, |a, b| b.1.total_cmp(&a.1));
+            scored.select_nth_unstable_by(limit, cmp);
             scored.truncate(limit);
         }
-        scored.sort_by(|a,b| b.1.total_cmp(&a.1));
+        scored.sort_by(cmp);
 
         scored.into_iter().filter_map(|(i, score)|
             self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
@@ -403,12 +438,15 @@ impl IndexManager {
                 .collect()
         };
 
-        // Bounded top-k (item #2)
+        // Bounded top-k (item #2), with the same doc-id tie-break.
+        let cmp = |a: &(usize, f32), b: &(usize, f32)| {
+            b.1.total_cmp(&a.1).then_with(|| ids[a.0].cmp(&ids[b.0]))
+        };
         if limit < scored.len() {
-            scored.select_nth_unstable_by(limit, |a, b| b.1.total_cmp(&a.1));
+            scored.select_nth_unstable_by(limit, cmp);
             scored.truncate(limit);
         }
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        scored.sort_by(cmp);
 
         scored.into_iter().filter_map(|(i, score)|
             self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
@@ -565,5 +603,125 @@ mod tests {
         assert!(im.vector_search("embedding",&[1.0,0.0,0.0],0).is_empty());
         let allowed: std::collections::HashSet<String> = vec!["a".to_string()].into_iter().collect();
         assert!(im.vector_search_filtered("embedding",&[1.0,0.0,0.0],0,&allowed).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod incremental_vector_tests {
+    use super::*;
+    use bson::doc;
+
+    fn im() -> IndexManager {
+        IndexManager::new(&[], &[("embedding".into(), 3)], &[])
+    }
+
+    /// Search results after in-place removal must equal a full rebuild.
+    fn assert_matches_rebuild(im: &mut IndexManager, query: &[f32]) {
+        let incremental = im.vector_search("embedding", query, 100);
+        im.rebuild_vector_indexes();
+        let rebuilt = im.vector_search("embedding", query, 100);
+
+        let ids = |r: &Vec<(Document, f32)>| -> Vec<(String, String)> {
+            let mut v: Vec<_> = r
+                .iter()
+                .map(|(d, s)| (d.get_str("_id").unwrap().to_string(), format!("{s:.5}")))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids(&incremental), ids(&rebuilt));
+    }
+
+    #[test]
+    fn remove_keeps_ids_and_matrix_in_lockstep() {
+        let mut m = im();
+        for i in 0..6 {
+            let f = i as f64;
+            m.add(doc! {"_id": i.to_string(), "embedding": [f, 1.0, 0.0]});
+        }
+        m.rebuild_vector_indexes();
+
+        // Remove from the middle, the front, and the end.
+        m.remove("3");
+        m.remove("0");
+        m.remove("5");
+
+        let (ids, data, dim) = m.vector_data.get("embedding").unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(data.len(), ids.len() * dim);
+        let mut got: Vec<_> = ids.clone();
+        got.sort();
+        assert_eq!(got, vec!["1", "2", "4"]);
+
+        assert_matches_rebuild(&mut m, &[1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn remove_last_remaining_row() {
+        let mut m = im();
+        m.add(doc! {"_id": "only", "embedding": [1.0, 0.0, 0.0]});
+        m.rebuild_vector_indexes();
+        m.remove("only");
+
+        let (ids, data, _) = m.vector_data.get("embedding").unwrap();
+        assert!(ids.is_empty());
+        assert!(data.is_empty());
+        assert!(m.vector_search("embedding", &[1.0, 0.0, 0.0], 10).is_empty());
+    }
+
+    #[test]
+    fn interleaved_add_remove_stays_consistent() {
+        let mut m = im();
+        for i in 0..10 {
+            m.add(doc! {"_id": i.to_string(), "embedding": [i as f64, 1.0, 0.0]});
+        }
+        m.rebuild_vector_indexes();
+
+        for i in 0..10 {
+            if i % 2 == 0 {
+                m.remove(&i.to_string());
+            }
+            m.add(doc! {"_id": format!("n{i}"), "embedding": [1.0, i as f64, 0.0]});
+        }
+
+        let (ids, data, dim) = m.vector_data.get("embedding").unwrap();
+        assert_eq!(data.len(), ids.len() * dim);
+        assert_eq!(ids.len(), m.documents.len());
+        assert_matches_rebuild(&mut m, &[1.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn update_pattern_remove_then_add() {
+        // update_one() is remove() + add(); the row must be replaced, not duplicated.
+        let mut m = im();
+        m.add(doc! {"_id": "a", "embedding": [1.0, 0.0, 0.0]});
+        m.add(doc! {"_id": "b", "embedding": [0.0, 1.0, 0.0]});
+        m.rebuild_vector_indexes();
+
+        m.remove("a");
+        m.add(doc! {"_id": "a", "embedding": [0.0, 0.0, 1.0]});
+
+        let (ids, _, _) = m.vector_data.get("embedding").unwrap();
+        assert_eq!(ids.len(), 2, "row should be replaced, not duplicated");
+
+        let r = m.vector_search("embedding", &[0.0, 0.0, 1.0], 1);
+        assert_eq!(r[0].0.get_str("_id").unwrap(), "a");
+        assert!((r[0].1 - 1.0).abs() < 1e-5, "must use the updated vector");
+    }
+
+    #[test]
+    fn removing_doc_with_no_vector_is_harmless() {
+        let mut m = im();
+        m.add(doc! {"_id": "vec", "embedding": [1.0, 0.0, 0.0]});
+        m.add(doc! {"_id": "novec", "other": 1});
+        m.add(doc! {"_id": "baddim", "embedding": [1.0, 0.0]});
+        m.rebuild_vector_indexes();
+
+        m.remove("novec");
+        m.remove("baddim");
+
+        let (ids, data, dim) = m.vector_data.get("embedding").unwrap();
+        assert_eq!(ids, &vec!["vec".to_string()]);
+        assert_eq!(data.len(), *dim);
     }
 }

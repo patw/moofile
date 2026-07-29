@@ -145,7 +145,10 @@ class TextIndex:
                 doc_scores[doc_id] += idf * tf_component
         
         # Sort by score descending and limit results
-        sorted_results = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+        # Sort by score descending, then doc_id ascending.  The tie-break makes
+        # the ranking a total order so equal-scoring documents come back in the
+        # same order here and in the Rust implementation.
+        sorted_results = sorted(doc_scores.items(), key=lambda x: (-x[1], x[0]))
         return sorted_results[:limit]
     
     def clear(self) -> None:

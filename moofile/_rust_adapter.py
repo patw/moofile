@@ -21,6 +21,8 @@ def _map_errors(e):
         ConcurrentAccessError,
         DocumentNotFoundError,
         DuplicateKeyError,
+        InvalidFilterError,
+        InvalidIdError,
         ReadOnlyError,
     )
     msg = str(e).lower()
@@ -32,6 +34,10 @@ def _map_errors(e):
         raise DuplicateKeyError(str(e)) from e
     if "no document matches" in msg:
         raise DocumentNotFoundError(str(e)) from e
+    if "_id must be a string" in msg:
+        raise InvalidIdError(str(e)) from e
+    if "invalid filter" in msg:
+        raise InvalidFilterError(str(e)) from e
     raise e
 
 
@@ -204,6 +210,17 @@ class Collection:
 
     def __exit__(self, *args):
         self.close()
+
+    def __del__(self):
+        # The pure-Python Collection closes on __del__, so without this the
+        # two backends disagreed about whether the index cache gets written:
+        # a caller who never called close() (or used a `with` block) silently
+        # got no cache at all, and paid a full BSON rescan on every open --
+        # exactly the cost the cache exists to avoid.
+        try:
+            self.close()
+        except Exception:
+            pass  # interpreter shutdown — nothing useful to do here
 
 
 # ---------------------------------------------------------------------------

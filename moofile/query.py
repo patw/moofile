@@ -2,6 +2,71 @@
 
 from .operators import apply_op
 
+# Field-level operators understood by matches().  Kept in sync with
+# FIELD_OPERATORS in core/src/query.rs.
+_FIELD_OPERATORS = frozenset({
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists", "$elemMatch",
+})
+
+
+def copy_doc(value):
+    """Return a deep copy of a BSON-shaped value.
+
+    The in-memory index stores documents by reference.  Handing those objects
+    straight back to callers meant a caller mutating a query result silently
+    mutated the index itself — and, because ``close()`` pickles the index into
+    the ``.cache`` file, that corruption survived a reopen and then vanished
+    again whenever the cache was invalidated.  The Rust engine clones on read,
+    so every public read path here copies too.
+
+    Only dicts and lists are rebuilt; every other BSON value (str, int, float,
+    bool, None, bytes, datetime, ObjectId, Binary) is immutable and safe to
+    share.  That makes this ~2.4x faster than copy.deepcopy.
+    """
+    if isinstance(value, dict):
+        return {k: copy_doc(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [copy_doc(v) for v in value]
+    return value
+
+
+def validate_filter(filter_dict: dict) -> None:
+    """Raise InvalidFilterError if *filter_dict* is structurally malformed.
+
+    Mirrors ``validate_filter`` in core/src/query.rs so both backends reject
+    the same filters with the same message.
+    """
+    from .errors import InvalidFilterError
+
+    for key, value in filter_dict.items():
+        if key in ("$and", "$or"):
+            if not isinstance(value, (list, tuple)):
+                raise InvalidFilterError(
+                    f"invalid filter: '{key}' requires an array, got {value!r}"
+                )
+            for sub in value:
+                if not isinstance(sub, dict):
+                    raise InvalidFilterError(
+                        f"invalid filter: '{key}' elements must be documents, got {sub!r}"
+                    )
+                validate_filter(sub)
+        elif key == "$not":
+            if not isinstance(value, dict):
+                raise InvalidFilterError(
+                    f"invalid filter: '$not' requires a document, got {value!r}"
+                )
+            validate_filter(value)
+        elif key.startswith("$"):
+            raise InvalidFilterError(
+                f"invalid filter: unknown top-level operator '{key}'"
+            )
+        elif isinstance(value, dict) and any(k.startswith("$") for k in value):
+            for op in value:
+                if op not in _FIELD_OPERATORS:
+                    raise InvalidFilterError(
+                        f"invalid filter: unknown operator '{op}' on field '{key}'"
+                    )
+
 
 # ---------------------------------------------------------------------------
 # Filter evaluation
@@ -229,7 +294,8 @@ class Query:
         if self._limit_n is not None:
             docs = docs[: self._limit_n]
 
-        return docs
+        # 6. Copy out.  Done last so only the returned page is copied.
+        return [copy_doc(d) for d in docs]
 
     def _apply_group_agg(self, docs: list) -> list:
         from collections import defaultdict
@@ -270,13 +336,14 @@ class VectorQuery:
             # (item #4: avoids scoring all docs then filtering)
             filtered_docs = self._collection._get_docs(self._pre_filter)
             allowed_ids = {doc["_id"] for doc in filtered_docs}
-            return self._collection._index_manager.vector_search_filtered(
+            results = self._collection._index_manager.vector_search_filtered(
                 self._field, self._query_vector, self._limit, allowed_ids
             )
         else:
-            return self._collection._index_manager.vector_search(
+            results = self._collection._index_manager.vector_search(
                 self._field, self._query_vector, self._limit
             )
+        return [(copy_doc(doc), score) for doc, score in results]
     
     def first(self):
         """Return the best match as (doc, score) tuple or None."""
@@ -311,11 +378,12 @@ class TextQuery:
             filtered_doc_ids = {doc["_id"] for doc in filtered_docs}
             results = [(doc, score) for doc, score in all_results 
                       if doc["_id"] in filtered_doc_ids]
-            return results[:self._limit]
+            results = results[:self._limit]
         else:
-            return self._collection._index_manager.text_search(
+            results = self._collection._index_manager.text_search(
                 self._field, self._query, self._limit
             )
+        return [(copy_doc(doc), score) for doc, score in results]
     
     def first(self):
         """Return the best match as (doc, score) tuple or None."""

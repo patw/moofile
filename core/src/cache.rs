@@ -170,17 +170,24 @@ pub(crate) fn try_load_cache(
         })
         .collect();
 
-    let regular: std::collections::BTreeMap<String, std::collections::BTreeMap<Value, Vec<String>>> =
-        cache
-            .regular
-            .into_iter()
-            .map(|(field, entries)| {
-                (
-                    field,
-                    entries.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
-                )
-            })
-            .collect();
+    // Posting lists are serialised as Vec (stable on-disk layout) and
+    // rebuilt as BTreeSet in memory, where removal is O(log k) not O(k).
+    let regular: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<Value, std::collections::BTreeSet<String>>,
+    > = cache
+        .regular
+        .into_iter()
+        .map(|(field, entries)| {
+            (
+                field,
+                entries
+                    .into_iter()
+                    .map(|(v, ids)| (v, ids.into_iter().collect()))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )
+        })
+        .collect();
 
     let vector_data: std::collections::BTreeMap<String, (Vec<String>, Vec<f32>, usize)> =
         cache
@@ -247,7 +254,12 @@ pub(crate) fn save_cache(
         .regular
         .iter()
         .map(|(field, map)| {
-            (field.clone(), map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            (
+                field.clone(),
+                map.iter()
+                    .map(|(k, v)| (k.clone(), v.iter().cloned().collect::<Vec<_>>()))
+                    .collect(),
+            )
         })
         .collect();
 

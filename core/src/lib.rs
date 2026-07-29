@@ -370,7 +370,21 @@ impl Collection {
             doc.insert("_id", generate_id());
         }
 
-        let _id = doc.get_str("_id").unwrap().to_string();
+        // `_id` is the key for every in-memory index, so it must be a string.
+        // This is checked before any mutation: returning an error unwinds
+        // cleanly, whereas the previous `get_str(..).unwrap()` panicked while
+        // holding the write guard, poisoning the lock and permanently
+        // bricking the collection handle (and discarding any open batch).
+        let _id = match doc.get("_id") {
+            Some(Bson::String(s)) => s.clone(),
+            Some(other) => {
+                return Err(MooFileError::InvalidId(format!(
+                    "{:?}",
+                    other.element_type()
+                )))
+            }
+            None => unreachable!("_id was just inserted if absent"),
+        };
 
         // --- Batch path ---
         if inner.batch.is_some() {
@@ -429,6 +443,7 @@ impl Collection {
     ) -> Result<bool, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
+        query::validate_filter(&where_clause)?;
 
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
@@ -476,6 +491,7 @@ impl Collection {
     ) -> Result<usize, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
+        query::validate_filter(&where_clause)?;
 
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
@@ -524,6 +540,7 @@ impl Collection {
     ) -> Result<bool, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
+        query::validate_filter(&where_clause)?;
 
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
@@ -571,6 +588,7 @@ impl Collection {
     pub fn delete_one(&self, where_clause: Document) -> Result<bool, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
+        query::validate_filter(&where_clause)?;
 
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
@@ -603,6 +621,7 @@ impl Collection {
     pub fn delete_many(&self, where_clause: Document) -> Result<usize, MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
+        query::validate_filter(&where_clause)?;
 
         if inner.batch.is_some() {
             let docs = batch_get_matching(&inner, &where_clause);
@@ -644,6 +663,7 @@ impl Collection {
     pub fn find(&self, filter: Document) -> Result<Query, MooFileError> {
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
+        query::validate_filter(&filter)?;
         Ok(Query::new(Arc::clone(&self.inner), filter))
     }
 
@@ -654,6 +674,7 @@ impl Collection {
     pub fn count(&self, filter: Document) -> Result<usize, MooFileError> {
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
+        query::validate_filter(&filter)?;
         Ok(inner.index_manager.count_matching(&filter))
     }
 
@@ -1320,5 +1341,70 @@ mod tests {
 
         assert_eq!(db.count(doc! {}).unwrap(), 3);
         assert!(db.find_one(doc! { "_id": "delete_me" }).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod id_validation_tests {
+    use super::*;
+    use bson::doc;
+
+    fn setup() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bson");
+        (dir, path)
+    }
+
+    #[test]
+    fn non_string_id_is_rejected_not_panicked() {
+        let (_dir, path) = setup();
+        let db = Collection::builder(&path).open().unwrap();
+
+        for bad in [doc! { "_id": 42 }, doc! { "_id": 1.5 }, doc! { "_id": [1, 2] }] {
+            assert!(matches!(db.insert(bad), Err(MooFileError::InvalidId(_))));
+        }
+
+        // The collection must remain fully usable: the old code panicked
+        // while holding the write guard, poisoning the lock forever.
+        db.insert(doc! { "_id": "ok", "v": 1 }).unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 1);
+    }
+
+    #[test]
+    fn rejected_id_inside_batch_does_not_lose_buffered_writes() {
+        let (_dir, path) = setup();
+        let db = Collection::builder(&path).open().unwrap();
+
+        db.batch_begin().unwrap();
+        db.insert(doc! { "_id": "a", "v": 1 }).unwrap();
+        db.insert(doc! { "_id": "b", "v": 2 }).unwrap();
+        assert!(db.insert(doc! { "_id": 99 }).is_err());
+        // The batch survives the rejected insert and still commits.
+        db.batch_commit().unwrap();
+
+        assert_eq!(db.count(doc! {}).unwrap(), 2);
+    }
+
+    #[test]
+    fn malformed_filter_is_rejected_at_the_api_boundary() {
+        let (_dir, path) = setup();
+        let db = Collection::builder(&path).open().unwrap();
+        db.insert(doc! { "_id": "a", "v": 1 }).unwrap();
+
+        assert!(matches!(
+            db.find(doc! { "$or": ["junk"] }),
+            Err(MooFileError::InvalidFilter(_))
+        ));
+        assert!(matches!(
+            db.count(doc! { "v": { "$bogus": 1 } }),
+            Err(MooFileError::InvalidFilter(_))
+        ));
+        assert!(matches!(
+            db.delete_many(doc! { "$or": [1] }),
+            Err(MooFileError::InvalidFilter(_))
+        ));
+
+        // Still usable afterwards.
+        assert_eq!(db.count(doc! {}).unwrap(), 1);
     }
 }

@@ -11,7 +11,13 @@ class IndexManager:
 
     Internal structure:
         _documents: {_id -> document_dict}
-        _indexes:   {field -> SortedDict(value -> [list of _ids])}
+        _indexes:   {field -> SortedDict(value -> {_id: None})}
+
+    Posting lists are dicts used as insertion-ordered sets: membership and
+    removal are O(1) rather than the O(k) list scans they replaced, which
+    made writes to a low-cardinality indexed field quadratic in the
+    collection size.  A dict (not a set) preserves the insertion ordering
+    that query results have always had.
         _vector_indexes: {field -> (embeddings_array, doc_ids_list)}
         _text_indexes: {field -> TextIndex}
     """
@@ -45,9 +51,8 @@ class IndexManager:
             if val is None:
                 continue
             if val not in idx:
-                idx[val] = []
-            if _id not in idx[val]:
-                idx[val].append(_id)
+                idx[val] = {}
+            idx[val][_id] = None
         
         # Text indexes
         for field in self._text_fields:
@@ -69,10 +74,7 @@ class IndexManager:
         for field, idx in self._indexes.items():
             val = doc.get(field)
             if val is not None and val in idx:
-                try:
-                    idx[val].remove(_id)
-                except ValueError:
-                    pass
+                idx[val].pop(_id, None)
                 if not idx[val]:
                     del idx[val]
         
@@ -100,7 +102,7 @@ class IndexManager:
         idx = self._indexes.get(field)
         if idx is None:
             return None
-        ids = idx.get(value, [])
+        ids = idx.get(value, {})
         return [self._documents[i] for i in ids if i in self._documents]
 
     def get_by_field_range(
@@ -200,17 +202,19 @@ class IndexManager:
         q_normed = query_vec / query_norm
         similarities = embeddings @ q_normed
         
-        # Bounded top-k using argpartition: O(n) instead of O(n log n) (item #2)
+        # Rank by score descending, breaking ties on doc_id ascending.
+        # The tie-break makes the ranking a total order, so equal-scoring
+        # documents come back in the same order here and in Rust, and do not
+        # reshuffle as rows move within the matrix.  This is why argpartition
+        # is not used: selecting the top-k by score alone picks an arbitrary
+        # member of a tied group at the k-th boundary.
         n = len(similarities)
+        if limit is not None and limit == 0:
+            return []
+        id_rank = np.argsort(np.argsort(np.array(doc_ids, dtype=object), kind="stable"))
+        top_indices = np.lexsort((id_rank, -similarities))
         if limit is not None and limit < n:
-            if limit == 0:
-                return []
-            # argpartition: O(n) selection of top-k indices (unordered)
-            top_indices = np.argpartition(similarities, n - limit)[n - limit:]
-            # Sort just the top-k in descending order
-            top_indices = top_indices[np.argsort(similarities[top_indices])[::-1]]
-        else:
-            top_indices = np.argsort(similarities)[::-1]
+            top_indices = top_indices[:limit]
         
         results = []
         for idx in top_indices:
@@ -254,15 +258,15 @@ class IndexManager:
         filtered_embeddings = embeddings[allowed_indices]
         similarities = filtered_embeddings @ q_normed
         
-        # Bounded top-k (item #2)
+        # Same total order as vector_search: score desc, then doc_id asc.
         n = len(similarities)
+        if limit is not None and limit == 0:
+            return []
+        allowed_doc_ids = [doc_ids[i] for i in allowed_indices]
+        id_rank = np.argsort(np.argsort(np.array(allowed_doc_ids, dtype=object), kind="stable"))
+        top_local = np.lexsort((id_rank, -similarities))
         if limit is not None and limit < n:
-            if limit == 0:
-                return []
-            top_local = np.argpartition(similarities, n - limit)[n - limit:]
-            top_local = top_local[np.argsort(similarities[top_local])[::-1]]
-        else:
-            top_local = np.argsort(similarities)[::-1]
+            top_local = top_local[:limit]
         
         results = []
         for local_idx in top_local:
