@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use bson::{Bson, Document};
 use moofile_core::Collection as RustCollection;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
 
 // ---------------------------------------------------------------------------
 // Helpers: PyObject ↔ Bson
@@ -18,29 +18,41 @@ fn py_to_bson(obj: &Bound<PyAny>) -> PyResult<Bson> {
     if obj.is_none() {
         return Ok(Bson::Null);
     }
-    if let Ok(b) = obj.extract::<bool>() {
-        return Ok(Bson::Boolean(b));
+
+    // These fast paths test the *exact* type on purpose.  Several BSON types
+    // subclass a Python builtin — `bson.Code` is a `str`, `bson.Int64` is an
+    // `int`, `bson.Binary` is `bytes`, `bson.SON` is a `dict` — so an
+    // `extract()`-based check silently downgrades them to the builtin (a Code
+    // was being stored as a plain string).  Anything that is not exactly a
+    // builtin falls through to pymongo's encoder below, which knows them all.
+    if obj.is_exact_instance_of::<PyBool>() {
+        return Ok(Bson::Boolean(obj.extract::<bool>()?));
     }
-    if let Ok(i) = obj.extract::<i64>() {
-        if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-            return Ok(Bson::Int32(i as i32));
+    if obj.is_exact_instance_of::<PyInt>() {
+        // Out-of-range ints fall through so pymongo raises its own error.
+        if let Ok(i) = obj.extract::<i64>() {
+            if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                return Ok(Bson::Int32(i as i32));
+            }
+            return Ok(Bson::Int64(i));
         }
-        return Ok(Bson::Int64(i));
     }
-    if let Ok(f) = obj.extract::<f64>() {
-        return Ok(Bson::Double(f));
+    if obj.is_exact_instance_of::<PyFloat>() {
+        return Ok(Bson::Double(obj.extract::<f64>()?));
     }
-    if let Ok(s) = obj.extract::<String>() {
-        return Ok(Bson::String(s));
+    if obj.is_exact_instance_of::<PyString>() {
+        return Ok(Bson::String(obj.extract::<String>()?));
     }
-    if let Ok(list) = obj.downcast::<PyList>() {
-        let mut arr = Vec::new();
+    if obj.is_exact_instance_of::<PyList>() {
+        let list = obj.downcast::<PyList>()?;
+        let mut arr = Vec::with_capacity(list.len());
         for item in list.iter() {
             arr.push(py_to_bson(&item)?);
         }
         return Ok(Bson::Array(arr));
     }
-    if let Ok(dict) = obj.downcast::<PyDict>() {
+    if obj.is_exact_instance_of::<PyDict>() {
+        let dict = obj.downcast::<PyDict>()?;
         let mut doc = Document::new();
         for (k, v) in dict.iter() {
             let key: String = k.extract()?;
@@ -48,47 +60,51 @@ fn py_to_bson(obj: &Bound<PyAny>) -> PyResult<Bson> {
         }
         return Ok(Bson::Document(doc));
     }
-    Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-        format!("unsupported type: {:?}", obj.get_type().name()),
-    ))
+    // Anything else (datetime, Binary, ObjectId, Decimal128, Regex, Timestamp,
+    // Code, bytes, ...) goes through pymongo's own encoder.  Hand-rolling each
+    // type here would drift from the pure-Python implementation, which encodes
+    // with the same library; delegating keeps the two byte-identical by
+    // construction and supports the whole BSON type set for free.
+    //
+    // BSON can only encode documents, so the value is wrapped in a one-key
+    // document and unwrapped again.  Only non-primitive types reach this path.
+    py_to_bson_via_pymongo(obj)
+}
+
+/// Cached handle to pymongo's `bson` module.
+static BSON_MODULE: pyo3::sync::GILOnceCell<PyObject> = pyo3::sync::GILOnceCell::new();
+
+fn py_to_bson_via_pymongo(obj: &Bound<PyAny>) -> PyResult<Bson> {
+    let py = obj.py();
+    let module = BSON_MODULE
+        .get_or_try_init(py, || py.import("bson").map(|m| m.unbind().into_any()))?
+        .bind(py);
+
+    let wrapper = PyDict::new(py);
+    wrapper.set_item("v", obj)?;
+
+    let encoded = module.call_method1("encode", (wrapper,))?;
+    let bytes: Vec<u8> = encoded.extract()?;
+
+    let doc: Document = bson::from_slice(&bytes).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "could not decode {} as BSON: {e}",
+            obj.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+        ))
+    })?;
+
+    doc.get("v").cloned().ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>("BSON round-trip lost the value")
+    })
 }
 
 fn py_to_document(dict: &Bound<PyDict>) -> PyResult<Document> {
+    // Route through py_to_bson so a dict subclass (bson.SON) is handled by the
+    // pymongo fallback rather than losing its ordering.
     match py_to_bson(dict.as_any())? {
         Bson::Document(doc) => Ok(doc),
         _ => Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("expected dict")),
     }
-}
-
-fn bson_to_py(val: &Bson, py: Python<'_>) -> PyObject {
-    match val {
-        Bson::Null => py.None(),
-        Bson::Boolean(b) => b.to_object(py),
-        Bson::Int32(i) => i.to_object(py),
-        Bson::Int64(i) => i.to_object(py),
-        Bson::Double(f) => f.to_object(py),
-        Bson::String(s) => s.to_object(py),
-        Bson::Array(arr) => {
-            let list = PyList::new(py, arr.iter().map(|v| bson_to_py(v, py)));
-            list.unwrap().into()
-        }
-        Bson::Document(doc) => {
-            let dict = PyDict::new(py);
-            for (k, v) in doc.iter() {
-                dict.set_item(k, bson_to_py(v, py)).unwrap();
-            }
-            dict.into()
-        }
-        _ => val.to_string().to_object(py),
-    }
-}
-
-fn doc_to_py(doc: &Document, py: Python<'_>) -> PyObject {
-    let dict = PyDict::new(py);
-    for (k, v) in doc.iter() {
-        dict.set_item(k, bson_to_py(v, py)).unwrap();
-    }
-    dict.into()
 }
 
 /// Encode a BSON document to raw bytes for Python-side decoding (item #6).
@@ -183,18 +199,21 @@ impl NativeCollection {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let list = PyList::new(py, results.iter().map(|d| doc_to_py(d, py)));
+        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
         Ok(list.unwrap().into())
     }
 
     // --- Single-document ops ---
 
+    /// Returns raw BSON bytes; the adapter decodes with pymongo's C decoder.
+    /// Building a PyDict here went through `bson_to_py`, which stringified
+    /// every type it did not know (datetime, Binary, ObjectId, ...).
     fn insert(&self, py: Python<'_>, doc: &Bound<PyDict>) -> PyResult<PyObject> {
         let d = py_to_document(doc)?;
         let result = self.inner.insert(d).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
         })?;
-        Ok(doc_to_py(&result, py))
+        Ok(doc_to_bson_bytes(&result, py))
     }
 
     fn find_one(
@@ -210,7 +229,7 @@ impl NativeCollection {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })?;
         match result {
-            Some(doc) => Ok(doc_to_py(&doc, py)),
+            Some(doc) => Ok(doc_to_bson_bytes(&doc, py)),
             None => Ok(py.None()),
         }
     }

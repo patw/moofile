@@ -18,6 +18,11 @@ const PARALLEL_THRESHOLD: usize = 4096;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Value {
     Null, Bool(bool), I32(i32), I64(i64), Double(OrderedFloat), String(String),
+    /// Milliseconds since the epoch.  Datetimes must be indexable or an
+    /// indexed timestamp field yields `IndexResult::Exact` over an empty set
+    /// and the query returns nothing.
+    DateTime(i64),
+    ObjectId([u8; 12]),
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -470,7 +475,10 @@ fn bson_to_value(v: &bson::Bson) -> Option<Value> {
         bson::Bson::Null => Some(Value::Null), bson::Bson::Boolean(b) => Some(Value::Bool(*b)),
         bson::Bson::Int32(i) => Some(Value::I32(*i)), bson::Bson::Int64(i) => Some(Value::I64(*i)),
         bson::Bson::Double(f) => Some(Value::Double(OrderedFloat(*f))),
-        bson::Bson::String(s) => Some(Value::String(s.clone())), _ => None,
+        bson::Bson::String(s) => Some(Value::String(s.clone())),
+        bson::Bson::DateTime(d) => Some(Value::DateTime(d.timestamp_millis())),
+        bson::Bson::ObjectId(o) => Some(Value::ObjectId(o.bytes())),
+        _ => None,
     }
 }
 

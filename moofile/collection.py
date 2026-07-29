@@ -6,6 +6,8 @@ import os
 import pickle
 import struct
 import time
+
+import bson
 from datetime import datetime, timezone
 
 from .errors import DocumentNotFoundError, DuplicateKeyError, ReadOnlyError
@@ -31,6 +33,36 @@ _CACHE_VERSION = 2
 def _generate_id() -> str:
     """Generate a random 12-byte hex string for use as _id."""
     return binascii.hexlify(os.urandom(12)).decode()
+
+
+def _normalize(doc: dict) -> dict:
+    """Round-trip a document through BSON.
+
+    Documents used to be stored in the index exactly as the caller passed them,
+    so a read returned the original Python objects (``Binary``, tz-aware
+    ``datetime``) while a read after a cold reopen returned whatever BSON
+    decoding produced (``bytes``, naive ``datetime``).  The answer therefore
+    depended on whether the pickle cache happened to be valid, and differed
+    from the Rust engine, which always stores the decoded form.
+
+    Normalising on the way in makes a read equal what is on disk in every case.
+    The round-trip also deep-copies, so it subsumes copy_doc on write paths.
+    """
+    return bson.decode(bson.encode(doc))
+
+
+def _prepare_filter(filter_dict: dict) -> dict:
+    """Validate a filter and normalise its values through BSON.
+
+    Stored documents are BSON-normalised (see _normalize), so filter values
+    must be too: a tz-aware datetime in a query would otherwise never match the
+    naive-UTC datetime on disk.  The Rust backend gets this for free because
+    filters cross the FFI boundary through the same encoder.
+
+    Once per query, not once per document.
+    """
+    validate_filter(filter_dict)
+    return _normalize(filter_dict) if filter_dict else filter_dict
 
 
 def _check_id(_id) -> None:
@@ -140,6 +172,7 @@ class Collection:
         if "_id" not in doc:
             doc["_id"] = _generate_id()
         _check_id(doc["_id"])
+        doc = _normalize(doc)
         # The duplicate check must happen under the same lock hold as the
         # append, and after _catch_up, or a concurrent writer's record for this
         # _id is invisible and we write a second one for the same key.
@@ -171,7 +204,7 @@ class Collection:
             if "_id" not in doc:
                 doc["_id"] = _generate_id()
             _check_id(doc["_id"])
-            prepared.append(doc)
+            prepared.append(_normalize(doc))
 
         out = []
         with self._with_write_lock():
@@ -208,7 +241,7 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
-        validate_filter(where)
+        where = _prepare_filter(where)
         if self._batch is not None:
             return self._batch.update_one(where, set, unset, inc)
         # Match and write under a single lock hold, so the document we picked
@@ -239,7 +272,7 @@ class Collection:
         Returns the count of updated documents.
         """
         self._require_write()
-        validate_filter(where)
+        where = _prepare_filter(where)
         if self._batch is not None:
             return self._batch.update_many(where, set, unset, inc)
         count = 0
@@ -264,7 +297,7 @@ class Collection:
         Raises DocumentNotFoundError if no document matches.
         """
         self._require_write()
-        validate_filter(where)
+        where = _prepare_filter(where)
         if self._batch is not None:
             return self._batch.replace_one(where, new_doc)
         with self._with_write_lock():
@@ -272,7 +305,7 @@ class Collection:
             if not docs:
                 raise DocumentNotFoundError(f"No document matches: {where!r}")
             old_doc = docs[0]
-            replacement = copy_doc(new_doc)
+            replacement = _normalize(copy_doc(new_doc))
             replacement["_id"] = old_doc["_id"]
             self._storage.append(RECORD_REPLACEMENT, replacement)
             self._index_manager.remove(old_doc["_id"])
@@ -292,7 +325,7 @@ class Collection:
         Returns True if a document was deleted, False if nothing matched.
         """
         self._require_write()
-        validate_filter(where)
+        where = _prepare_filter(where)
         if self._batch is not None:
             return self._batch.delete_one(where)
         with self._with_write_lock():
@@ -313,7 +346,7 @@ class Collection:
         Returns the count of deleted documents.
         """
         self._require_write()
-        validate_filter(where)
+        where = _prepare_filter(where)
         if self._batch is not None:
             return self._batch.delete_many(where)
         count = 0
@@ -334,8 +367,7 @@ class Collection:
 
     def find(self, filter_dict: dict = None) -> Query:
         """Return a lazy Query object. No work is done until a terminal method is called."""
-        filter_dict = filter_dict or {}
-        validate_filter(filter_dict)
+        filter_dict = _prepare_filter(filter_dict or {})
         return Query(self, filter_dict)
 
     def find_one(self, filter_dict: dict = None):
@@ -344,9 +376,7 @@ class Collection:
 
     def count(self, filter_dict: dict = None) -> int:
         """Count documents matching *filter_dict* (all documents if omitted)."""
-        filter_dict = filter_dict or {}
-        validate_filter(filter_dict)
-        return self._count_docs(filter_dict)
+        return self._count_docs(_prepare_filter(filter_dict or {}))
 
     def exists(self, filter_dict: dict) -> bool:
         """Return True if at least one document matches *filter_dict*."""
@@ -985,6 +1015,7 @@ class BatchContext:
         if "_id" not in doc:
             doc["_id"] = _generate_id()
         _check_id(doc["_id"])
+        doc = _normalize(doc)
         if self._get(doc["_id"]) is not None:
             raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
         self._records.append((RECORD_LIVE, doc))
@@ -1039,7 +1070,7 @@ class BatchContext:
         if not docs:
             raise DocumentNotFoundError(f"No document matches: {where!r}")
         old_doc = docs[0]
-        replacement = copy_doc(new_doc)
+        replacement = _normalize(copy_doc(new_doc))
         replacement["_id"] = old_doc["_id"]
         self._records.append((RECORD_REPLACEMENT, replacement))
         self._index_ops.append(("remove", old_doc["_id"]))
@@ -1120,4 +1151,4 @@ def _apply_update(
     if inc_dict:
         for field, delta in inc_dict.items():
             new_doc[field] = new_doc.get(field, 0) + delta
-    return new_doc
+    return _normalize(new_doc)

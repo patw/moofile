@@ -237,6 +237,15 @@ fn bson_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
         (Bson::Int64(a), Bson::Int32(b)) => a.cmp(&(*b as i64)).into(),
         (Bson::String(a), Bson::String(b)) => Some(a.cmp(b)),
         (Bson::Boolean(a), Bson::Boolean(b)) => Some(a.cmp(b)),
+        // Range queries over timestamps are the common case for event logs.
+        // Without these, `$lt`/`$gt` on a datetime silently matched nothing
+        // here while working in the Python implementation.
+        (Bson::DateTime(a), Bson::DateTime(b)) => Some(a.cmp(b)),
+        (Bson::Timestamp(a), Bson::Timestamp(b)) => {
+            Some((a.time, a.increment).cmp(&(b.time, b.increment)))
+        }
+        (Bson::ObjectId(a), Bson::ObjectId(b)) => Some(a.cmp(b)),
+        (Bson::Binary(a), Bson::Binary(b)) => Some(a.bytes.cmp(&b.bytes)),
         _ => None,
     }
 }

@@ -26,7 +26,9 @@ use crate::text::TextIndex;
 
 /// Cache format version — bump when the serialised layout changes.
 /// Old caches with a different version are silently rejected.
-const CACHE_VERSION: u32 = 1;
+///   1 -> 2: `index::Value` gained DateTime/ObjectId variants, which changes
+///           the bincode discriminants of every indexed value.
+const CACHE_VERSION: u32 = 2;
 
 /// Magic bytes at the start of every cache file, so we can quickly reject
 /// non-cache files (e.g. a pickle written by the Python implementation).

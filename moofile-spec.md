@@ -1,4 +1,4 @@
-# MooFile — Specification v0.4.0
+# MooFile — Specification v0.5.3
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, **on-device autoembedding**, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
@@ -35,7 +35,8 @@ If you need horizontal scaling, distributed search, or sub-millisecond vector lo
 
 - No network interface or server mode — ever
 - No replication or clustering
-- No multi-process concurrent writes — detected and rejected with `ConcurrentAccessError` rather than silently corrupting data
+- No cross-process transactions or snapshot isolation — concurrent access is SQLite-style (see [Multi-Process Access](#multi-process-access-v052)), not MVCC
+- No multi-writer scaling — writes are serialized by a file lock; the design target is one writer with many readers
 - No `$lookup` / joins — denormalize your data
 - No SQL compatibility
 - No full MongoDB MQL parity — implement the 80%, skip the 20% nobody uses
@@ -82,6 +83,8 @@ On close, MooFile may write `mydata.bson.cache` — a binary snapshot of the in-
 3. Data file byte length matches (catches all append-only writes)
 4. Data file modification time matches (catches compaction, external edits)
 5. Index configuration matches (catches schema changes)
+
+The recorded length and mtime are the state the index **actually describes** — the point this handle last reconciled to — not the file's state at the moment the cache is written. With concurrent writers the two differ, and recording the current state yields a cache that validates on the next open while omitting another process's records.
 
 **Properties:**
 - **Never a source of truth** — the BSON file is always the source of truth. The cache is a memoisation of the rebuild, keyed on file identity.
@@ -216,6 +219,11 @@ moofile/
 
 ### Performance (10K docs, 128d vectors)
 
+> These figures predate copy-on-read and BSON normalisation in the Python
+> implementation, which previously returned live references to its internal
+> documents and stored callers' objects verbatim. Its read and write rows are
+> therefore not comparable to Rust's. Re-run `bench_native.py` before quoting.
+
 | Operation | Python | Rust (pure) | Speedup |
 |---|---|---|---|
 | Cold open (scan + index rebuild) | 4,194 ms | 175 ms | **24×** |
@@ -255,6 +263,7 @@ Rules:
 - fsyncs the parent directory so the rename is durable across power loss
 - Safe to interrupt — if it fails, original file is untouched
 - Recommended when dead space exceeds ~30% of file size (check via `db.stats()`)
+- Reconciles with the file under the exclusive lock before computing the live set, and other handles detect the resulting inode change and reopen — see [Multi-Process Access](#multi-process-access-v052)
 
 ### In-Memory Indexes
 
@@ -263,7 +272,7 @@ On open, MooFile scans the BSON file and builds three types of in-memory indexes
 **Python implementation:**
 ```python
 self._indexes = {
-    "email": SortedDict(),   # value → [list of _ids]
+    "email": SortedDict(),   # value → {_id: None}  (insertion-ordered set)
 }
 self._vector_indexes = {
     "embedding": np.array(),  # [n_docs × vector_dim] matrix
@@ -277,12 +286,20 @@ self._documents = {}         # _id → document_dict
 **Rust implementation:**
 ```rust
 documents: BTreeMap<String, Arc<Document>>          // _id → shared doc
-regular: BTreeMap<String, BTreeMap<Value, Vec<String>>> // field → value → ids
+regular: BTreeMap<String, BTreeMap<Value, BTreeSet<String>>> // field → value → ids
 vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)> // (ids, matrix, dim)
 text_indexes: BTreeMap<String, TextIndex>           // BM25 inverted indexes
 ```
 
 Documents are stored as `Arc<Document>` — reference-counted to avoid deep copies during queries. Regular indexes use `BTreeMap` with `Bound`-based range queries for O(log n + k) lookups. Pure equality and pure range queries on a single indexed field return `IndexResult::Exact` — no secondary `matches()` filter pass needed.
+
+**Posting lists are sets, not lists.** Removal from a list is an O(k) scan over every id sharing that value, which makes writes to a low-cardinality indexed field (a `status` with three values across the whole collection) O(n) each and bulk operations quadratic. Python uses a dict as an insertion-ordered set so result ordering is unchanged.
+
+**Vector indexes are maintained incrementally.** `add` appends a normalised row; `remove` swap-removes one in place, keeping the id list and the flat matrix in lockstep. Marking the whole matrix stale on every write instead — which is what a "lazy rebuild" flag does — forces a full O(n·d) renormalise on the next search, so a single update in an interleaved insert/search workload costs as much as rebuilding the index. The stale flag survives only as a fallback for `clear()` and initial load.
+
+**Ranked results are a total order.** Vector and text search break score ties on `_id`. Without a tie-break, equal-scoring documents come back in `HashMap` iteration order in Rust (randomised per process) and insertion order in Python, so results differ run to run, differ between backends, and reshuffle as rows move within the vector matrix.
+
+**Documents handed to callers are copies.** The index stores documents by reference and `close()` serialises the index into the cache, so returning a live reference lets a caller's mutation corrupt the index, persist across a reopen, and then vanish when the cache is invalidated. Python copies after `skip`/`limit`, so paginated reads pay nothing and only unbounded scans pay the copy.
 
 ### No WAL
 
@@ -291,6 +308,8 @@ WAL is explicitly excluded. The tradeoff:
 - A crash mid-write may corrupt the final record in the BSON file
 - On open, scan to the last complete record and truncate any partial trailing write
 - All prior records are intact — you lose at most the last in-flight write
+
+A partial trailing record is truncated **only on open**, never during a mid-session catch-up. With multiple processes a short tail usually means another writer is mid-append, and truncating it would destroy their record; the reconciler stops before the partial record and picks it up next time.
 
 ### Durability Modes
 
@@ -315,15 +334,31 @@ db.sync()  # fsync once — all inserts are now durable
 
 Compaction always fsyncs the temporary file and parent directory regardless of the durability setting, because it is a destructive rewrite of the entire file.
 
-### Advisory File Locking
+### Multi-Process Access (v0.5.2)
 
-Multi-process concurrent writes are a non-goal, but two processes opening the same file would silently interleave appends and corrupt the BSON file. MooFile detects this situation and raises `ConcurrentAccessError` instead of silently corrupting data.
+MooFile targets SQLite-style multi-process access: **typically one writer, possibly many readers**, all with the file open at once. This is the shape real deployments take — a persistent worker writing events while a web front end reads and occasionally writes configuration.
 
-On open, MooFile acquires an advisory lock on `mydata.bson.lock`:
-- Write mode → exclusive lock (`LOCK_EX`)
-- Read-only mode → shared lock (`LOCK_SH`)
+No lock is held for the lifetime of a handle. An exclusive `flock` on `mydata.bson.lock` is taken only for the duration of a write, and covers the *whole* operation — match, append, and index update — so a bulk `update_many` cannot interleave with another process's writes, and `insert_many` and batches take it once rather than per document.
 
-Multiple read-only opens are fine. One writer OR multiple readers, never both. The lock is released automatically when the collection is closed or the process exits.
+**A handle's in-memory index is a private snapshot, not the source of truth.** Every operation that reads the index reconciles first:
+
+| Data file vs. last-seen state | Action |
+|---|---|
+| Unchanged (same length, mtime, inode) | One `stat`, no work — the common path |
+| Grew | Replay only the new suffix |
+| Shrank, or inode changed | Full reload **and** reopen the storage handle |
+
+Replaying only the suffix is possible because the format is append-only: another process's records are always a contiguous tail. Catching up costs O(new bytes), not O(file).
+
+Three consequences are load-bearing. Changing any of them silently loses data:
+
+1. **The index cache is stamped with the file state the index actually describes**, not the file's length at the moment of writing. With concurrent writers those differ, and stamping the current length produces a cache that passes validation on the next open while permanently omitting the other writer's records.
+2. **`compact()` reconciles before computing its live set**, under the exclusive lock. It rewrites the file wholesale, so a stale snapshot erases records it never saw, irrecoverably.
+3. **An inode change forces the storage handle to reopen.** `compact()` renames a new file over the path; every other handle's append descriptor then refers to the unlinked old inode, and everything it writes is lost. Detected via `st_ino` on Unix. On platforms without a usable inode only the shrink case is caught, so `compact()` alongside concurrent writers is less safe there.
+
+**Guarantees.** No writes are lost, readers converge on writers, and duplicate `_id`s are detected across processes. **Not** guaranteed: cross-process transactions, or a stable read view within one operation. A reader can observe a writer's records at any point.
+
+`ConcurrentAccessError` still exists in the exception hierarchy but is no longer raised on open.
 
 ---
 
@@ -334,6 +369,24 @@ Every document has an `_id` field. Rules:
 - If not provided on insert, MooFile generates a random 24-char hex string (12 random bytes, hex-encoded). Both implementations produce the same format.
 - `_id` is always indexed automatically
 - `_id` must be unique — inserting a duplicate raises `DuplicateKeyError`
+- **`_id` must be a BSON string.** Any other type raises `InvalidIdError` (a subclass of `TypeError`). This is enforced because the Rust loader skips records whose `_id` is not a string when replaying the file: a non-string `_id` would be written to disk and then silently vanish on the next open.
+
+---
+
+## BSON Type Support
+
+Documents may contain any type the BSON specification defines and pymongo can encode: `str`, `int`, `float`, `bool`, `None`, `list`, `dict`, `bytes`, `datetime`, `Binary`, `ObjectId`, `Decimal128`, `Timestamp`, `Regex`, `Code`, `Int64`, `SON`.
+
+Both implementations encode through **pymongo's encoder**, so the bytes they write are identical to each other and to `bson.encode()`. The native binding converts `None`/`bool`/`int`/`float`/`str`/`list`/`dict` directly and delegates everything else; hand-rolling per-type conversion would drift from the Python implementation, which has no such layer.
+
+Two consequences worth knowing:
+
+- **Exact type checks matter.** Several BSON types subclass a Python builtin — `Code` is a `str`, `Int64` is an `int`, `Binary` is `bytes`, `SON` is a `dict`. A conversion that tests with `isinstance` silently downgrades them (a `Code` stored as a plain string). The fast paths test exact types; everything else falls through to the encoder.
+- **Values a caller stores are BSON-normalised.** A read returns what is on disk, not the original Python object: a tz-aware `datetime` reads back as naive UTC, and a subtype-0 `Binary` reads back as `bytes` — the same values `bson.decode()` produces. Filter values are normalised the same way, so a tz-aware datetime in a query matches the stored form.
+
+A type pymongo refuses to encode (a bare `uuid.UUID`, for instance) raises pymongo's own error, identically from both backends.
+
+Range operators work on `datetime`, `Timestamp`, `ObjectId`, and `Binary` in addition to numbers, strings, and booleans, and datetimes and ObjectIds are indexable.
 
 ---
 
@@ -523,6 +576,10 @@ Batch operations support the full write API: `insert`, `insert_many`, `update_on
 
 That is the complete filter surface. No `$regex`, no `$where`, no geospatial.
 
+Filters are validated at every entry point (`find`, `count`, and all mutations). An unknown operator, a `$and`/`$or` whose elements are not documents, or a `$not` that is not a document raises `InvalidFilterError` (a subclass of `ValueError`) rather than silently matching nothing. Filter *evaluation* itself is total and never raises — malformed input encountered mid-scan is treated as non-matching, because a panic inside the Rust engine would poison the collection's lock and disable the handle.
+
+**A missing field satisfies no range operator.** `{"age": {"$gt": 10}}` never matches a document without an `age` field. This has to hold on both the index path and the scan path, or the same query returns different rows depending on whether the field happens to be indexed.
+
 ---
 
 ## Query Execution
@@ -546,7 +603,19 @@ from moofile import (
     ReadOnlyError,
     ConcurrentAccessError,
 )
+from moofile.errors import InvalidIdError, InvalidFilterError
 ```
+
+| Exception | Base | Raised when |
+|---|---|---|
+| `DuplicateKeyError` | `MooFileError` | inserting an `_id` that already exists |
+| `DocumentNotFoundError` | `MooFileError` | `update_one` / `replace_one` matches nothing |
+| `ReadOnlyError` | `MooFileError` | writing to a read-only collection, or a closed one |
+| `ConcurrentAccessError` | `MooFileError` | retained for compatibility; not raised since v0.5.2 |
+| `InvalidIdError` | `MooFileError`, `TypeError` | `_id` is not a string |
+| `InvalidFilterError` | `MooFileError`, `ValueError` | filter is structurally malformed |
+
+The two newer exceptions subclass a builtin so ordinary `except TypeError` / `except ValueError` handling still catches them.
 
 ---
 
@@ -578,6 +647,9 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
 | 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception. **Disposable index snapshot cache** — `mydata.bson.cache` memoises the in-memory index rebuild, validated against the data file's length + mtime and silently ignored on any mismatch |
+| 0.5.3 | **Multi-process safety** — handles reconcile with the data file by replaying the appended suffix; the index cache records the state it describes; `compact()` reconciles under the lock; inode changes reopen the storage handle. **Full BSON type support in the native backend** — datetime/Binary/ObjectId/Decimal128/… encode through pymongo, byte-identical to the Python impl. **Correctness** — `_id` must be a string; missing fields satisfy no range operator; malformed filters raise instead of panicking or matching nothing; ranked results break ties on `_id`; returned documents are copies. **Performance** — set-backed posting lists (bulk writes on a low-cardinality index no longer quadratic), incremental vector index maintenance, one lock hold per operation |
+| 0.5.2 | **Concurrent multi-process access** — the lifetime-long advisory lock is replaced by a brief exclusive lock around each write, allowing several processes to hold the same file open |
+| 0.5.1 | `hybrid_search` type fix, dead code removal, API guard tests |
 | 0.5.0 | **On-device autoembedding** — local GGUF embedding models via `llama-gguf`, auto-downloaded from HuggingFace on first use. `.semantic()` query method. `hybrid_search()` accepts `None` query_vector for auto-embedding. Multiple precision modes: f32, int8, uint8, binary. QAT-trained models retain quality after quantization |
 
 ---

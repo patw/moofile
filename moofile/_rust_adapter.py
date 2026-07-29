@@ -101,7 +101,10 @@ class Collection:
 
     def insert(self, doc: dict) -> dict:
         try:
-            return self._native.insert(doc)
+            # Raw BSON, decoded with pymongo's C decoder — the native side used
+            # to build the dict itself and stringified any type it did not know
+            # (datetime, Binary, ObjectId, ...).
+            return _bson.BSON(self._native.insert(doc)).decode()
         except (RuntimeError, ValueError) as e:
             _map_errors(e)
 

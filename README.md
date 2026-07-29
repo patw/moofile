@@ -5,7 +5,8 @@
 > A lightweight, embedded, single-file document store with a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
 > **🦀 Rust core available — 2-24× faster than pure Python.**  
-> **🧠 On-device autoembedding — local embedding models for semantic search.**
+> **🧠 On-device autoembedding — local embedding models for semantic search.**  
+> **🔀 Multi-process friendly — a background worker and a web app can share one file.**
 
 ```python
 from moofile import Collection, count, mean
@@ -60,9 +61,34 @@ with Collection("mydata.bson",
 | Text search | ✓ (FTS) | ✗ | ✓ | **✓** |
 | Developer API | ✗ (SQL) | ✓ (raw) | ✓ | **✓** |
 | Single-file portable | ✓ | ✓ | ✗ | **✓** |
+| Multi-process safe | ✓ | ✗ | ✓ | **✓ (v0.5.2+)** |
 | **Rust core available** | ✗ | ✗ | ✗ | **✓ (v0.3+)** |
 
 **Target dataset size:** megabytes to single-digit gigabytes.
+
+---
+
+## Sharing a file between processes
+
+Like SQLite, several processes can keep the same file open — the usual setup
+being a long-running worker that writes and a web app that reads:
+
+```python
+# worker.py — writes events forever
+with Collection("app.bson", indexes=["kind"]) as db:
+    for event in stream:
+        db.insert({"kind": "event", **event})
+
+# web.py — reads them, and writes the occasional setting
+with Collection("app.bson", indexes=["kind"]) as db:
+    recent = db.find({"kind": "event"}).sort("_id", descending=True).limit(50).to_list()
+    db.insert({"kind": "config", "theme": "dark"})
+```
+
+Readers pick up new writes automatically, writes are serialized so nothing is
+lost or interleaved, and duplicate `_id`s are caught across processes. Best
+suited to one writer with many readers — writes take a brief exclusive lock, so
+many simultaneous writers will queue.
 
 ---
 
@@ -79,6 +105,9 @@ This installs the pure-Python version which works everywhere. See [Native instal
 ## Quick Start
 
 ```python
+from datetime import datetime, timezone
+from bson import Binary
+
 from moofile import Collection
 
 db = Collection("users.bson", 
@@ -86,13 +115,16 @@ db = Collection("users.bson",
                 text_indexes=["bio"],
                 vector_indexes={"profile_vec": 128})
 
-# Insert
-alice = db.insert({"name": "Alice", "email": "a@ex.com", "age": 30, "status": "active"})
+# Insert — any BSON type: datetimes, binary, ObjectId, Decimal128, nested docs
+alice = db.insert({"name": "Alice", "email": "a@ex.com", "age": 30, "status": "active",
+                   "joined": datetime(2025, 1, 15, tzinfo=timezone.utc),
+                   "avatar": Binary(b"...")})
 db.insert_many([...])
 
-# Query
+# Query — ranges work on dates too
 active = db.find({"status": "active"}).to_list()
 young  = db.find({"age": {"$lt": 30}}).sort("age").to_list()
+recent = db.find({"joined": {"$gte": datetime(2025, 1, 1, tzinfo=timezone.utc)}}).to_list()
 one    = db.find_one({"email": "alice@example.com"})
 
 # Vector search
@@ -202,13 +234,14 @@ moo2sqlite users.bson users.db --table people
 ## Development
 
 ```bash
-# Pure-Python tests (always run)
-pytest tests/ -v
+# Unit tests (PYTHONPATH=. so you test this checkout, not an installed copy)
+PYTHONPATH=. pytest tests/ -v
 
-# Cross-implementation tests
-pytest tests-cross/ -v
+# Cross-implementation tests — runs both backends
+PYTHONPATH=. pytest tests-cross/ -v
 
 # Rust core tests
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 cd core && cargo test
 
 # Rust benchmark
