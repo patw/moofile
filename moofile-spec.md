@@ -1,4 +1,4 @@
-# MooFile — Specification v0.6.0
+# MooFile — Specification v1.0.0
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, **on-device autoembedding**, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
@@ -240,7 +240,7 @@ moofile/
 
 ---
 
-## Language Bindings (v0.6.0)
+## Language Bindings (v1.0.0)
 
 MooFile now ships with bindings for **C, C++, Node.js, Go, Java, and C#** — all
 consuming the same C shared library (`libmoofile.so` / `.dylib` / `.dll`).

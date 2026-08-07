@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## v1.0.0 (2026-08-07)
+
+Moofile finally hits 1.0 with proper multi language bindings. These all work on my machine, but are in a 1.0 state and may have rapid fixes in the coming weeks. We've finally escaped Python world and can Moo everywhere!
+
+- Stable release of the shared Rust core and Python, C, C++, Go, Node.js, and C# bindings.
+- GitHub Actions publish Python wheels to PyPI, native libraries as release artifacts, and packages to npm and NuGet.
+- Java remains available as a buildable binding and release artifact, but is not published to a package registry yet.
+
+
 ### Language bindings
 
 - **Node.js, Go, Java and C# bindings are now functional.** As first written

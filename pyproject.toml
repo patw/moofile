@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "moofile"
-version = "0.6.0"
+version = "1.0.0"
 license = {text = "MIT"}
 description = "Lightweight embedded document store — SQLite ergonomics, MongoDB-style queries"
 readme = "README.md"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["database", "embedded", "document-store", "mongodb", "sqlite", "vector-search", "text-search", "bm25"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
