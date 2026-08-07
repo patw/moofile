@@ -46,7 +46,13 @@ const ErrOut = koffi.out(koffi.pointer('void*'));
 let cachedLib = null;
 let cachedLibPath = null;
 
-/** Locate libmoofile relative to this file, honouring MOOFILE_LIB. */
+/**
+ * Locate libmoofile.
+ *
+ * Order: MOOFILE_LIB, then the library bundled in the published package, then
+ * the in-repo cargo output directories (so a git checkout works without an
+ * install step), then the platform loader's own search path.
+ */
 function defaultLibPath() {
     if (process.env.MOOFILE_LIB) return process.env.MOOFILE_LIB;
 
@@ -57,6 +63,9 @@ function defaultLibPath() {
     const name = stem + ext;
 
     const roots = [
+        // Published package: native/<platform>-<arch>/ mirrors process.platform
+        // and process.arch, so the lookup is exact rather than a search.
+        path.join(__dirname, 'native', `${process.platform}-${process.arch}`),
         path.join(__dirname, '..', '..', 'target', 'release'),
         path.join(__dirname, '..', '..', 'target', 'debug'),
         __dirname,
@@ -68,6 +77,13 @@ function defaultLibPath() {
     // Fall through to the platform loader's own search path.
     return name;
 }
+
+/** Platform/arch combinations the published package carries binaries for. */
+const SUPPORTED_PLATFORMS = [
+    'linux-x64', 'linux-arm64',
+    'darwin-x64', 'darwin-arm64',
+    'win32-x64',
+];
 
 /**
  * Load and bind the shared library.  Cached: repeated `new Collection()` calls
@@ -81,8 +97,15 @@ function loadLibrary(libPath) {
     try {
         lib = koffi.load(resolved);
     } catch (e) {
+        // An unsupported platform gives a confusing dlopen error otherwise,
+        // so say plainly that no binary was shipped for it.
+        const current = `${process.platform}-${process.arch}`;
+        const unsupported = !SUPPORTED_PLATFORMS.includes(current)
+            ? `\nNo prebuilt binary ships for ${current}. ` +
+              `Supported: ${SUPPORTED_PLATFORMS.join(', ')}.`
+            : '';
         throw new MooFileError(
-            `failed to load ${resolved}: ${e.message}\n` +
+            `failed to load ${resolved}: ${e.message}${unsupported}\n` +
             'Build it with: cargo build -p moofile-c --release\n' +
             'Or point MOOFILE_LIB at an existing library.'
         );

@@ -164,3 +164,138 @@ jobs:
             dist/moofile-*.tar.gz
             dist/moofile-*.zip
             dist/SHA256SUMS
+
+  # ── npm ───────────────────────────────────────────────────────────
+  # One package carrying every platform binary (~16 MB compressed). Simpler
+  # and more robust than per-platform optionalDependencies at this scale, and
+  # avoids a postinstall downloader — those break under --ignore-scripts,
+  # offline, and behind proxies.
+  npm:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write     # for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Stage native libraries
+        working-directory: bindings/node
+        run: |
+          set -euo pipefail
+          # npm dir names mirror process.platform + process.arch, so the
+          # runtime lookup is exact rather than a search.
+          stage() {  # <archive-target> <npm-dir> <libname>
+            local target="$1" dir="$2" lib="$3"
+            mkdir -p "native/$dir"
+            if [ -f "../../artifacts/moofile-$target.tar.gz" ]; then
+              tar xzf "../../artifacts/moofile-$target.tar.gz" -C /tmp
+            else
+              unzip -oq "../../artifacts/moofile-$target.zip" -d /tmp
+            fi
+            cp "/tmp/moofile-$target/lib/$lib" "native/$dir/$lib"
+          }
+          stage linux-x86_64    linux-x64    libmoofile.so
+          stage linux-aarch64   linux-arm64  libmoofile.so
+          stage macos-x86_64    darwin-x64   libmoofile.dylib
+          stage macos-aarch64   darwin-arm64 libmoofile.dylib
+          stage windows-x86_64  win32-x64    moofile.dll
+          find native -type f -exec ls -la {} +
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Version check
+        working-directory: bindings/node
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          [ "$TAG" = "$PKG" ] || {
+            echo "::error::tag $TAG does not match package.json $PKG"; exit 1; }
+
+      - name: Publish
+        working-directory: bindings/node
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── NuGet ─────────────────────────────────────────────────────────
+  # Native assets go in runtimes/<rid>/native/; the SDK copies the matching
+  # one into the consumer's output directory automatically.
+  nuget:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write     # for NuGet trusted publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Stage native libraries
+        working-directory: bindings/csharp/Moofile
+        run: |
+          set -euo pipefail
+          stage() {  # <archive-target> <rid> <libname>
+            local target="$1" rid="$2" lib="$3"
+            mkdir -p "runtimes/$rid/native"
+            if [ -f "../../../artifacts/moofile-$target.tar.gz" ]; then
+              tar xzf "../../../artifacts/moofile-$target.tar.gz" -C /tmp
+            else
+              unzip -oq "../../../artifacts/moofile-$target.zip" -d /tmp
+            fi
+            cp "/tmp/moofile-$target/lib/$lib" "runtimes/$rid/native/$lib"
+          }
+          stage linux-x86_64    linux-x64    libmoofile.so
+          stage linux-aarch64   linux-arm64  libmoofile.so
+          stage macos-x86_64    osx-x64      libmoofile.dylib
+          stage macos-aarch64   osx-arm64    libmoofile.dylib
+          stage windows-x86_64  win-x64      moofile.dll
+          find runtimes -type f -exec ls -la {} +
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Version check
+        working-directory: bindings/csharp/Moofile
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(grep -oP '(?<=<Version>)[^<]+' Moofile.csproj)
+          [ "$TAG" = "$PKG" ] || {
+            echo "::error::tag $TAG does not match Moofile.csproj $PKG"; exit 1; }
+
+      - name: Pack
+        working-directory: bindings/csharp/Moofile
+        run: dotnet pack -c Release -o "$GITHUB_WORKSPACE/nupkg"
+
+      # Trusted publishing: exchanges the GitHub OIDC token for a short-lived
+      # API key, so no long-lived secret is stored. Set the NUGET_USER
+      # repository variable to the nuget.org account name.
+      - name: NuGet login (trusted publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Push
+        run: |
+          dotnet nuget push "nupkg/*.nupkg" \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

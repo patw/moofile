@@ -81,8 +81,8 @@ Python. "Idiomatic" is the goal, but not at any cost.
 | Python | PyPI wheels | **Done** | Already working, nothing to add. |
 | C / C++ | Release tarball + headers | **Done** | There is no registry convention for C. A tarball with `include/` and `lib/` *is* the idiom. |
 | Go | `go get` from the repo | **Done** | Module path fixed. Needing a system library is normal for cgo. |
-| C# | NuGet with `runtimes/<rid>/native/` | **Recommended** | Best effort-to-payoff ratio of the real registries. The SDK copies the right native file automatically; publishing needs only a nuget.org account and an API key. |
-| Node.js | npm | **Recommended** | koffi needs no compilation, so the package just has to carry the binaries. See the note on sizing below. |
+| C# | NuGet with `runtimes/<rid>/native/` | **Done** | `dotnet add package MooFile`. The SDK copies the matching native file into the consumer's output automatically. |
+| Node.js | npm | **Done** | `npm install moofile`. All five platform binaries ship in the package; no compile step, no postinstall download. |
 | Java | Maven Central | **Skip for now** | The only ecosystem where doing it properly is genuinely expensive: Sonatype namespace verification, GPG signing, and the staging-repository dance. Ship the jar as a release artifact and revisit if somebody asks. |
 
 ### Node sizing
@@ -90,8 +90,9 @@ Python. "Idiomatic" is the goal, but not at any cost.
 Two shapes are available:
 
 1. **One package carrying all five platform libraries.** Simplest possible
-   thing; never breaks. Costs roughly 40 MB packed, because autoembedding
-   pulls `llama-gguf` into every binary.
+   thing; never breaks. Measured at 3.3 MB compressed per platform, so about
+   16 MB for the published package (8.3 MB unpacked each, because
+   autoembedding pulls `llama-gguf` into every binary).
 2. **Per-platform optional dependencies** (`@moofile/linux-x64` and friends,
    selected by npm through the `os`/`cpu` fields). This is what esbuild and
    swc do and it is the modern best practice — each user downloads ~8 MB. It
@@ -129,17 +130,43 @@ implying them.
 
 ---
 
-## Open decisions
+## Publishing setup
 
-These need a human, because they involve names and accounts:
+Both registry jobs live in `release-libs.yml` and run on a `v*` tag, after the
+native build matrix they depend on. Each refuses to publish if the tag does
+not match the version in `package.json` / `Moofile.csproj`, so a mistagged
+release fails loudly instead of shipping a mismatched package.
 
-1. **NuGet package id.** `MooFile` if free, otherwise something like
-   `PatWendorf.MooFile`. Needs a nuget.org account and an API key stored as
-   the `NUGET_API_KEY` repository secret.
-2. **npm package name.** `moofile` if free, else a scope like `@patw/moofile`.
-   Needs an npm account and an `NPM_TOKEN` secret.
-3. **Whether the Java jar is worth publishing at all**, even as a release
-   artifact, before anyone asks for it.
+### NuGet — trusted publishing
 
-Until those are settled, every language is still installable — via the release
-archive — just not through its own registry.
+Uses OIDC, so there is no long-lived key to leak. Requires one repository
+variable:
+
+| Kind | Name | Value |
+|---|---|---|
+| Variable | `NUGET_USER` | the nuget.org account name |
+
+Set under *Settings → Secrets and variables → Actions → Variables*. The
+trusted-publishing policy on nuget.org must name this repository and the
+workflow.
+
+### npm — token
+
+npm's trusted publishing is newer and not yet wired up here, so this uses a
+token:
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `NPM_TOKEN` | an npm automation token |
+
+Set under *Settings → Secrets and variables → Actions → Secrets*. Use an
+**automation** token (bypasses 2FA for CI) and rotate it if it is ever pasted
+anywhere outside that box. Publishing uses `--provenance`, which attests the
+package back to this repository and commit.
+
+## Still open
+
+**Java.** Maven Central remains skipped: Sonatype namespace verification, GPG
+signing and the staging-repository dance are a multi-day slog for what is
+currently zero users. The jar is buildable from source and the release archive
+covers the native side. Revisit if somebody asks.

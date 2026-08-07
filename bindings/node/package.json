@@ -1,10 +1,55 @@
 {
   "name": "moofile",
   "version": "0.6.0",
-  "description": "Lightweight embedded document store — No server. No infra. Just a file.",
+  "description": "Lightweight embedded document store with MongoDB-style queries, vector and text search — no server, just a file",
   "main": "moofile.js",
+  "types": "moofile.d.ts",
   "license": "MIT",
-  "repository": "github:patw/moofile",
+  "author": "Pat Wendorf <dungeons@gmail.com>",
+  "homepage": "https://github.com/patw/moofile#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patw/moofile.git",
+    "directory": "bindings/node"
+  },
+  "bugs": {
+    "url": "https://github.com/patw/moofile/issues"
+  },
+  "keywords": [
+    "database",
+    "embedded",
+    "document-store",
+    "nosql",
+    "bson",
+    "vector-search",
+    "semantic-search",
+    "text-search",
+    "bm25",
+    "sqlite-alternative"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "files": [
+    "moofile.js",
+    "moofile.d.ts",
+    "example.js",
+    "native/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node test.js",
+    "example": "node example.js"
+  },
   "dependencies": {
     "koffi": "^2.5.0"
   }

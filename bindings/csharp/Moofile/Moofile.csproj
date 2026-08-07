@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
+
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <!-- net8.0 is the oldest LTS with NativeLibrary.SetDllImportResolver and
+         is what most consumers can actually target; nothing in this binding
+         needs anything newer. The test and example projects target net10.0. -->
+    <TargetFramework>net8.0</TargetFramework>
     <RootNamespace>Moofile</RootNamespace>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
@@ -8,8 +12,45 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <!-- Self-evident accessors do not need XML docs. -->
     <NoWarn>$(NoWarn);CS1591</NoWarn>
-    <!-- The binding is a library; the test/example entry points live in
-         sibling projects so this one has no Main. -->
-    <OutputType>Library</OutputType>
   </PropertyGroup>
+
+  <!-- ── NuGet package metadata ─────────────────────────────────────── -->
+  <PropertyGroup>
+    <PackageId>MooFile</PackageId>
+    <Version>0.6.0</Version>
+    <Authors>Pat Wendorf</Authors>
+    <Description>Lightweight embedded document store — MongoDB-style queries, vector search and BM25 text search over a single file. No server, no infrastructure. Native libraries for linux, macOS and Windows are included.</Description>
+    <PackageTags>database;embedded;document-store;nosql;bson;vector-search;semantic-search;text-search;bm25</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/patw/moofile</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/patw/moofile</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <!-- Deterministic builds and source link make the package auditable. -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <!--
+    Native libraries.
+
+    The SDK resolves runtimes/<rid>/native/ automatically: on restore it copies
+    the entry matching the consumer's RID next to their output assembly, where
+    the default DllImport search finds it. Nothing in Native.cs has to know.
+
+    The files are staged by CI (see .github/workflows/release-libs.yml) before
+    packing; the glob is deliberately non-fatal when they are absent so a plain
+    `dotnet build` still works from a git checkout.
+  -->
+  <ItemGroup>
+    <None Include="runtimes/**/native/*" Pack="true" PackagePath="runtimes/">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
 </Project>

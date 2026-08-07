@@ -49,3 +49,7 @@ bindings/csharp/**/*.user
 bindings/node/node_modules/
 bindings/c/tests/build/
 bindings/c/example
+
+# Native libraries staged into packages at publish time
+bindings/node/native/
+bindings/csharp/Moofile/runtimes/
