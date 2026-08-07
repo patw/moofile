@@ -12,6 +12,14 @@ namespace Moofile.Example;
 /// </summary>
 public static class Program
 {
+    // Phase 1 selectors use the stored field's exact name.
+    private sealed class Contact
+    {
+        public int age { get; init; }
+        public string? email { get; init; }
+        public string? status { get; init; }
+    }
+
     public static void Main()
     {
         var dir = Directory.CreateTempSubdirectory("moofile-csharp-example-").FullName;
@@ -47,8 +55,8 @@ public static class Program
 
         db.InsertMany(new[]
         {
-            Document.Of("name", "Bob", "email", "bob@example.com", "age", 25),
-            Document.Of("name", "Carol", "email", "carol@example.com", "age", 35),
+            Document.Of("name", "Bob", "email", "bob@example.com", "age", 25, "status", "trial"),
+            Document.Of("name", "Carol", "email", "carol@example.com", "age", 35, "status", "active"),
         });
         Console.WriteLine($"   Total contacts: {db.Count()}");
 
@@ -61,6 +69,20 @@ public static class Program
 
         var over30 = db.Find(Document.Of("age", Document.Of("$gte", 30)));
         Console.WriteLine($"4. Contacts 30 or older: {over30.Count}");
+
+        // Builders<T>.Filter selects stored fields with strongly typed property expressions.
+        // In this Phase 1 API, the property name must match the stored field exactly.
+        var filter = Builders<Contact>.Filter;
+        var typedOver30 = filter.Gte(contact => contact.age, 30);
+        var typedAlice = filter.Eq(contact => contact.email, "alice@example.com");
+        var activeAdults = filter.And(
+            typedOver30,
+            filter.Eq(contact => contact.status, "active"));
+        Console.WriteLine($"   Typed builder: {db.Count(typedOver30)} contacts 30 or older; " +
+            $"Alice exists: {db.Exists(typedAlice)}; active adults: {db.Count(activeAdults)}");
+
+        // Typed filters also work for updates and deletes; documents remain the write format.
+        db.UpdateMany(activeAdults, set: Document.Of("status", "reviewed"));
 
         db.DeleteOne(Document.Of("email", "bob@example.com"));
         Console.WriteLine($"5. After delete, total: {db.Count()}");

@@ -40,7 +40,6 @@ export interface FilterOperators {
     $in?: Value[];
     $nin?: Value[];
     $exists?: boolean;
-    $regex?: string;
     $elemMatch?: Filter;
 }
 

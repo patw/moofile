@@ -40,9 +40,10 @@ func main() {
 		found, _ := db.FindOne(map[string]any{"email": "alice@example.com"})
 		fmt.Printf("2. Found: %v, age %v\n", found["name"], found["age"])
 
-		db.UpdateOne(
-			map[string]any{"email": "alice@example.com"},
-			map[string]any{"age": 31}, nil, nil,
+		// Named update/search option structs avoid positional nil arguments.
+		db.UpdateOneWith(
+			moofile.Filter{"email": "alice@example.com"},
+			moofile.Update{Set: moofile.Document{"age": 31}},
 		)
 		updated, _ := db.FindOne(map[string]any{"email": "alice@example.com"})
 		fmt.Printf("3. Updated age: %v\n", updated["age"])
@@ -110,7 +111,8 @@ func main() {
 			{"_id": "c", "title": "Cooking", "embedding": []float64{0, 0, 1}},
 		})
 
-		results, _ := db.VectorSearch("embedding", []float64{1, 0, 0}, 3, nil)
+		results, _ := db.VectorSearchWithOptions("embedding", []float64{1, 0, 0},
+			moofile.SearchOptions{Limit: 3})
 		fmt.Println("\n7. Vector Search:")
 		for _, r := range results {
 			fmt.Printf("   %v: score=%.4f\n", r.Doc["title"], r.Score)

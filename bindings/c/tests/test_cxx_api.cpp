@@ -446,6 +446,20 @@ static void test_hybrid_search() {
     ASSERT(results[0].first["_id"] == "a");
 }
 
+static void test_cursor_range_iteration() {
+    TEST("Cursor supports range-for iteration");
+    moofile::Collection db(make_path("range_cursor.bson"));
+    db.insert({{"_id", "a"}, {"age", 20}});
+    db.insert({{"_id", "b"}, {"age", 30}});
+
+    std::vector<std::string> ids;
+    for (const auto& doc : db.find(json::object())) {
+        ids.push_back(doc.at("_id").get<std::string>());
+    }
+    ASSERT(ids.size() == 2);
+    ASSERT(ids[0] == "a" && ids[1] == "b");
+}
+
 static void test_batch_commit() {
     TEST("batch commit applies writes atomically");
     moofile::Collection db(make_path("batch_c.bson"));
@@ -637,7 +651,8 @@ int main() {
     test_text_search();
     test_hybrid_search();
 
-    /* Batch */
+    /* Cursor and batch */
+    test_cursor_range_iteration();
     test_batch_commit();
     test_batch_rollback();
     test_batch_exception_rollback();

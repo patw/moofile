@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.0.1 (2026-08-07)
+
+### Minor refinements to language bindings
+
+- **C#**: Added optional `Builders<T>.Filter` property-expression filters for the document-oriented API, including typed overloads across CRUD and search pre-filters.
+- **Java**: Added MongoDB-style static `Filters` factories, a versioned binding JAR release artifact, and consumer guidance for `javac`, Maven/Gradle local dependencies, and fat-JAR deployments.
+- **Go**: Added `Document`, `Filter`, `Update`, and `SearchOptions` conveniences with named update/search methods that avoid positional `nil` arguments.
+- **C++**: Cursors now work in range-for loops; `Batch::commit()` now commits immediately and batch cleanup safely rolls back uncommitted work.
+- **Node/TypeScript**: Removed the unsupported `$regex` filter operator from declarations.
+- **Release tooling and docs**: Native release re-runs now skip already-published npm versions; Java JARs are included in release checksums; stale test counts and examples were refreshed.
+
 ## Unreleased
 
 ## v1.0.0 (2026-08-07)

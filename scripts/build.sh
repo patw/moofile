@@ -31,6 +31,8 @@ done
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+VERSION="$(sed -nE 's/^version = "([^"]+)"/\1/p' pyproject.toml | head -n1)"
+[ -n "$VERSION" ] || { echo "ERROR: unable to read project version" >&2; exit 1; }
 
 case "$MODE" in
     native)
@@ -68,7 +70,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moofile"
-version = "0.5.2"
+version = "__VERSION__"
 requires-python = ">=3.10"
 dependencies = [
     "pymongo>=4.0",
@@ -90,6 +92,8 @@ moo2sqlite = "moofile.cli.sqlite_tool:main"
 where = ["."]
 include = ["moofile*"]
 PYEOF
+        sed -i.bak "s/version = \"__VERSION__\"/version = \"$VERSION\"/" pyproject.toml
+        rm -f pyproject.toml.bak
 
         python -m build --wheel --outdir dist/
         mv pyproject.toml.maturin pyproject.toml

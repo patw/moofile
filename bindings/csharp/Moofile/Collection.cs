@@ -170,6 +170,13 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Find documents using a strongly typed property-based filter.</summary>
+    public List<Document> Find<TDocument>(FilterDefinition<TDocument> filter, FindOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Find(filter.ToDocument(), options);
+    }
+
     /// <summary>Consume a cursor, freeing it even if decoding throws.</summary>
     private static List<Document> DrainCursor(IntPtr cursor)
     {
@@ -204,6 +211,13 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Find the first document using a strongly typed property-based filter.</summary>
+    public Document? FindOne<TDocument>(FilterDefinition<TDocument> filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return FindOne(filter.ToDocument());
+    }
+
     /// <summary>Number of documents matching the filter; null counts everything.</summary>
     public long Count(Document? filter = null)
     {
@@ -215,6 +229,13 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Count documents using a strongly typed property-based filter.</summary>
+    public long Count<TDocument>(FilterDefinition<TDocument> filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Count(filter.ToDocument());
+    }
+
     /// <summary>True if at least one document matches.</summary>
     public bool Exists(Document filter)
     {
@@ -224,6 +245,13 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
             return r == 1;
         }
+    }
+
+    /// <summary>Check whether a strongly typed property-based filter has a match.</summary>
+    public bool Exists<TDocument>(FilterDefinition<TDocument> filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Exists(filter.ToDocument());
     }
 
     // -----------------------------------------------------------------
@@ -264,6 +292,14 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Update the first document matching a strongly typed filter.</summary>
+    public bool UpdateOne<TDocument>(FilterDefinition<TDocument> where, Document? set = null,
+                                     IEnumerable<string>? unset = null, Document? inc = null)
+    {
+        ArgumentNullException.ThrowIfNull(where);
+        return UpdateOne(where.ToDocument(), set, unset, inc);
+    }
+
     /// <summary>
     /// Update every matching document and return the count. Unlike
     /// <see cref="UpdateOne"/>, matching nothing is not an error — it returns 0.
@@ -280,6 +316,14 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Update every document matching a strongly typed filter.</summary>
+    public long UpdateMany<TDocument>(FilterDefinition<TDocument> where, Document? set = null,
+                                      IEnumerable<string>? unset = null, Document? inc = null)
+    {
+        ArgumentNullException.ThrowIfNull(where);
+        return UpdateMany(where.ToDocument(), set, unset, inc);
+    }
+
     /// <summary>
     /// Replace the first matching document, keeping its <c>_id</c>.
     /// </summary>
@@ -293,6 +337,13 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
             return r == 1;
         }
+    }
+
+    /// <summary>Replace the first document matching a strongly typed filter.</summary>
+    public bool ReplaceOne<TDocument>(FilterDefinition<TDocument> where, Document replacement)
+    {
+        ArgumentNullException.ThrowIfNull(where);
+        return ReplaceOne(where.ToDocument(), replacement);
     }
 
     // -----------------------------------------------------------------
@@ -313,6 +364,13 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Delete the first document matching a strongly typed filter.</summary>
+    public bool DeleteOne<TDocument>(FilterDefinition<TDocument> where)
+    {
+        ArgumentNullException.ThrowIfNull(where);
+        return DeleteOne(where.ToDocument());
+    }
+
     /// <summary>Delete every matching document and return the count.</summary>
     public long DeleteMany(Document where)
     {
@@ -322,6 +380,13 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
             return n;
         }
+    }
+
+    /// <summary>Delete every document matching a strongly typed filter.</summary>
+    public long DeleteMany<TDocument>(FilterDefinition<TDocument> where)
+    {
+        ArgumentNullException.ThrowIfNull(where);
+        return DeleteMany(where.ToDocument());
     }
 
     // -----------------------------------------------------------------
@@ -348,6 +413,14 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Vector search with a strongly typed pre-filter.</summary>
+    public List<SearchResult> VectorSearch<TDocument>(string field, IEnumerable<double> queryVector,
+                                                      FilterDefinition<TDocument> filter, int limit = 10)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return VectorSearch(field, queryVector, limit, filter.ToDocument());
+    }
+
     /// <summary>BM25 full-text search over a text field.</summary>
     public List<SearchResult> TextSearch(string field, string query,
                                          int limit = 10, Document? filter = null)
@@ -359,6 +432,14 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
             return DrainSearchCursor(cursor);
         }
+    }
+
+    /// <summary>Text search with a strongly typed pre-filter.</summary>
+    public List<SearchResult> TextSearch<TDocument>(string field, string query,
+                                                    FilterDefinition<TDocument> filter, int limit = 10)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return TextSearch(field, query, limit, filter.ToDocument());
     }
 
     /// <summary>
@@ -380,6 +461,15 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Hybrid search with a strongly typed pre-filter.</summary>
+    public List<SearchResult> HybridSearch<TDocument>(string textField, string vectorField,
+        string queryText, FilterDefinition<TDocument> filter, IEnumerable<double>? queryVector = null,
+        int limit = 10)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return HybridSearch(textField, vectorField, queryText, queryVector, limit, filter.ToDocument());
+    }
+
     /// <summary>
     /// Semantic search — auto-embeds <paramref name="queryText"/> with the
     /// model configured for <paramref name="sourceField"/> via
@@ -395,6 +485,14 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
             return DrainSearchCursor(cursor);
         }
+    }
+
+    /// <summary>Semantic search with a strongly typed pre-filter.</summary>
+    public List<SearchResult> Semantic<TDocument>(string sourceField, string queryText,
+                                                  FilterDefinition<TDocument> filter, int limit = 10)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Semantic(sourceField, queryText, limit, filter.ToDocument());
     }
 
     /// <summary>

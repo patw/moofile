@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to publish (for example v1.0.0)"
+        description: "Existing release tag to publish (for example v1.0.1)"
         required: true
-        default: "v1.0.0"
+        default: "v1.0.1"
 
 permissions:
   contents: write
@@ -137,8 +137,28 @@ jobs:
             moofile-*.tar.gz
             moofile-*.zip
 
-  publish:
+  java:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Build Java binding JAR
+        run: bash bindings/java/build.sh jar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: java-jar
+          path: bindings/java/build/moofile-java-*.jar
+
+  publish:
+    needs: [build, java]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -148,10 +168,15 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: java-jar
+          path: dist/
+
       - name: Checksums
         run: |
           cd dist
-          sha256sum moofile-*.tar.gz moofile-*.zip > SHA256SUMS
+          sha256sum moofile-*.tar.gz moofile-*.zip moofile-java-*.jar > SHA256SUMS
           cat SHA256SUMS
 
       - name: Attach to release
@@ -161,6 +186,7 @@ jobs:
           files: |
             dist/moofile-*.tar.gz
             dist/moofile-*.zip
+            dist/moofile-java-*.jar
             dist/SHA256SUMS
 
   # ── npm ───────────────────────────────────────────────────────────
@@ -221,7 +247,16 @@ jobs:
 
       - name: Publish
         working-directory: bindings/node
-        run: npm publish --provenance --access public
+        run: |
+          # workflow_dispatch can intentionally republish native release assets
+          # for an existing tag. npm versions are immutable, so treat an
+          # already-published matching version as a successful no-op.
+          if npm view "moofile@$(node -p \"require('./package.json').version\")" version \
+              --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+            echo "npm package version already published; skipping."
+            exit 0
+          fi
+          npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

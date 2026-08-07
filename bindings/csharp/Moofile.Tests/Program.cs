@@ -19,6 +19,26 @@ public static class Program
     private static string _currentTest = "";
     private static string _tempDir = "";
 
+    private sealed class Tag
+    {
+        public string? Label { get; init; }
+    }
+
+    private sealed class VectorRecord
+    {
+        // Field names are the selected property names in Phase 1.
+        public string? kind { get; init; }
+    }
+
+    private sealed class Person
+    {
+        public string? Name { get; init; }
+        public int Age { get; init; }
+        public DateTime? Birthday { get; init; }
+        public string? Status { get; init; }
+        public List<Tag> Tags { get; init; } = new();
+    }
+
     // -----------------------------------------------------------------
     // Harness
     // -----------------------------------------------------------------
@@ -259,6 +279,56 @@ public static class Program
         Check(!db.Exists(Document.Of("_id", "zz")), "exists miss");
     }
 
+    private static void TestTypedFilters()
+    {
+        Test("typed filters render supported operators and work across CRUD");
+        using var db = Collection.Open(Path("typed-filters.bson"));
+        db.InsertMany(new[]
+        {
+            Document.Of("_id", "a", "Name", "Alice", "Age", 30, "Birthday", null,
+                "Status", "active", "Tags", new[] { Document.Of("Label", "vip"), Document.Of("Label", "beta") }),
+            Document.Of("_id", "b", "Name", "Bob", "Age", 20,
+                "Status", "trial", "Tags", new[] { Document.Of("Label", "new") }),
+            Document.Of("_id", "c", "Name", "Carol", "Age", 40,
+                "Status", "archived", "Tags", new[] { Document.Of("Label", "vip") }),
+        });
+
+        var adults = Builders<Person>.Filter.Gte(person => person.Age, 30);
+        var hasBirthday = Builders<Person>.Filter.Ne(person => person.Birthday, null);
+        var activeAdults = Builders<Person>.Filter.And(
+            adults,
+            Builders<Person>.Filter.Eq(person => person.Status, "active"));
+        var vip = Builders<Person>.Filter.ElemMatch(
+            person => person.Tags,
+            Builders<Tag>.Filter.Eq(tag => tag.Label, "vip"));
+
+        CheckEquals(adults.ToDocument().ToJson(), "{\"Age\":{\"$gte\":30}}", "renders $gte");
+        CheckEquals(hasBirthday.ToDocument().ToJson(), "{\"Birthday\":{\"$ne\":null}}", "renders null $ne");
+        CheckEquals(db.Count(adults), 2L, "typed count");
+        Check(db.Exists(activeAdults), "typed exists");
+        CheckEquals(db.Find(activeAdults)[0].Id, "a", "typed find");
+        CheckEquals(db.Find(vip).Count, 2, "typed elemMatch");
+        CheckEquals(db.Find(Builders<Person>.Filter.In(person => person.Status,
+            new[] { "active", "trial" })).Count, 2, "typed $in");
+        CheckEquals(db.Find(Builders<Person>.Filter.Or(
+            Builders<Person>.Filter.Eq(person => person.Name, "Alice"),
+            Builders<Person>.Filter.Eq(person => person.Name, "Bob"))).Count, 2, "typed $or");
+        CheckEquals(db.Find(Builders<Person>.Filter.Not(
+            Builders<Person>.Filter.Eq(person => person.Status, "archived"))).Count, 2, "typed $not");
+
+        Check(db.UpdateOne(adults, set: Document.Of("Status", "reviewed")), "typed update");
+        CheckEquals(db.DeleteMany(Builders<Person>.Filter.Lt(person => person.Age, 25)),
+            1L, "typed delete");
+    }
+
+    private static void TestTypedFiltersRejectUnsupportedSelectors()
+    {
+        Test("typed filters reject nested and computed selectors");
+        CheckThrows<ArgumentException>(
+            () => Builders<Person>.Filter.Eq(person => person.Name!.Length, 5),
+            "computed selector");
+    }
+
     private static void TestFindOptionsSort()
     {
         Test("find sorts ascending and descending");
@@ -439,6 +509,11 @@ public static class Program
         var hits = db.VectorSearch("emb", new[] { 1.0, 0.0, 0.0 }, 5, Document.Of("kind", "y"));
         CheckEquals(hits.Count, 1, "filtered result count");
         CheckEquals(hits[0].Doc.Id, "b", "filtered result");
+
+        var typedHits = db.VectorSearch("emb", new[] { 1.0, 0.0, 0.0 },
+            Builders<VectorRecord>.Filter.Eq(record => record.kind, "y"), 5);
+        CheckEquals(typedHits.Count, 1, "typed filtered result count");
+        CheckEquals(typedHits[0].Doc.Id, "b", "typed filtered result");
     }
 
     // -----------------------------------------------------------------
@@ -544,6 +619,8 @@ public static class Program
             TestInsertVectorSurvivesRoundTrip,
             TestFindFilters,
             TestFindOneCountExists,
+            TestTypedFilters,
+            TestTypedFiltersRejectUnsupportedSelectors,
             TestFindOptionsSort,
             TestFindOptionsSkipLimit,
             TestFindOptionsGroupAgg,

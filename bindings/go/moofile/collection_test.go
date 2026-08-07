@@ -110,6 +110,41 @@ func TestExists(t *testing.T) {
 	}
 }
 
+func TestNamedUpdateAndSearchOptions(t *testing.T) {
+	db, err := moofile.Open(tmpPath(t), &moofile.Config{VectorIndexes: map[string]int{"emb": 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	_, err = db.Insert(moofile.Document{"_id": "a", "kind": "keep", "age": 30, "emb": []float64{1, 0}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Insert(moofile.Document{"_id": "b", "kind": "skip", "age": 20, "emb": []float64{0, 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := db.UpdateOneWith(moofile.Filter{"_id": "a"}, moofile.Update{
+		Set: moofile.Document{"age": 31},
+	})
+	if err != nil || !updated {
+		t.Fatalf("UpdateOneWith = %v, %v; want true, nil", updated, err)
+	}
+
+	hits, err := db.VectorSearchWithOptions("emb", []float64{1, 0}, moofile.SearchOptions{
+		Limit:  5,
+		Filter: moofile.Filter{"kind": "keep"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 1 || hits[0].Doc["_id"] != "a" {
+		t.Fatalf("named search results = %#v; want only a", hits)
+	}
+}
+
 func TestUpdateOne(t *testing.T) {
 	db, _ := moofile.Open(tmpPath(t), nil)
 	defer db.Close()
@@ -261,12 +296,12 @@ func TestJSONSerialization(t *testing.T) {
 	defer db.Close()
 
 	db.Insert(map[string]any{
-		"_id":  "types",
-		"s":    "hello",
-		"i":    42,
-		"f":    3.14,
-		"b":    true,
-		"arr":  []any{1, "two", 3.0},
+		"_id":    "types",
+		"s":      "hello",
+		"i":      42,
+		"f":      3.14,
+		"b":      true,
+		"arr":    []any{1, "two", 3.0},
 		"nested": map[string]any{"k": "v"},
 	})
 

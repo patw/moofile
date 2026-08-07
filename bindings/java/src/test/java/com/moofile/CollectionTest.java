@@ -249,6 +249,40 @@ public class CollectionTest {
         }
     }
 
+    private static void testFiltersFactory() {
+        test("Filters factory builds supported filters for every document API");
+        try (Collection db = Collection.open(path("filters.bson"))) {
+            db.insertMany(List.of(
+                Document.of("_id", "a", "age", 30, "status", "active",
+                    "birthday", null, "tags", List.of(Document.of("label", "vip"))),
+                Document.of("_id", "b", "age", 20, "status", "trial",
+                    "tags", List.of(Document.of("label", "new"))),
+                Document.of("_id", "c", "age", 40, "status", "archived",
+                    "tags", List.of(Document.of("label", "vip")))));
+
+            Document adults = Filters.gte("age", 30);
+            Document activeAdults = Filters.and(adults, Filters.eq("status", "active"));
+            Document vip = Filters.elemMatch("tags", Filters.eq("label", "vip"));
+
+            checkEquals(adults.toJson(), "{\"age\":{\"$gte\":30}}", "renders $gte");
+            checkEquals(Filters.ne("birthday", null).toJson(),
+                "{\"birthday\":{\"$ne\":null}}", "renders null $ne");
+            checkEquals(db.count(adults), 2L, "factory count");
+            check(db.exists(activeAdults), "factory exists");
+            checkEquals(db.findOne(activeAdults).id(), "a", "factory findOne");
+            checkEquals(db.find(vip).size(), 2, "factory elemMatch");
+            checkEquals(db.find(Filters.in("status", List.of("active", "trial"))).size(),
+                2, "factory $in");
+            checkEquals(db.find(Filters.or(Filters.eq("_id", "a"), Filters.eq("_id", "b"))).size(),
+                2, "factory $or");
+            checkEquals(db.find(Filters.not(Filters.eq("status", "archived"))).size(),
+                2, "factory $not");
+
+            check(db.updateOne(activeAdults, Document.of("status", "reviewed")), "factory update");
+            checkEquals(db.deleteMany(Filters.lt("age", 25)), 1L, "factory delete");
+        }
+    }
+
     private static void testFindOptionsSort() {
         test("find sorts ascending and descending");
         try (Collection db = sortable("fsort.bson")) {
@@ -524,6 +558,7 @@ public class CollectionTest {
             CollectionTest::testInsertVectorSurvivesRoundTrip,
             CollectionTest::testFindFilters,
             CollectionTest::testFindOneAndCountAndExists,
+            CollectionTest::testFiltersFactory,
             CollectionTest::testFindOptionsSort,
             CollectionTest::testFindOptionsSkipLimit,
             CollectionTest::testFindOptionsGroupAgg,

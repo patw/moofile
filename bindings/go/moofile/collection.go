@@ -47,6 +47,12 @@ import (
 // Errors
 // ---------------------------------------------------------------------------
 
+// Document is a JSON-shaped MooFile document. It is also used for filters.
+type Document map[string]any
+
+// Filter is a Document interpreted as a MongoDB-style match expression.
+type Filter = Document
+
 // Error represents a MooFile error returned from the C library.
 type Error struct {
 	Msg string
@@ -125,11 +131,11 @@ func (a *cstrings) free() {
 // The JSON tags matter: the C layer reads lower-case snake_case keys, so a
 // field without a tag would be serialised as "Model" and silently ignored.
 type AutoEmbedConfig struct {
-	Model       string `json:"model"`                 // GGUF model URI, e.g. "hf:user/repo:file.gguf"
-	Target      string `json:"target"`                // Target vector field name
-	Dims        int    `json:"dims,omitempty"`        // Embedding dimensions (default 1024)
-	Precision   string `json:"precision,omitempty"`   // "f32", "int8", "uint8", "binary"
-	Normalize   *bool  `json:"normalize,omitempty"`   // L2-normalize (default true)
+	Model       string `json:"model"`               // GGUF model URI, e.g. "hf:user/repo:file.gguf"
+	Target      string `json:"target"`              // Target vector field name
+	Dims        int    `json:"dims,omitempty"`      // Embedding dimensions (default 1024)
+	Precision   string `json:"precision,omitempty"` // "f32", "int8", "uint8", "binary"
+	Normalize   *bool  `json:"normalize,omitempty"` // L2-normalize (default true)
 	QueryPrefix string `json:"query_prefix,omitempty"`
 	DocPrefix   string `json:"doc_prefix,omitempty"`
 }
@@ -253,6 +259,20 @@ func (o *FindOptions) toJSON() (string, error) {
 type SearchResult struct {
 	Doc   map[string]any
 	Score float64
+}
+
+// Update describes the supported MooFile update operations. Use it with
+// UpdateOneWith or UpdateManyWith to avoid positional nil arguments.
+type Update struct {
+	Set   Document
+	Unset []string
+	Inc   Document
+}
+
+// SearchOptions controls a search and its optional MongoDB-style pre-filter.
+type SearchOptions struct {
+	Limit  int
+	Filter Filter
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +621,18 @@ func (c *Collection) UpdateMany(where, setValues map[string]any, unsetFields []s
 	return n, nil
 }
 
+// UpdateOneWith updates the first matching document using a named Update.
+// It is equivalent to UpdateOne(where, update.Set, update.Unset, update.Inc).
+func (c *Collection) UpdateOneWith(where Filter, update Update) (bool, error) {
+	return c.UpdateOne(where, update.Set, update.Unset, update.Inc)
+}
+
+// UpdateManyWith updates every matching document using a named Update.
+// It is equivalent to UpdateMany(where, update.Set, update.Unset, update.Inc).
+func (c *Collection) UpdateManyWith(where Filter, update Update) (int64, error) {
+	return c.UpdateMany(where, update.Set, update.Unset, update.Inc)
+}
+
 // ReplaceOne replaces the first document matching where, keeping its _id.
 // Matching nothing is an error, as with UpdateOne.
 func (c *Collection) ReplaceOne(where, replacement map[string]any) (bool, error) {
@@ -778,6 +810,16 @@ func (c *Collection) TextSearch(field, query string, limit int, filter map[strin
 	return drainSearchCursor(cursor)
 }
 
+// VectorSearchWithOptions ranks documents by cosine similarity using named options.
+func (c *Collection) VectorSearchWithOptions(field string, queryVector []float64, options SearchOptions) ([]SearchResult, error) {
+	return c.VectorSearch(field, queryVector, options.Limit, options.Filter)
+}
+
+// TextSearchWithOptions ranks documents by BM25 relevance using named options.
+func (c *Collection) TextSearchWithOptions(field, query string, options SearchOptions) ([]SearchResult, error) {
+	return c.TextSearch(field, query, options.Limit, options.Filter)
+}
+
 // HybridSearch fuses BM25 and vector rankings with Reciprocal Rank Fusion.
 // Pass a nil queryVector to auto-embed queryText.
 func (c *Collection) HybridSearch(textField, vectorField, queryText string, queryVector []float64, limit int, filter map[string]any) ([]SearchResult, error) {
@@ -815,6 +857,11 @@ func (c *Collection) HybridSearch(textField, vectorField, queryText string, quer
 	return drainSearchCursor(cursor)
 }
 
+// HybridSearchWithOptions fuses BM25 and vector rankings using named options.
+func (c *Collection) HybridSearchWithOptions(textField, vectorField, queryText string, queryVector []float64, options SearchOptions) ([]SearchResult, error) {
+	return c.HybridSearch(textField, vectorField, queryText, queryVector, options.Limit, options.Filter)
+}
+
 // Semantic auto-embeds queryText with the model configured for sourceField
 // via Config.AutoEmbed, then runs a vector search.
 func (c *Collection) Semantic(sourceField, queryText string, limit int, filter map[string]any) ([]SearchResult, error) {
@@ -844,6 +891,11 @@ func (c *Collection) Semantic(sourceField, queryText string, limit int, filter m
 // -----------------------------------------------------------------------
 // Batch
 // -----------------------------------------------------------------------
+
+// SemanticWithOptions auto-embeds queryText and searches using named options.
+func (c *Collection) SemanticWithOptions(sourceField, queryText string, options SearchOptions) ([]SearchResult, error) {
+	return c.Semantic(sourceField, queryText, options.Limit, options.Filter)
+}
 
 // BatchBegin starts an atomic batch.  Prefer Batch, which cannot leak an
 // open batch.

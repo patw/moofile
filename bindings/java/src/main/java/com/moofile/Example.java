@@ -45,8 +45,8 @@ public class Example {
                 + " (_id: " + alice.id() + ")");
 
             db.insertMany(List.of(
-                Document.of("name", "Bob", "email", "bob@example.com", "age", 25),
-                Document.of("name", "Carol", "email", "carol@example.com", "age", 35)));
+                Document.of("name", "Bob", "email", "bob@example.com", "age", 25, "status", "trial"),
+                Document.of("name", "Carol", "email", "carol@example.com", "age", 35, "status", "active")));
             System.out.println("   Total contacts: " + db.count());
 
             Document found = db.findOne(Document.of("email", "alice@example.com"));
@@ -59,6 +59,19 @@ public class Example {
 
             List<Document> over30 = db.find(Document.of("age", Document.of("$gte", 30)));
             System.out.println("4. Contacts 30 or older: " + over30.size());
+
+            // Java uses static filter factories, like the MongoDB Java driver.
+            // import static com.moofile.Filters.*; makes these calls shorter.
+            Document typedOver30 = Filters.gte("age", 30);
+            Document typedAlice = Filters.eq("email", "alice@example.com");
+            Document activeAdults = Filters.and(
+                typedOver30,
+                Filters.eq("status", "active"));
+            System.out.println("   Filter factory: " + db.count(typedOver30)
+                + " contacts 30 or older; Alice exists: " + db.exists(typedAlice));
+
+            // Factory filters work with updates and deletes too.
+            db.updateMany(activeAdults, Document.of("status", "reviewed"));
 
             db.deleteOne(Document.of("email", "bob@example.com"));
             System.out.println("5. After delete, total: " + db.count());

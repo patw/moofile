@@ -172,19 +172,19 @@ cargo test
 # instead of this checkout (silent, and very confusing).
 PYTHONPATH=. pytest tests/ tests-cross/ -v
 
-# C (73), C++ (42) and cross-backend parity (8)
+# C (73), C++ (43) and cross-backend parity (8)
 cd bindings/c/tests && ./run_tests.sh --release
 
 # Node.js — 22 tests
 cd bindings/node && npm install && node test.js
 
-# Go — 22 tests
+# Go — 23 tests
 cd bindings/go && go test ./moofile/
 
-# Java — 30 tests
+# Java — 31 tests
 cd bindings/java && ./build.sh test
 
-# C# — 30 tests
+# C# — 32 tests
 cd bindings/csharp && dotnet run --project Moofile.Tests
 ```
 

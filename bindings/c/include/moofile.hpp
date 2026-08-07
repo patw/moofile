@@ -26,7 +26,7 @@
  *
  *     db.insert({{"name", "Alice"}, {"email", "a@example.com"}});
  *
- *     for (auto doc : db.find({{"age", {{"$gt", 25}}}}).to_vector()) {
+ *     for (const auto& doc : db.find({{"age", {{"$gt", 25}}}})) {
  *         std::cout << doc.dump() << std::endl;
  *     }
  *
@@ -61,6 +61,8 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <cstddef>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -338,6 +340,42 @@ public:
         return result;
     }
 
+    /** Input iterator for range-for loops. Iteration consumes the cursor. */
+    class iterator {
+    public:
+        using value_type = json;
+        using reference = const json&;
+        using pointer = const json*;
+        using difference_type = std::ptrdiff_t;
+        using iterator_category = std::input_iterator_tag;
+
+        iterator() = default;
+        explicit iterator(Cursor* cursor) : cursor_(cursor) { advance(); }
+
+        reference operator*() const { return *current_; }
+        pointer operator->() const { return &*current_; }
+        iterator& operator++() { advance(); return *this; }
+        iterator operator++(int) { auto copy = *this; advance(); return copy; }
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.cursor_ == b.cursor_;
+        }
+        friend bool operator!=(const iterator& a, const iterator& b) { return !(a == b); }
+
+    private:
+        void advance() {
+            if (!cursor_) return;
+            current_ = cursor_->next();
+            if (!current_) cursor_ = nullptr;
+        }
+        Cursor* cursor_ = nullptr;
+        std::optional<json> current_;
+    };
+
+    /** Begin consuming this cursor with a range-for loop. */
+    iterator begin() { return iterator(this); }
+    /** End sentinel for a range-for loop. */
+    iterator end() { return iterator(); }
+
 private:
     MooFileCursor* cursor_;
 };
@@ -397,6 +435,42 @@ public:
         }
         return result;
     }
+
+    /** Input iterator for range-for loops. Iteration consumes the cursor. */
+    class iterator {
+    public:
+        using value_type = std::pair<json, float>;
+        using reference = const value_type&;
+        using pointer = const value_type*;
+        using difference_type = std::ptrdiff_t;
+        using iterator_category = std::input_iterator_tag;
+
+        iterator() = default;
+        explicit iterator(SearchCursor* cursor) : cursor_(cursor) { advance(); }
+
+        reference operator*() const { return *current_; }
+        pointer operator->() const { return &*current_; }
+        iterator& operator++() { advance(); return *this; }
+        iterator operator++(int) { auto copy = *this; advance(); return copy; }
+        friend bool operator==(const iterator& a, const iterator& b) {
+            return a.cursor_ == b.cursor_;
+        }
+        friend bool operator!=(const iterator& a, const iterator& b) { return !(a == b); }
+
+    private:
+        void advance() {
+            if (!cursor_) return;
+            current_ = cursor_->next();
+            if (!current_) cursor_ = nullptr;
+        }
+        SearchCursor* cursor_ = nullptr;
+        std::optional<value_type> current_;
+    };
+
+    /** Begin consuming this cursor with a range-for loop. */
+    iterator begin() { return iterator(this); }
+    /** End sentinel for a range-for loop. */
+    iterator end() { return iterator(); }
 
 private:
     MooFileSearchCursor* cursor_;
@@ -822,18 +896,34 @@ public:
         moofile_free_string(err);
     }
 
-    /** RAII helper for batch writes. */
+    /**
+     * RAII helper for batch writes. Rolls back unless commit() is called.
+     * commit() commits immediately; it does not defer the commit to scope exit.
+     */
     class Batch {
     public:
         Batch(Collection& db) : db_(db) { db_.batch_begin(); }
         ~Batch() {
-            if (committed_) db_.batch_commit();
-            else db_.batch_rollback();
+            if (!finished_) {
+                try { db_.batch_rollback(); }
+                catch (...) { /* destructors must not throw */ }
+            }
         }
-        void commit() { committed_ = true; }
+        Batch(const Batch&) = delete;
+        Batch& operator=(const Batch&) = delete;
+        void commit() {
+            if (finished_) throw error("batch is already finished");
+            db_.batch_commit();
+            finished_ = true;
+        }
+        void rollback() {
+            if (finished_) throw error("batch is already finished");
+            db_.batch_rollback();
+            finished_ = true;
+        }
     private:
         Collection& db_;
-        bool committed_ = false;
+        bool finished_ = false;
     };
 
     // ----------------------------------------------------------

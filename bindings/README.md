@@ -178,7 +178,7 @@ collection.
 | `include/moofile.hpp` | C++17 RAII wrapper |
 | `src/lib.rs` | Rust `extern "C"` implementation |
 | `tests/test_c_api.c` | 73 C API tests |
-| `tests/test_cxx_api.cpp` | 42 C++ wrapper tests |
+| `tests/test_cxx_api.cpp` | 43 C++ wrapper tests |
 | `tests/test_parity.py` | Python ↔ Rust ↔ C parity |
 | `example.c` | Runnable examples |
 
@@ -233,7 +233,7 @@ moofile::Collection db("data.bson",
 
 db.insert({{"name", "Alice"}, {"age", 30}});
 
-for (auto doc : db.find({{"age", {{"$gt", 25}}}}).to_vector()) {
+for (const auto& doc : db.find({{"age", {{"$gt", 25}}}})) {
     std::cout << doc.dump() << "\n";
 }
 
@@ -244,7 +244,7 @@ auto oldest = db.find(json::object(),
 auto by_dept = db.find(json::object(),
     moofile::FindOptions().group("dept").count().sum("pay")).to_vector();
 
-// Atomic batch — commits on scope exit, rolls back if an exception escapes
+// Atomic batch — commit() commits immediately; scope exit rolls back if omitted
 {
     moofile::Collection::Batch batch(db);
     db.insert({{"_id", "a"}});
@@ -306,7 +306,7 @@ node example.js
 | File | Description |
 |------|-------------|
 | `moofile/collection.go` | Go package via cgo |
-| `moofile/collection_test.go` | 22 tests |
+| `moofile/collection_test.go` | 23 tests |
 | `example/main.go` | Runnable example |
 
 The cgo directives point at the in-repo `target/release` and bake an rpath, so
@@ -314,7 +314,7 @@ binaries find `libmoofile` without `LD_LIBRARY_PATH`. Override with
 `CGO_CFLAGS` / `CGO_LDFLAGS` when vendoring elsewhere.
 
 ```go
-import "github.com/patw/moofile-go/moofile"
+import "github.com/patw/moofile/bindings/go/moofile"
 
 db, err := moofile.Open("data.bson", &moofile.Config{
     Indexes: []string{"email"},
@@ -337,6 +337,14 @@ err = db.Batch(func() error {
     db.Insert(map[string]any{"_id": "a"})
     return nil // returning an error rolls back
 })
+
+// Named operation options avoid positional nil values.
+_, err = db.UpdateOneWith(
+    moofile.Filter{"_id": "a"},
+    moofile.Update{Set: moofile.Document{"status": "active"}},
+)
+hits, err := db.VectorSearchWithOptions("embedding", queryVector,
+    moofile.SearchOptions{Limit: 10, Filter: moofile.Filter{"status": "active"}})
 ```
 
 **Build & test:**
@@ -356,14 +364,25 @@ CGO_ENABLED=1 go run ./example/
 | `src/main/java/com/moofile/Document.java` | Document type |
 | `src/main/java/com/moofile/Config.java` | Config + AutoEmbedConfig |
 | `src/main/java/com/moofile/FindOptions.java` | Query builder |
+| `src/main/java/com/moofile/Filters.java` | Static MongoDB-style filter factories |
 | `src/main/java/com/moofile/Json.java` | Dependency-free JSON reader/writer |
 | `src/main/java/com/moofile/Native.java` | Panama FFI layer |
 | `src/main/java/com/moofile/Example.java` | Runnable examples |
-| `src/test/java/com/moofile/CollectionTest.java` | 30 tests |
+| `src/test/java/com/moofile/CollectionTest.java` | 31 tests |
 
 **Requires JDK 22+.** The binding uses the JDK's Foreign Function &amp; Memory
 API, so it needs no third-party jars and no Maven or Gradle — a JDK and the
 shared library are the whole toolchain.
+
+**Application consumption.** Java binding JARs are attached to GitHub Releases
+rather than published to Maven Central. Download `moofile-java-<version>.jar`
+alongside the native archive for the deployment platform, then launch with
+`--enable-native-access=ALL-UNNAMED` and
+`-Dmoofile.library.path=/real/path/to/libmoofile`. A fat JAR may include the
+binding JAR, but the native `.so`/`.dylib`/`.dll` must be packaged beside it or
+extracted to a real filesystem path. See the
+[Java consumer guide](java/README.md) for `javac`, Maven, Gradle, and fat-JAR
+examples.
 
 ```java
 import com.moofile.*;
@@ -376,6 +395,13 @@ try (Collection db = Collection.open("data.bson",
     for (Document d : db.find(Document.of("age", Document.of("$gt", 25)))) {
         System.out.println(d);
     }
+
+    // Optional static filter factories, following the MongoDB Java driver style.
+    // Import them statically for terse queries: import static com.moofile.Filters.*;
+    Document activeAdults = Filters.and(
+        Filters.gte("age", 30),
+        Filters.eq("status", "active"));
+    List<Document> matches = db.find(activeAdults);
 
     List<Document> oldest = db.find(null,
         FindOptions.create().sort("age", true).limit(10));
@@ -413,7 +439,7 @@ java --enable-native-access=ALL-UNNAMED -cp build/classes com.moofile.Example
 | `Moofile/Document.cs` | Document, SearchResult, MooFileException |
 | `Moofile/Config.cs` | Config, AutoEmbedConfig, FindOptions |
 | `Moofile/Native.cs` | P/Invoke layer + library resolver |
-| `Moofile.Tests/` | 30 tests |
+| `Moofile.Tests/` | 32 tests |
 | `Moofile.Example/` | Runnable examples |
 
 Documents hold plain CLR values (`string`, `long`, `double`, `bool`, `List`,
@@ -431,6 +457,14 @@ db.Insert(Document.Of("name", "Alice", "email", "a@example.com", "age", 30));
 
 foreach (var doc in db.Find(Document.Of("age", Document.Of("$gt", 25))))
     Console.WriteLine(doc);
+
+// Optional property-expression filters; this Phase 1 API still returns Documents.
+// In Phase 1, selected property names must match stored fields exactly.
+var adults = Builders<Person>.Filter.Gte(person => person.age, 30);
+var hasBirthday = Builders<Person>.Filter.Ne(person => person.birthday, null);
+var activeAdults = Builders<Person>.Filter.And(adults,
+    Builders<Person>.Filter.Eq(person => person.status, "active"));
+var matches = db.Find(activeAdults);
 
 var oldest = db.Find(null, FindOptions.Create().Sort("age", desc: true).Limit(10));
 
@@ -514,12 +548,12 @@ Every suite below runs against a freshly built `libmoofile`.
 | Python (both backends) | 307 | `PYTHONPATH=. pytest tests/ tests-cross/` |
 | Rust core | 79 | `cargo test` |
 | C | 73 | `cd bindings/c/tests && ./run_tests.sh --release` |
-| C++ | 42 | (same command) |
+| C++ | 43 | (same command) |
 | Cross-backend parity | 8 | (same command) |
 | Node.js | 22 | `cd bindings/node && node test.js` |
-| Go | 22 | `cd bindings/go && go test ./moofile/` |
-| Java | 30 | `cd bindings/java && ./build.sh test` |
-| C# | 30 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
+| Go | 23 | `cd bindings/go && go test ./moofile/` |
+| Java | 31 | `cd bindings/java && ./build.sh test` |
+| C# | 32 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
 
 `run_tests.sh` now runs `test_parity.py` as its third stage. That script
 cross-checks the pure-Python, PyO3 and C backends against each other over the

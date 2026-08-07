@@ -964,11 +964,11 @@ across the boundary.
 |----------|----------|-----------|:-----:|:-------:|
 | **Python** | PyO3 native (or pure-Python) | `bindings/python/` | 307 | `examples/` |
 | **C** | `extern "C"` from Rust | `bindings/c/` | 73 | `example.c` |
-| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 42 | (inline) |
+| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 43 | (inline) |
 | **Node.js** | `koffi` FFI (pure JS) | `bindings/node/` | 22 | `example.js` |
-| **Go** | cgo + C header | `bindings/go/` | 22 | `example/main.go` |
-| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 30 | `Example.java` |
-| **C#** | P/Invoke | `bindings/csharp/` | 30 | `Moofile.Example/` |
+| **Go** | cgo + C header | `bindings/go/` | 23 | `example/main.go` |
+| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 31 | `Example.java` |
+| **C#** | P/Invoke | `bindings/csharp/` | 32 | `Moofile.Example/` |
 
 ### Autoembedding across languages
 

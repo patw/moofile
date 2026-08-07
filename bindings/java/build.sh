@@ -11,13 +11,18 @@
 #   ./build.sh build      # build only
 #   ./build.sh test       # build, then run the tests
 #   ./build.sh example    # build, then run the examples
+#   ./build.sh jar        # build a redistributable Java binding JAR
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="$SCRIPT_DIR/build/classes"
+MAIN_BUILD_DIR="$SCRIPT_DIR/build/main-classes"
+JAR_DIR="$SCRIPT_DIR/build"
 LIB_DIR="$PROJECT_DIR/target/release"
+VERSION="$(sed -nE 's/^version = "([^"]+)"/\1/p' "$PROJECT_DIR/Cargo.toml" | head -n1)"
+JAR_FILE="$JAR_DIR/moofile-java-$VERSION.jar"
 
 ACTION="${1:-test}"
 
@@ -37,7 +42,7 @@ if [ "$JAVA_MAJOR" -lt 22 ]; then
     exit 1
 fi
 
-if [ ! -f "$LIB_DIR/libmoofile.so" ] \
+if [ "$ACTION" != "jar" ] && [ ! -f "$LIB_DIR/libmoofile.so" ] \
    && [ ! -f "$LIB_DIR/libmoofile.dylib" ] \
    && [ ! -f "$LIB_DIR/moofile.dll" ]; then
     echo "--- libmoofile not found, building it ---"
@@ -55,13 +60,39 @@ javac -d "$BUILD_DIR" \
     "$SCRIPT_DIR"/src/test/java/com/moofile/*.java
 echo "Classes written to $BUILD_DIR"
 
+package_jar() {
+    echo "--- Packaging $JAR_FILE ---"
+    rm -rf "$MAIN_BUILD_DIR"
+    mkdir -p "$MAIN_BUILD_DIR"
+    javac -d "$MAIN_BUILD_DIR" "$SCRIPT_DIR"/src/main/java/com/moofile/*.java
+
+    local manifest="$JAR_DIR/MANIFEST.MF"
+    cat > "$manifest" <<'EOF'
+Manifest-Version: 1.0
+Automatic-Module-Name: com.moofile
+EOF
+    jar --create --file "$JAR_FILE" --manifest "$manifest" -C "$MAIN_BUILD_DIR" .
+    echo "JAR written to $JAR_FILE"
+}
+
 # --enable-native-access silences the restricted-method warning;
-# moofile.library.path tells the binding where the .so lives.
-JAVA_ARGS=(
-    --enable-native-access=ALL-UNNAMED
-    "-Dmoofile.library.path=$LIB_DIR/libmoofile.so"
-    -cp "$BUILD_DIR"
-)
+# moofile.library.path tells the binding where the platform-specific library lives.
+JAVA_ARGS=()
+if [ "$ACTION" != "jar" ]; then
+    if [ -f "$LIB_DIR/libmoofile.dylib" ]; then
+        LIB_PATH="$LIB_DIR/libmoofile.dylib"
+    elif [ -f "$LIB_DIR/moofile.dll" ]; then
+        LIB_PATH="$LIB_DIR/moofile.dll"
+    else
+        LIB_PATH="$LIB_DIR/libmoofile.so"
+    fi
+
+    JAVA_ARGS=(
+        --enable-native-access=ALL-UNNAMED
+        "-Dmoofile.library.path=$LIB_PATH"
+        -cp "$BUILD_DIR"
+    )
+fi
 
 case "$ACTION" in
     build)
@@ -74,8 +105,11 @@ case "$ACTION" in
         echo ""
         java "${JAVA_ARGS[@]}" com.moofile.Example
         ;;
+    jar)
+        package_jar
+        ;;
     *)
-        echo "usage: $0 [build|test|example]" >&2
+        echo "usage: $0 [build|test|example|jar]" >&2
         exit 1
         ;;
 esac

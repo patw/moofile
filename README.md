@@ -241,11 +241,11 @@ MooFile is implemented in **Rust** with a **Python** binding (via PyO3). A **C s
 |----------|----------|-----------|:-----:|
 | **Python** | PyO3 native (or pure-Python fallback) | `bindings/python/` | 307 |
 | **C** | `extern "C"` from Rust core | `bindings/c/` | 73 |
-| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 42 |
+| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 43 |
 | **Node.js** | `koffi` FFI (pure JS, no native compile) | `bindings/node/` | 22 |
-| **Go** | cgo + C header | `bindings/go/` | 22 |
-| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 30 |
-| **C#** | P/Invoke + `DllImport` | `bindings/csharp/` | 30 |
+| **Go** | cgo + C header | `bindings/go/` | 23 |
+| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 31 |
+| **C#** | P/Invoke + `DllImport` | `bindings/csharp/` | 32 |
 
 Plus 8 cross-backend parity scenarios comparing pure-Python, PyO3 and C.
 

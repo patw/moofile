@@ -81,7 +81,7 @@ Python. "Idiomatic" is the goal, but not at any cost.
 | Go | `go get` from the repo | **Done** | Module path fixed. Needing a system library is normal for cgo. |
 | C# | NuGet with `runtimes/<rid>/native/` | **Done** | `dotnet add package MooFile`. The SDK copies the matching native file into the consumer's output automatically. |
 | Node.js | npm | **Done** | `npm install moofile`. All three currently built platform binaries ship in the package; no compile step, no postinstall download. |
-| Java | Maven Central | **Skip for now** | The only ecosystem where doing it properly is genuinely expensive: Sonatype namespace verification, GPG signing, and the staging-repository dance. Ship the jar as a release artifact and revisit if somebody asks. |
+| Java | GitHub Release JAR + native archive | **Done, no Maven Central** | Maven Central is still disproportionate: Sonatype namespace verification, GPG signing, and staging. A versioned binding JAR and each platform's native archive attach to the same GitHub Release; [the Java guide](bindings/java/README.md) covers javac, Maven/Gradle local consumption, and fat-JAR deployment. |
 
 ### Node sizing
 
@@ -164,7 +164,8 @@ package back to this repository and commit.
 
 ## Still open
 
-**Java.** Maven Central remains skipped: Sonatype namespace verification, GPG
-signing and the staging-repository dance are a multi-day slog for what is
-currently zero users. The jar is buildable from source and the release archive
-covers the native side. Revisit if somebody asks.
+**Java Maven Central.** Maven Central remains deliberately skipped: Sonatype
+namespace verification, GPG signing, and the staging-repository dance are a
+multi-day slog for what is currently a small user base. GitHub Releases now
+ship the versioned Java binding JAR alongside the platform-native archives;
+revisit a public Maven repository if demand justifies the operational cost.

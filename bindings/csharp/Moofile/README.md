@@ -32,6 +32,17 @@ db.InsertMany(new[] {
 db.FindOne(Document.Of("email", "alice@example.com"));
 db.Find(Document.Of("age", Document.Of("$gte", 30)));
 
+// Strongly typed filters select fields with C# property expressions. They work
+// with the document-oriented Collection API and return List<Document>.
+// The selected property name must match the stored field exactly in Phase 1.
+var adults = Builders<Person>.Filter.Gte(person => person.age, 30);
+var hasBirthday = Builders<Person>.Filter.Ne(person => person.birthday, null);
+var activeAdults = Builders<Person>.Filter.And(
+    adults,
+    Builders<Person>.Filter.Eq(person => person.status, "active"));
+db.Find(activeAdults);
+db.Count(activeAdults);
+
 // Sorting, paging, aggregation
 db.Find(null, FindOptions.Create().Sort("age", desc: true).Limit(10));
 db.Find(null, FindOptions.Create().Group("region").Count().Sum("amount"));
@@ -52,6 +63,75 @@ db.Batch(() => {
 **Documents hold plain CLR values** — `string`, `long`, `double`, `bool`,
 `List<object?>`, nested `Document` — not `JsonElement`. So `doc["age"]`
 compares and casts the way you would expect.
+
+**Typed filters are an optional convenience layer.** `Builders<T>.Filter`
+turns direct top-level property selectors (for example,
+`person => person.Age`) into MooFile's existing MongoDB-style filters. It is
+not a general LINQ provider: it does not translate arbitrary predicates, and
+this Phase 1 API still reads and writes `Document` values rather than POCOs.
+Raw `Document` filters remain available for dynamic field names.
+
+## Typed filter builder
+
+Use `Builders<T>.Filter` when your document shape is known at compile time.
+`T` is a field-selection type in this Phase 1 API; it does **not** cause
+`Collection` to serialize or return POCOs yet. Its selected public property
+name must exactly match the stored MooFile field name.
+
+```csharp
+sealed class Person
+{
+    public int age { get; init; }
+    public string? status { get; init; }
+    public DateTime? birthday { get; init; }
+    public List<Tag> tags { get; init; } = new();
+}
+
+sealed class Tag
+{
+    public string? label { get; init; }
+}
+
+var ageFilter = Builders<Person>.Filter.Gte(person => person.age, 18);
+var activeFilter = Builders<Person>.Filter.Eq(person => person.status, "active");
+var eligible = Builders<Person>.Filter.And(ageFilter, activeFilter);
+
+// Document-oriented results, with a type-safe field selection in the filter.
+List<Document> people = db.Find(eligible);
+Document? first = db.FindOne(eligible);
+long count = db.Count(eligible);
+bool any = db.Exists(eligible);
+```
+
+The builder supports MooFile's complete current filter surface:
+
+```csharp
+var filter = Builders<Person>.Filter;
+
+filter.Eq(person => person.status, "active");
+filter.Ne(person => person.birthday, null);
+filter.Gt(person => person.age, 21);
+filter.Gte(person => person.age, 21);
+filter.Lt(person => person.age, 65);
+filter.Lte(person => person.age, 65);
+filter.In(person => person.status, new[] { "active", "trial" });
+filter.Nin(person => person.status, new[] { "archived", "deleted" });
+filter.Exists(person => person.birthday);
+filter.And(/* filters */);
+filter.Or(/* filters */);
+filter.Not(filter.Eq(person => person.status, "archived"));
+filter.ElemMatch(person => person.tags,
+    Builders<Tag>.Filter.Eq(tag => tag.label, "vip"));
+```
+
+Typed filters can also be used with `UpdateOne`, `UpdateMany`, `ReplaceOne`,
+`DeleteOne`, `DeleteMany`, and as pre-filters for `VectorSearch`, `TextSearch`,
+`HybridSearch`, and `Semantic`.
+
+Selectors must be direct, top-level properties such as `person => person.age`.
+Nested or computed selectors such as `person => person.Address.City` and
+`person => person.Name.Length` are rejected. Use a raw `Document` filter for
+dynamic field names or any future operation not exposed by the typed builder.
 
 **`UpdateOne` and `ReplaceOne` throw `MooFileException` when nothing matches.**
 This mirrors the Rust and Python APIs, which raise `DocumentNotFound`.
