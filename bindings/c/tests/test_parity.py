@@ -814,7 +814,12 @@ class ParityTester:
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def path(self, name: str) -> str:
+    def path(self, name: str, backend: Backend = None) -> str:
+        """Return a per-backend file path to avoid cross-contamination."""
+        stem = name.replace(".bson", "")
+        if backend:
+            safe = backend.name.replace(" ", "_").replace("(", "").replace(")", "")
+            return os.path.join(self.tmpdir, f"{stem}_{safe}.bson")
         return os.path.join(self.tmpdir, name)
 
     def run_on_all(self, name: str, scenario: Callable):
@@ -886,7 +891,7 @@ class ParityTester:
 # ---------------------------------------------------------------------------
 
 def scenario_basic_crud(bk: Backend, t: ParityTester):
-    path = t.path("basic_crud.bson")
+    path = t.path("basic_crud.bson", bk)
     bk.open(path, indexes=["email"])
     bk.insert({"_id": "a", "name": "Alice", "email": "a@test.com", "age": 30})
     bk.insert({"_id": "b", "name": "Bob", "email": "b@test.com", "age": 25})
@@ -926,39 +931,40 @@ def scenario_basic_crud(bk: Backend, t: ParityTester):
 
 
 def scenario_vector_search(bk: Backend, t: ParityTester):
-    path = t.path("vec_parity.bson")
+    path = t.path("vec_parity.bson", bk)
     bk.open(path, vector_indexes={"emb": 3})
     bk.insert({"_id": "a", "emb": [1.0, 0.0, 0.0]})
-    bk.insert({"_id": "b", "emb": [0.0, 1.0, 0.0]})
-    bk.insert({"_id": "c", "emb": [0.0, 0.0, 1.0]})
+    bk.insert({"_id": "b", "emb": [0.5, 0.5, 0.0]})  # cos sim ~0.71
+    bk.insert({"_id": "c", "emb": [0.0, 0.0, 1.0]})  # cos sim = 0.0
     results = bk.vector_search("emb", [1.0, 0.0, 0.0], 3)
     bk.close()
     return results
 
 
 def scenario_text_search(bk: Backend, t: ParityTester):
-    path = t.path("txt_parity.bson")
+    path = t.path("txt_parity.bson", bk)
     bk.open(path, text_indexes=["content"])
-    bk.insert({"_id": "1", "content": "machine learning"})
-    bk.insert({"_id": "2", "content": "deep learning"})
+    bk.insert({"_id": "1", "content": "machine learning is fascinating"})
+    bk.insert({"_id": "2", "content": "deep learning only"})
     bk.insert({"_id": "3", "content": "cooking"})
-    results = bk.text_search("content", "learning", 5)
+    results = bk.text_search("content", "machine learning", 5)
     bk.close()
     return results
 
 
 def scenario_hybrid_search(bk: Backend, t: ParityTester):
-    path = t.path("hy_parity.bson")
+    path = t.path("hy_parity.bson", bk)
     bk.open(path, text_indexes=["content"], vector_indexes={"emb": 2})
-    bk.insert({"_id": "a", "content": "ml", "emb": [1.0, 0.0]})
-    bk.insert({"_id": "b", "content": "dl", "emb": [0.0, 1.0]})
-    results = bk.hybrid_search("content", "emb", "ml", [1.0, 0.0], 2)
+    bk.insert({"_id": "a", "content": "machine learning", "emb": [1.0, 0.0]})
+    bk.insert({"_id": "b", "content": "deep learning", "emb": [0.0, 0.9]})
+    bk.insert({"_id": "c", "content": "cooking", "emb": [0.0, 0.0]})
+    results = bk.hybrid_search("content", "emb", "machine learning", [1.0, 0.0], 3)
     bk.close()
     return results
 
 
 def scenario_batch_atomicity(bk: Backend, t: ParityTester):
-    path = t.path("batch_parity.bson")
+    path = t.path("batch_parity.bson", bk)
     bk.open(path)
 
     # Batch commit
@@ -984,7 +990,7 @@ def scenario_batch_atomicity(bk: Backend, t: ParityTester):
 
 
 def scenario_compact_reclaim(bk: Backend, t: ParityTester):
-    path = t.path("compact_parity.bson")
+    path = t.path("compact_parity.bson", bk)
     bk.open(path)
     bk.insert_many([{"x": i} for i in range(10)])
     bk.delete_many({"x": {"$lt": 5}})
@@ -1000,7 +1006,7 @@ def scenario_compact_reclaim(bk: Backend, t: ParityTester):
 
 
 def scenario_filter_operators(bk: Backend, t: ParityTester):
-    path = t.path("filters.bson")
+    path = t.path("filters.bson", bk)
     bk.open(path, indexes=["age", "status"])
     bk.insert_many([
         {"_id": "1", "age": 20, "status": "a", "tags": ["x", "y"]},
@@ -1041,7 +1047,7 @@ def scenario_filter_operators(bk: Backend, t: ParityTester):
 
 
 def scenario_error_paths(bk: Backend, t: ParityTester):
-    path = t.path("errors.bson")
+    path = t.path("errors.bson", bk)
     bk.open(path)
 
     errors = {}
@@ -1143,19 +1149,19 @@ def main():
 
     try:
         # CRUD parity
-        tester.run_crud_parity("Basic CRUD parity", scenario_basic_crud)
+        tester.run_on_all("Basic CRUD parity", scenario_basic_crud)
 
         # Filter operators parity
-        tester.run_crud_parity("Filter operators parity", scenario_filter_operators)
+        tester.run_on_all("Filter operators parity", scenario_filter_operators)
 
         # Error paths parity
-        tester.run_crud_parity("Error paths parity", scenario_error_paths)
+        tester.run_on_all("Error paths parity", scenario_error_paths)
 
         # Batch parity
-        tester.run_crud_parity("Batch atomicity parity", scenario_batch_atomicity)
+        tester.run_on_all("Batch atomicity parity", scenario_batch_atomicity)
 
         # Compaction parity
-        tester.run_crud_parity("Compact reclaim parity", scenario_compact_reclaim)
+        tester.run_on_all("Compact reclaim parity", scenario_compact_reclaim)
 
         # Search parity
         tester.run_search_parity("Vector search parity", scenario_vector_search)
