@@ -171,6 +171,7 @@ collection.
 | `tests/test_c_api.c` | 73 C API tests |
 | `tests/test_cxx_api.cpp` | 42 C++ wrapper tests |
 | `tests/test_parity.py` | Python ↔ Rust ↔ C parity |
+| `example.c` | Runnable examples |
 
 ```c
 #include "moofile.h"
@@ -197,6 +198,12 @@ moofile_close(db, &err);
 ```bash
 cd bindings/c/tests
 ./run_tests.sh --release
+
+# The example builds standalone
+cd bindings/c
+gcc -std=c11 -D_POSIX_C_SOURCE=200809L -o example example.c \
+    -Iinclude -L../../target/release -lmoofile
+LD_LIBRARY_PATH=../../target/release ./example
 ```
 
 Needs gcc/g++ with C11 and C++17, and cmake ≥ 3.16. nlohmann/json is
@@ -520,6 +527,9 @@ CRUD, sorting and aggregation, vector search, text search, atomic batches, and
 autoembedding:
 
 ```bash
+cd bindings/c && gcc -std=c11 -D_POSIX_C_SOURCE=200809L -o example example.c \
+    -Iinclude -L../../target/release -lmoofile && \
+    LD_LIBRARY_PATH=../../target/release ./example
 node bindings/node/example.js
 cd bindings/go && go run ./example/
 cd bindings/java && ./build.sh example

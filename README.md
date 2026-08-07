@@ -233,6 +233,28 @@ moo2sqlite users.bson users.db --table people
 
 ---
 
+## Language Bindings
+
+MooFile is implemented in **Rust** with a **Python** binding (via PyO3). A **C shared library** (`libmoofile.so`) exposes the full API via `extern "C"` functions, and all other languages consume that:
+
+| Language | Approach | Directory | Tests |
+|----------|----------|-----------|:-----:|
+| **Python** | PyO3 native (or pure-Python fallback) | `bindings/python/` | 307 |
+| **C** | `extern "C"` from Rust core | `bindings/c/` | 73 |
+| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 42 |
+| **Node.js** | `koffi` FFI (pure JS, no native compile) | `bindings/node/` | 22 |
+| **Go** | cgo + C header | `bindings/go/` | 22 |
+| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 30 |
+| **C#** | P/Invoke + `DllImport` | `bindings/csharp/` | 30 |
+
+Plus 8 cross-backend parity scenarios comparing pure-Python, PyO3 and C.
+
+Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local GGUF embedding models) works transparently in all languages — the model loading and inference happen entirely inside the Rust core.
+
+See [`bindings/README.md`](bindings/README.md) for build instructions, usage examples, and test results for each language.
+
+---
+
 ## Development
 
 Setting up a machine from scratch — including the toolchains for all seven
@@ -274,13 +296,15 @@ moofile/
 │   └── csharp/              # C# via P/Invoke
 ├── moofile/                 # Python package
 │   ├── __init__.py          # Auto-detects Rust, falls back to Python
-│   ├── _rust_adapter.py     # Adapts NativeCollection → Collection API
+│   ├── _rust_adapter.py     # Adapts Rust NativeCollection → Python API
 │   ├── collection.py        # Pure-Python reference implementation
 │   ├── query.py, index.py, storage.py, ...
 │   └── cli/                 # moosh, moo2json, moo2mongo, moo2sqlite
 ├── tests/                   # Python test suite
 ├── tests-cross/             # Cross-implementation validation
-└── pyproject.toml
+├── docs/README.md           # Full Python API reference
+├── moofile-spec.md          # File format & architecture spec
+└── pyproject.toml           # Python package config
 ```
 
 ### Other languages

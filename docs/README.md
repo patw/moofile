@@ -953,6 +953,49 @@ All columns are stored as `TEXT`. The `_id` field becomes the `TEXT PRIMARY KEY`
 
 ---
 
+## Language Bindings
+
+MooFile's core is written in Rust. In addition to Python (via PyO3), the full API is
+exposed through a **C shared library** (`libmoofile.so` / `.dylib` / `.dll`) that
+all other languages consume via FFI. Every binding passes documents as **JSON strings**
+across the boundary.
+
+| Language | Approach | Directory | Tests | Example |
+|----------|----------|-----------|:-----:|:-------:|
+| **Python** | PyO3 native (or pure-Python) | `bindings/python/` | 307 | `examples/` |
+| **C** | `extern "C"` from Rust | `bindings/c/` | 73 | `example.c` |
+| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 42 | (inline) |
+| **Node.js** | `koffi` FFI (pure JS) | `bindings/node/` | 22 | `example.js` |
+| **Go** | cgo + C header | `bindings/go/` | 22 | `example/main.go` |
+| **Java** | Foreign Function & Memory API (JDK 22+) | `bindings/java/` | 30 | `Example.java` |
+| **C#** | P/Invoke | `bindings/csharp/` | 30 | `Moofile.Example/` |
+
+### Autoembedding across languages
+
+The autoembedding feature (local GGUF models for semantic search) works
+**transparently in all bindings** — the model loading and inference happen
+entirely inside the Rust core. The `auto_embed` config JSON is identical
+across all languages:
+
+```json
+{
+  "vector_indexes": {"embedding": 1024},
+  "auto_embed": {
+    "content": {
+      "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+      "target": "embedding",
+      "dims": 1024,
+      "precision": "int8"
+    }
+  }
+}
+```
+
+See [`bindings/README.md`](../bindings/README.md) for build instructions,
+usage examples, and test results for each language.
+
+---
+
 ## Examples
 
 See the [`examples/`](../examples/) directory:

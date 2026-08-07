@@ -45,5 +45,7 @@ target/
 bindings/java/build/
 bindings/csharp/**/bin/
 bindings/csharp/**/obj/
+bindings/csharp/**/*.user
 bindings/node/node_modules/
 bindings/c/tests/build/
+bindings/c/example
