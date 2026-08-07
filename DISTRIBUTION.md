@@ -27,8 +27,6 @@ itself, once, for every platform. Everything else layers on top.
 | Target | Runner | Artifact |
 |---|---|---|
 | linux-x86_64 | ubuntu-latest | `moofile-linux-x86_64.tar.gz` |
-| linux-aarch64 | ubuntu-24.04-arm | `moofile-linux-aarch64.tar.gz` |
-| macos-x86_64 | macos-13 | `moofile-macos-x86_64.tar.gz` |
 | macos-aarch64 | macos-14 | `moofile-macos-aarch64.tar.gz` |
 | windows-x86_64 | windows-latest | `moofile-windows-x86_64.zip` |
 
@@ -82,7 +80,7 @@ Python. "Idiomatic" is the goal, but not at any cost.
 | C / C++ | Release tarball + headers | **Done** | There is no registry convention for C. A tarball with `include/` and `lib/` *is* the idiom. |
 | Go | `go get` from the repo | **Done** | Module path fixed. Needing a system library is normal for cgo. |
 | C# | NuGet with `runtimes/<rid>/native/` | **Done** | `dotnet add package MooFile`. The SDK copies the matching native file into the consumer's output automatically. |
-| Node.js | npm | **Done** | `npm install moofile`. All five platform binaries ship in the package; no compile step, no postinstall download. |
+| Node.js | npm | **Done** | `npm install moofile`. All three currently built platform binaries ship in the package; no compile step, no postinstall download. |
 | Java | Maven Central | **Skip for now** | The only ecosystem where doing it properly is genuinely expensive: Sonatype namespace verification, GPG signing, and the staging-repository dance. Ship the jar as a release artifact and revisit if somebody asks. |
 
 ### Node sizing
