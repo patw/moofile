@@ -84,6 +84,15 @@ pub enum MooFileError {
     /// Network/download error.
     #[error("download error: {0}")]
     DownloadError(String),
+
+    /// Autoembedding was requested from a build compiled without the `embed`
+    /// feature.  The feature is on by default; it is only absent when the
+    /// crate was built with `--no-default-features`, which drops the
+    /// `llama-gguf` dependency and everything that runs a model.
+    #[error("autoembedding is not available: this build of moofile was \
+             compiled without the 'embed' feature (rebuild without \
+             --no-default-features to enable it)")]
+    EmbedDisabled,
 }
 
 /// Convenience: wrap a `std::io::Error` alongside the path that caused it.

@@ -60,8 +60,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace moofile {
@@ -180,6 +183,106 @@ struct Config {
         if (!model_cache_dir.empty()) j["model_cache_dir"] = model_cache_dir;
         return j.dump();
     }
+};
+
+/**
+ * Serialise a filter/document argument for the C layer.
+ *
+ * Brace-initialising an nlohmann `json` from a bare `{}` yields *null*, not an
+ * empty object, so the natural-looking `db.count({})` would otherwise be
+ * rejected by the C layer with "expected JSON object at top level".  Null and
+ * an empty array (the other thing `{}` can decay to) both mean "no
+ * constraints", so normalise them to an empty object.
+ */
+inline std::string dump_doc(const json& j) {
+    if (j.is_null()) return "{}";
+    if (j.is_array() && j.empty()) return "{}";
+    return j.dump();
+}
+
+// ---------------------------------------------------------------------------
+// Find options (sort / skip / limit / group / agg)
+// ---------------------------------------------------------------------------
+
+/**
+ * Query-builder options for Collection::find().
+ *
+ * Chainable, mirroring the Rust and Python query chains:
+ *
+ *     db.find({{"active", true}},
+ *             moofile::FindOptions().sort("age", true).limit(10));
+ *
+ * Stages apply in the order: filter → group/agg → sort → skip → limit.
+ */
+class FindOptions {
+public:
+    /** Sort by a field.  `desc` selects descending order. */
+    FindOptions& sort(const std::string& field, bool desc = false) {
+        sort_field_ = field;
+        sort_desc_ = desc;
+        return *this;
+    }
+
+    /** Skip the first `n` results. */
+    FindOptions& skip(int64_t n) { skip_ = n; return *this; }
+
+    /** Return at most `n` results. */
+    FindOptions& limit(int64_t n) { limit_ = n; return *this; }
+
+    /** Group by a field.  Combine with agg() to aggregate each group. */
+    FindOptions& group(const std::string& field) { group_ = field; return *this; }
+
+    /** Aggregate the number of documents per group. */
+    FindOptions& count() { return agg("count", ""); }
+
+    /** Aggregate a field per group: "sum", "mean", "min", "max",
+     *  "collect", "first", "last". */
+    FindOptions& agg(const std::string& func, const std::string& field) {
+        aggs_.emplace_back(func, field);
+        return *this;
+    }
+
+    FindOptions& sum(const std::string& f)     { return agg("sum", f); }
+    FindOptions& mean(const std::string& f)    { return agg("mean", f); }
+    FindOptions& min(const std::string& f)     { return agg("min", f); }
+    FindOptions& max(const std::string& f)     { return agg("max", f); }
+    FindOptions& collect(const std::string& f) { return agg("collect", f); }
+    FindOptions& first(const std::string& f)   { return agg("first", f); }
+    FindOptions& last(const std::string& f)    { return agg("last", f); }
+
+    std::string to_json() const {
+        json j = json::object();
+        if (!sort_field_.empty()) {
+            j["sort"] = json{{"field", sort_field_}, {"desc", sort_desc_}};
+        }
+        if (skip_ > 0) j["skip"] = skip_;
+        if (limit_ >= 0) j["limit"] = limit_;
+        if (!group_.empty()) j["group"] = group_;
+        if (!aggs_.empty()) {
+            json arr = json::array();
+            for (const auto& [func, field] : aggs_) {
+                json entry = json{{"func", func}};
+                if (!field.empty()) entry["field"] = field;
+                arr.push_back(entry);
+            }
+            j["agg"] = arr;
+        }
+        return j.dump();
+    }
+
+    /** True when nothing has been set — lets find() skip the extra call. */
+    bool empty() const {
+        return sort_field_.empty() && skip_ == 0 && limit_ < 0
+            && group_.empty() && aggs_.empty();
+    }
+
+private:
+    std::string sort_field_;
+    bool sort_desc_ = false;
+    int64_t skip_ = 0;
+    int64_t limit_ = -1;
+    std::string group_;
+    std::vector<std::pair<std::string, std::string>> aggs_;
 };
 
 // ---------------------------------------------------------------------------
@@ -370,15 +473,15 @@ public:
 
     /** Insert a single document. Returns the inserted doc (with _id). */
     json insert(const json& doc) {
-        return json::parse(exec([&] {
-            return moofile_insert(handle_, doc.dump().c_str(), &err);
+        return json::parse(exec([&](char** err) {
+            return moofile_insert(handle_, dump_doc(doc).c_str(), err);
         }));
     }
 
     /** Insert multiple documents. Returns the inserted docs (with _ids). */
     json insert_many(const json& docs) {
-        return json::parse(exec([&] {
-            return moofile_insert_many(handle_, docs.dump().c_str(), &err);
+        return json::parse(exec([&](char** err) {
+            return moofile_insert_many(handle_, dump_doc(docs).c_str(), err);
         }));
     }
 
@@ -389,7 +492,27 @@ public:
     /** Find documents matching a filter. Returns a Cursor. */
     Cursor find(const json& filter = json::object()) {
         char* err = nullptr;
-        auto* c = moofile_find(handle_, filter.dump().c_str(), &err);
+        auto* c = moofile_find(handle_, dump_doc(filter).c_str(), &err);
+        if (err) {
+            std::string msg(err);
+            moofile_free_string(err);
+            throw error(msg);
+        }
+        return Cursor(c);
+    }
+
+    /**
+     * Find with sort / skip / limit / group / agg.
+     *
+     *     auto docs = db.find({{"active", true}},
+     *                         FindOptions().sort("age", true).limit(10))
+     *                   .to_vector();
+     */
+    Cursor find(const json& filter, const FindOptions& options) {
+        auto options_json = options.to_json();
+        char* err = nullptr;
+        auto* c = moofile_find_ex(handle_, dump_doc(filter).c_str(),
+                                  options_json.c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -401,7 +524,7 @@ public:
     /** Find the first matching document, or nullopt. */
     std::optional<json> find_one(const json& filter = json::object()) {
         char* err = nullptr;
-        char* s = moofile_find_one(handle_, filter.dump().c_str(), &err);
+        char* s = moofile_find_one(handle_, dump_doc(filter).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -417,7 +540,7 @@ public:
     /** Count documents matching a filter. */
     int64_t count(const json& filter = json::object()) {
         char* err = nullptr;
-        int64_t n = moofile_count(handle_, filter.dump().c_str(), &err);
+        int64_t n = moofile_count(handle_, dump_doc(filter).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -429,7 +552,7 @@ public:
     /** Check if at least one document matches a filter. */
     bool exists(const json& filter) {
         char* err = nullptr;
-        int r = moofile_exists(handle_, filter.dump().c_str(), &err);
+        int r = moofile_exists(handle_, dump_doc(filter).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -463,8 +586,8 @@ public:
         if (!inc_values.empty()) update["inc"] = inc_values;
 
         char* err = nullptr;
-        int r = moofile_update_one(handle_, where.dump().c_str(),
-                                    update.dump().c_str(), &err);
+        int r = moofile_update_one(handle_, dump_doc(where).c_str(),
+                                    dump_doc(update).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -489,8 +612,8 @@ public:
         if (!inc_values.empty()) update["inc"] = inc_values;
 
         char* err = nullptr;
-        int64_t n = moofile_update_many(handle_, where.dump().c_str(),
-                                         update.dump().c_str(), &err);
+        int64_t n = moofile_update_many(handle_, dump_doc(where).c_str(),
+                                         dump_doc(update).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -505,8 +628,8 @@ public:
      */
     bool replace_one(const json& where, const json& replacement) {
         char* err = nullptr;
-        int r = moofile_replace_one(handle_, where.dump().c_str(),
-                                     replacement.dump().c_str(), &err);
+        int r = moofile_replace_one(handle_, dump_doc(where).c_str(),
+                                     dump_doc(replacement).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -522,7 +645,7 @@ public:
     /** Delete the first matching document. Returns true if deleted. */
     bool delete_one(const json& where) {
         char* err = nullptr;
-        int r = moofile_delete_one(handle_, where.dump().c_str(), &err);
+        int r = moofile_delete_one(handle_, dump_doc(where).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -534,7 +657,7 @@ public:
     /** Delete all matching documents. Returns the count deleted. */
     int64_t delete_many(const json& where) {
         char* err = nullptr;
-        int64_t n = moofile_delete_many(handle_, where.dump().c_str(), &err);
+        int64_t n = moofile_delete_many(handle_, dump_doc(where).c_str(), &err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);
@@ -557,7 +680,7 @@ public:
         json vec_json = query_vector;
         char* err = nullptr;
         auto* c = moofile_vector_search(
-            handle_, filter.dump().c_str(),
+            handle_, dump_doc(filter).c_str(),
             field.c_str(), vec_json.dump().c_str(),
             limit, &err
         );
@@ -582,7 +705,7 @@ public:
     ) {
         char* err = nullptr;
         auto* c = moofile_text_search(
-            handle_, filter.dump().c_str(),
+            handle_, dump_doc(filter).c_str(),
             field.c_str(), query.c_str(),
             limit, &err
         );
@@ -621,7 +744,7 @@ public:
             : json(query_vector).dump();
         char* err = nullptr;
         auto* c = moofile_hybrid_search(
-            handle_, filter.dump().c_str(),
+            handle_, dump_doc(filter).c_str(),
             text_field.c_str(), vector_field.c_str(),
             query_text.c_str(),
             vec_str.empty() ? nullptr : vec_str.c_str(),
@@ -659,7 +782,7 @@ public:
     ) {
         char* err = nullptr;
         auto* c = moofile_semantic_search(
-            handle_, filter.dump().c_str(),
+            handle_, dump_doc(filter).c_str(),
             source_field.c_str(), query_text.c_str(),
             limit, &err
         );
@@ -719,8 +842,8 @@ public:
 
     /** Get collection statistics. */
     json stats() {
-        return json::parse(exec([&] {
-            return moofile_stats(handle_, &err);
+        return json::parse(exec([&](char** err) {
+            return moofile_stats(handle_, err);
         }));
     }
 
@@ -758,11 +881,16 @@ private:
     MooFileCollection* handle_ = nullptr;
     std::string path_;
 
-    /** Helper: call a C function that returns a char*, handle errors. */
+    /**
+     * Helper: call a C function that returns an owned char*, translating an
+     * `err_out` message into an exception and freeing the result.
+     *
+     * `f` receives the `char**` to pass along as the call's err_out argument.
+     */
     template<typename F>
     std::string exec(F&& f) const {
         char* err = nullptr;
-        char* s = f();
+        char* s = f(&err);
         if (err) {
             std::string msg(err);
             moofile_free_string(err);

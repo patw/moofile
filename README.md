@@ -227,11 +227,18 @@ moo2sqlite users.bson users.db --table people
 
 - **[Specification](moofile-spec.md)** — file format, architecture, design decisions
 - **[API Reference](docs/README.md)** — complete Python API, filter operators, aggregation
+- **[Language Bindings](bindings/README.md)** — C, C++, Node.js, Go, Java, C#
+- **[Building & Testing](BUILDING.md)** — toolchain setup for every language
 - **[bench_native.py](bench_native.py)** — Python vs Rust head-to-head benchmark
 
 ---
 
 ## Development
+
+Setting up a machine from scratch — including the toolchains for all seven
+language bindings — is covered in **[BUILDING.md](BUILDING.md)**. Once
+installed, `./scripts/test-all.sh` runs every suite and prints a summary,
+skipping any language whose toolchain is absent.
 
 ```bash
 # Unit tests (PYTHONPATH=. so you test this checkout, not an installed copy)
@@ -258,8 +265,13 @@ moofile/
 ├── core/                    # Rust engine (cargo build)
 │   ├── src/{lib,storage,index,query,text,cache,embed,errors}.rs
 │   └── examples/bench.rs    # Pure-Rust benchmark
-├── bindings/python/         # PyO3 binding (maturin build)
-│   └── src/lib.rs
+├── bindings/                # Language bindings — see bindings/README.md
+│   ├── python/              # PyO3 binding (maturin build)
+│   ├── c/                   # C ABI (cdylib) + C++ header-only wrapper
+│   ├── node/                # Node.js via koffi
+│   ├── go/                  # Go via cgo
+│   ├── java/                # Java via the Foreign Function & Memory API
+│   └── csharp/              # C# via P/Invoke
 ├── moofile/                 # Python package
 │   ├── __init__.py          # Auto-detects Rust, falls back to Python
 │   ├── _rust_adapter.py     # Adapts NativeCollection → Collection API
@@ -270,6 +282,20 @@ moofile/
 ├── tests-cross/             # Cross-implementation validation
 └── pyproject.toml
 ```
+
+### Other languages
+
+Beyond Python, MooFile ships bindings for **C, C++, Node.js, Go, Java and
+C#**, all layered on one C ABI (`bindings/c`). They share the same file
+format, query language and semantics.
+
+```bash
+cargo build -p moofile-c --release   # build the shared library first
+```
+
+See [bindings/README.md](bindings/README.md) for per-language setup, usage,
+and the ABI contract (error conventions, ownership rules, no-match
+semantics).
 
 ---
 

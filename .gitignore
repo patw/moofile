@@ -40,3 +40,10 @@ target/
 
 # Compiled native extensions
 *.so
+
+# Binding build artifacts
+bindings/java/build/
+bindings/csharp/**/bin/
+bindings/csharp/**/obj/
+bindings/node/node_modules/
+bindings/c/tests/build/

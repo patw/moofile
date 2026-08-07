@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ---------------------------------------------------------------------------
@@ -364,9 +366,248 @@ static void test_find_comparison_ops(void) {
     cur = moofile_find(db, "{\"age\":{\"$gte\":25,\"$lte\":45}}", &err);
     count = 0;
     while ((doc = moofile_cursor_next(cur, &err)) != NULL) { count++; moofile_free_string(doc); }
-    ASSERT(count == 3); /* 30, 40, ... 25 <= age <= 45 */
+    ASSERT(count == 2); /* 30, 40 — of {20,30,40,50}, two fall in [25,45] */
     moofile_cursor_free(cur);
     
+    moofile_close(db, &err);
+}
+
+/* ---------------------------------------------------------------------------
+ * find_ex — sort / skip / limit / group / agg
+ * --------------------------------------------------------------------------- */
+
+/* Collect a cursor's documents into caller-supplied storage.  Returns the
+ * count, or -1 if the cursor is NULL. */
+static int drain_cursor(MooFileCursor* cur, char** out, int max) {
+    if (!cur) return -1;
+    char* err = NULL;
+    int n = 0;
+    char* doc;
+    while (n < max && (doc = moofile_cursor_next(cur, &err)) != NULL) {
+        out[n++] = doc;
+    }
+    moofile_cursor_free(cur);
+    return n;
+}
+
+static void free_docs(char** docs, int n) {
+    for (int i = 0; i < n; i++) moofile_free_string(docs[i]);
+}
+
+static MooFileCollection* open_sortable(const char* name, char** err) {
+    MooFileCollection* db = moofile_open(make_path(name), NULL, err);
+    if (!db) return NULL;
+    moofile_insert_many(db,
+        "[{\"_id\":\"a\",\"age\":30,\"dept\":\"eng\",\"pay\":100},"
+        " {\"_id\":\"b\",\"age\":20,\"dept\":\"eng\",\"pay\":200},"
+        " {\"_id\":\"c\",\"age\":50,\"dept\":\"ops\",\"pay\":300},"
+        " {\"_id\":\"d\",\"age\":40,\"dept\":\"ops\",\"pay\":400}]", err);
+    return db;
+}
+
+static void test_find_ex_null_options(void) {
+    TEST("find_ex with NULL options behaves like find");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_null.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(moofile_find_ex(db, "{}", NULL, &err), docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 4);
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_sort_ascending(void) {
+    TEST("find_ex sorts ascending");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_asc.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(moofile_find_ex(db, "{}", "{\"sort\":\"age\"}", &err), docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 4);
+    /* b(20), a(30), d(40), c(50) */
+    ASSERT(json_has_key(docs[0], "age"));
+    ASSERT(strstr(docs[0], "\"_id\":\"b\"") != NULL);
+    ASSERT(strstr(docs[3], "\"_id\":\"c\"") != NULL);
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_sort_descending(void) {
+    TEST("find_ex sorts descending");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_desc.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(
+        moofile_find_ex(db, "{}", "{\"sort\":{\"field\":\"age\",\"desc\":true}}", &err),
+        docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 4);
+    ASSERT(strstr(docs[0], "\"_id\":\"c\"") != NULL);
+    ASSERT(strstr(docs[3], "\"_id\":\"b\"") != NULL);
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_limit_and_skip(void) {
+    TEST("find_ex applies skip then limit after sort");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_page.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(
+        moofile_find_ex(db, "{}", "{\"sort\":\"age\",\"skip\":1,\"limit\":2}", &err),
+        docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 2);
+    /* ordered b,a,d,c — skip 1, take 2 → a(30), d(40) */
+    ASSERT(strstr(docs[0], "\"_id\":\"a\"") != NULL);
+    ASSERT(strstr(docs[1], "\"_id\":\"d\"") != NULL);
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_limit_with_filter(void) {
+    TEST("find_ex combines a filter with limit");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_filt.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(
+        moofile_find_ex(db, "{\"dept\":\"ops\"}", "{\"sort\":\"age\",\"limit\":1}", &err),
+        docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 1);
+    ASSERT(strstr(docs[0], "\"_id\":\"d\"") != NULL); /* ops: d(40), c(50) */
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_group_count(void) {
+    TEST("find_ex groups with a count aggregate");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_group.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(
+        moofile_find_ex(db, "{}",
+            "{\"group\":\"dept\",\"agg\":[{\"func\":\"count\"}],\"sort\":\"dept\"}",
+            &err),
+        docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 2); /* eng, ops */
+    ASSERT(strstr(docs[0], "\"dept\":\"eng\"") != NULL);
+    ASSERT(strstr(docs[0], "\"count\":2") != NULL);
+    ASSERT(strstr(docs[1], "\"dept\":\"ops\"") != NULL);
+    ASSERT(strstr(docs[1], "\"count\":2") != NULL);
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_group_sum_and_mean(void) {
+    TEST("find_ex aggregates sum and mean per group");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_agg.bson", &err);
+    ASSERT(db != NULL);
+
+    char* docs[8];
+    int n = drain_cursor(
+        moofile_find_ex(db, "{}",
+            "{\"group\":\"dept\","
+            " \"agg\":[{\"func\":\"sum\",\"field\":\"pay\"},"
+            "         {\"func\":\"mean\",\"field\":\"pay\"}],"
+            " \"sort\":\"dept\"}",
+            &err),
+        docs, 8);
+    ASSERT(err == NULL);
+    ASSERT(n == 2);
+    ASSERT(json_has_key(docs[0], "sum_pay"));   /* eng: 100 + 200 */
+    ASSERT(json_has_key(docs[0], "mean_pay"));
+    ASSERT(strstr(docs[0], "\"sum_pay\":300") != NULL);
+    ASSERT(strstr(docs[1], "\"sum_pay\":700") != NULL); /* ops: 300 + 400 */
+    free_docs(docs, n);
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_rejects_unknown_option(void) {
+    /* A typo must not silently degrade to "return everything". */
+    TEST("find_ex rejects an unknown option key");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_badopt.bson", &err);
+    ASSERT(db != NULL);
+
+    MooFileCursor* cur = moofile_find_ex(db, "{}", "{\"limt\":2}", &err);
+    ASSERT(cur == NULL);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "unknown find option") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_rejects_unknown_agg(void) {
+    TEST("find_ex rejects an unknown agg function");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_badagg.bson", &err);
+    ASSERT(db != NULL);
+
+    MooFileCursor* cur = moofile_find_ex(db, "{}",
+        "{\"group\":\"dept\",\"agg\":[{\"func\":\"median\",\"field\":\"pay\"}]}", &err);
+    ASSERT(cur == NULL);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "unknown agg func") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_agg_requires_field(void) {
+    TEST("find_ex rejects a field-less sum aggregate");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_nofield.bson", &err);
+    ASSERT(db != NULL);
+
+    MooFileCursor* cur = moofile_find_ex(db, "{}",
+        "{\"group\":\"dept\",\"agg\":[{\"func\":\"sum\"}]}", &err);
+    ASSERT(cur == NULL);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "requires a 'field'") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
+    moofile_close(db, &err);
+}
+
+static void test_find_ex_malformed_options(void) {
+    TEST("find_ex rejects malformed options JSON");
+    char* err = NULL;
+    MooFileCollection* db = open_sortable("fx_badjson.bson", &err);
+    ASSERT(db != NULL);
+
+    MooFileCursor* cur = moofile_find_ex(db, "{}", "{not json", &err);
+    ASSERT(cur == NULL);
+    ASSERT(err != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
     moofile_close(db, &err);
 }
 
@@ -641,15 +882,20 @@ static void test_update_one_inc(void) {
 }
 
 static void test_update_one_no_match(void) {
-    TEST("update_one with no match returns 0");
+    /* Matching nothing is an error, not a no-op — same as the Rust and
+     * Python APIs, which raise DocumentNotFound. */
+    TEST("update_one with no match errors");
     char* err = NULL;
     MooFileCollection* db = moofile_open(make_path("up_nomatch.bson"), NULL, &err);
     ASSERT(db != NULL);
-    
+
     int r = moofile_update_one(db, "{\"x\":99}", "{\"set\":{\"x\":1}}", &err);
-    ASSERT(r == 0);
-    ASSERT(err == NULL);
-    
+    ASSERT(r == -1);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "no document matches") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
     moofile_close(db, &err);
 }
 
@@ -703,15 +949,18 @@ static void test_replace_one(void) {
 }
 
 static void test_replace_one_no_match(void) {
-    TEST("replace_one with no match returns 0");
+    TEST("replace_one with no match errors");
     char* err = NULL;
     MooFileCollection* db = moofile_open(make_path("rep_nomatch.bson"), NULL, &err);
     ASSERT(db != NULL);
-    
+
     int r = moofile_replace_one(db, "{\"_id\":\"nonexistent\"}", "{\"v\":1}", &err);
-    ASSERT(r == 0);
-    ASSERT(err == NULL);
-    
+    ASSERT(r == -1);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "no document matches") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+
     moofile_close(db, &err);
 }
 
@@ -1032,8 +1281,10 @@ static void test_compact(void) {
     moofile_insert_many(db, "[{\"x\":1},{\"x\":2}]", &err);
     moofile_delete_one(db, "{\"x\":1}", &err);
     
+    /* One delete leaves two dead records: the superseded original plus the
+     * tombstone that marks it deleted. */
     char* before = moofile_stats(db, &err);
-    ASSERT(strstr(before, "\"dead_records\":1") != NULL);
+    ASSERT(strstr(before, "\"dead_records\":2") != NULL);
     moofile_free_string(before);
     
     ASSERT(moofile_compact(db, &err) == 0);
@@ -1215,6 +1466,20 @@ int main(void) {
     test_find_with_filter();
     test_find_comparison_ops();
     test_find_in_nin();
+
+    /* find_ex — query builder */
+    test_find_ex_null_options();
+    test_find_ex_sort_ascending();
+    test_find_ex_sort_descending();
+    test_find_ex_limit_and_skip();
+    test_find_ex_limit_with_filter();
+    test_find_ex_group_count();
+    test_find_ex_group_sum_and_mean();
+    test_find_ex_rejects_unknown_option();
+    test_find_ex_rejects_unknown_agg();
+    test_find_ex_agg_requires_field();
+    test_find_ex_malformed_options();
+
     test_find_logical_ops();
     test_find_exists();
     test_find_no_matches();

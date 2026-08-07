@@ -1,8 +1,15 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>Moofile</RootNamespace>
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Self-evident accessors do not need XML docs. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- The binding is a library; the test/example entry points live in
+         sibling projects so this one has no Main. -->
+    <OutputType>Library</OutputType>
   </PropertyGroup>
 </Project>

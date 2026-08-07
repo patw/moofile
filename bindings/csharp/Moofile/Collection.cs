@@ -1,283 +1,37 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Moofile;
 
 /// <summary>
-/// MooFile — lightweight embedded document store.
-///
-/// C# binding using P/Invoke to call libmoofile.so / moofile.dll.
-///
-/// Usage:
-///   using Moofile;
-///
-///   var db = Collection.Open("data.bson", new Config {
-///       Indexes = new[] { "email" }
-///   });
-///
-///   db.Insert(new Document { ["name"] = "Alice" });
-///   var results = db.Find(new Document { ["age"] = new Document { ["$gt"] = 25 } });
-///   db.Close();
+/// A handle to an open MooFile collection.
 /// </summary>
-
-// ---------------------------------------------------------------------------
-// Native methods (P/Invoke)
-// ---------------------------------------------------------------------------
-
-internal static class Native
-{
-    private const string LibName = "moofile";
-
-    // Lifecycle
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_open(string path, string configJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_close(IntPtr handle, out IntPtr errOut);
-
-    // Insert
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_insert(IntPtr handle, string docJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_insert_many(IntPtr handle, string docsJson, out IntPtr errOut);
-
-    // Query
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_find(IntPtr handle, string filterJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_find_one(IntPtr handle, string filterJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern long moofile_count(IntPtr handle, string filterJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_exists(IntPtr handle, string filterJson, out IntPtr errOut);
-
-    // Cursor
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_cursor_next(IntPtr cursor, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void moofile_cursor_free(IntPtr cursor);
-
-    // Update
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_update_one(IntPtr handle, string whereJson, string updateJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern long moofile_update_many(IntPtr handle, string whereJson, string updateJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_replace_one(IntPtr handle, string whereJson, string replJson, out IntPtr errOut);
-
-    // Delete
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_delete_one(IntPtr handle, string whereJson, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern long moofile_delete_many(IntPtr handle, string whereJson, out IntPtr errOut);
-
-    // Search
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_vector_search(IntPtr handle, string filterJson, string field, string vecJson, int limit, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_text_search(IntPtr handle, string filterJson, string field, string query, int limit, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_hybrid_search(IntPtr handle, string filterJson, string tf, string vf, string qt, string qv, int limit, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_semantic_search(IntPtr handle, string filterJson, string field, string query, int limit, out IntPtr errOut);
-
-    // Search cursor
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_search_cursor_next(IntPtr cursor, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void moofile_search_cursor_free(IntPtr cursor);
-
-    // Batch
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_batch_begin(IntPtr handle, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_batch_commit(IntPtr handle, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_batch_rollback(IntPtr handle, out IntPtr errOut);
-
-    // Utility
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern IntPtr moofile_stats(IntPtr handle, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_compact(IntPtr handle, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_sync(IntPtr handle, out IntPtr errOut);
-
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern int moofile_reindex(IntPtr handle, out IntPtr errOut);
-
-    // Memory
-    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-    internal static extern void moofile_free_string(IntPtr s);
-
-    // Library load helper
-    internal static void EnsureLoaded()
-    {
-        // P/Invoke resolves automatically through NuGet runtimes/ folder.
-        // If not found, try the default build path.
-        try
-        {
-            // Force load check
-            moofile_open("", "{}", out _);
-        }
-        catch (DllNotFoundException)
-        {
-            var candidates = new[]
-            {
-                "../target/release/libmoofile.so",
-                "../target/debug/libmoofile.so",
-                "../../target/release/libmoofile.so",
-            };
-            foreach (var c in candidates)
-            {
-                var full = Path.GetFullPath(c);
-                if (File.Exists(full))
-                {
-                    NativeLibrary.Load(full);
-                    return;
-                }
-            }
-            throw;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-/// <summary>Configuration for a single auto-embedding source field.</summary>
-public class AutoEmbedConfig
-{
-    public string Model { get; set; } = "";
-    public string Target { get; set; } = "";
-    public int Dims { get; set; } = 1024;
-    public string Precision { get; set; } = "int8";
-    public bool Normalize { get; set; } = true;
-    public string QueryPrefix { get; set; } = "Represent the query for retrieving supporting documents: ";
-    public string DocPrefix { get; set; } = "Represent the document for retrieval: ";
-}
-
-/// <summary>Configuration for opening a MooFile collection.</summary>
-public class Config
-{
-    public string[]? Indexes { get; set; }
-    public Dictionary<string, int>? VectorIndexes { get; set; }
-    public string[]? TextIndexes { get; set; }
-    public Dictionary<string, AutoEmbedConfig>? AutoEmbed { get; set; }
-    public bool Readonly { get; set; }
-    public string Durability { get; set; } = "os";
-    public string? ModelCacheDir { get; set; }
-
-    internal string ToJson()
-    {
-        var obj = new Dictionary<string, object>();
-        if (Indexes is { Length: > 0 }) obj["indexes"] = Indexes;
-        if (VectorIndexes is { Count: > 0 }) obj["vector_indexes"] = VectorIndexes;
-        if (TextIndexes is { Length: > 0 }) obj["text_indexes"] = TextIndexes;
-        if (AutoEmbed is { Count: > 0 })
-        {
-            var ae = new Dictionary<string, object>();
-            foreach (var (k, v) in AutoEmbed)
-            {
-                ae[k] = new Dictionary<string, object>
-                {
-                    ["model"] = v.Model,
-                    ["target"] = v.Target,
-                    ["dims"] = v.Dims,
-                    ["precision"] = v.Precision,
-                    ["normalize"] = v.Normalize,
-                    ["query_prefix"] = v.QueryPrefix,
-                    ["doc_prefix"] = v.DocPrefix,
-                };
-            }
-            obj["auto_embed"] = ae;
-        }
-        if (Readonly) obj["readonly"] = true;
-        obj["durability"] = Durability;
-        if (ModelCacheDir != null) obj["model_cache_dir"] = ModelCacheDir;
-        return JsonSerializer.Serialize(obj);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Document (JSON wrapper)
-// ---------------------------------------------------------------------------
-
-/// <summary>A BSON document, exposed as a dictionary with JSON serialization.</summary>
-public class Document : Dictionary<string, object?>
-{
-    public Document() { }
-    public Document(IDictionary<string, object?> d) : base(d) { }
-
-    public string ToJson() => JsonSerializer.Serialize(this, JsonOptions);
-    public static Document Parse(string json) => JsonSerializer.Deserialize<Document>(json, JsonOptions) ?? new();
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = false,
-    };
-}
-
-// ---------------------------------------------------------------------------
-// SearchResult
-// ---------------------------------------------------------------------------
-
-/// <summary>A search result containing a document and a similarity score.</summary>
-public class SearchResult
-{
-    public Document Doc { get; init; } = new();
-    public double Score { get; init; }
-}
-
-// ---------------------------------------------------------------------------
-// Collection
-// ---------------------------------------------------------------------------
-
-/// <summary>
-/// RAII wrapper for a MooFile collection handle.  Implements IDisposable.
-/// </summary>
-public class Collection : IDisposable
+/// <remarks>
+/// Requires the libmoofile shared library:
+/// <code>cargo build -p moofile-c --release</code>
+///
+/// <code>
+/// using var db = Collection.Open("data.bson", new Config {
+///     Indexes = new[] { "email" },
+/// });
+///
+/// db.Insert(Document.Of("name", "Alice", "email", "a@example.com", "age", 30));
+///
+/// foreach (var doc in db.Find(Document.Of("age", Document.Of("$gt", 25))))
+///     Console.WriteLine(doc);
+///
+/// var oldest = db.Find(null, FindOptions.Create().Sort("age", desc: true).Limit(10));
+/// </code>
+///
+/// Thread-safe: every method locks the handle, on top of the cross-process
+/// locking the Rust core already does.
+/// </remarks>
+public sealed class Collection : IDisposable
 {
     private IntPtr _handle;
     private readonly string _path;
-    private bool _disposed;
-
-    static Collection()
-    {
-        Native.EnsureLoaded();
-    }
-
-    /// <summary>Open a MooFile collection.</summary>
-    public static Collection Open(string path, Config? config = null)
-    {
-        var cfgJson = config?.ToJson() ?? "{}";
-        var handle = Native.moofile_open(path, cfgJson, out var err);
-        CheckError(err);
-        if (handle == IntPtr.Zero)
-            throw new InvalidOperationException("moofile_open returned null");
-        return new Collection(handle, path);
-    }
+    private readonly object _lock = new();
 
     private Collection(IntPtr handle, string path)
     {
@@ -285,307 +39,518 @@ public class Collection : IDisposable
         _path = path;
     }
 
+    // -----------------------------------------------------------------
+    // Open / dispose
+    // -----------------------------------------------------------------
+
+    /// <summary>Open a collection, creating the file if it does not exist.</summary>
+    public static Collection Open(string path, Config? config = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        Native.EnsureLoaded();
+
+        var handle = Native.moofile_open(path, config?.ToJson() ?? "{}", out var err);
+        Native.ThrowIfError(err);
+        if (handle == IntPtr.Zero)
+            throw new MooFileException($"failed to open collection: {path}");
+
+        return new Collection(handle, path);
+    }
+
+    /// <summary>The file this collection was opened from.</summary>
+    public string Path => _path;
+
+    /// <summary>Close the collection. Idempotent.</summary>
     public void Dispose()
     {
-        if (!_disposed && _handle != IntPtr.Zero)
+        lock (_lock)
         {
-            Native.moofile_close(_handle, out _);
+            if (_handle == IntPtr.Zero) return;
+            var handle = _handle;
             _handle = IntPtr.Zero;
-            _disposed = true;
+            Native.moofile_close(handle, out var err);
+            Native.ThrowIfError(err);
         }
         GC.SuppressFinalize(this);
     }
 
-    ~Collection() => Dispose();
+    /// <summary>Backstop for callers who forget Dispose.</summary>
+    ~Collection()
+    {
+        if (_handle == IntPtr.Zero) return;
+        // Don't surface errors from the finalizer thread — nobody can act on them.
+        Native.moofile_close(_handle, out var err);
+        if (err != IntPtr.Zero) Native.moofile_free_string(err);
+        _handle = IntPtr.Zero;
+    }
 
-    // ----------------------------------------------------------
+    private IntPtr Handle =>
+        _handle != IntPtr.Zero ? _handle : throw new ObjectDisposedException(nameof(Collection));
+
+    // -----------------------------------------------------------------
     // Insert
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
+    /// <summary>Insert one document; returns it with <c>_id</c> populated.</summary>
     public Document Insert(Document doc)
     {
-        var result = CallStr(h => Native.moofile_insert(h, doc.ToJson(), out _));
-        return result != null ? Document.Parse(result) : doc;
-    }
-
-    public List<Document> InsertMany(List<Document> docs)
-    {
-        var json = "[" + string.Join(",", docs.ConvertAll(d => d.ToJson())) + "]";
-        var result = CallStr(h => Native.moofile_insert_many(h, json, out _));
-        if (result == null) return docs;
-        return Document.Parse(result).Select(kvp => new Document { ["value"] = kvp.Value }).ToList()
-            ?? docs;
-    }
-
-    // ----------------------------------------------------------
-    // Query
-    // ----------------------------------------------------------
-
-    public List<Document> Find(Document? filter = null)
-    {
-        var cursor = CallPtr(h => Native.moofile_find(h, (filter ?? new()).ToJson(), out _));
-        if (cursor == IntPtr.Zero) return new();
-
-        var docs = new List<Document>();
-        while (true)
+        ArgumentNullException.ThrowIfNull(doc);
+        lock (_lock)
         {
-            var s = CallStrPtr(cursor, Native.moofile_cursor_next);
-            if (s == null) break;
-            docs.Add(Document.Parse(s));
+            var raw = Native.moofile_insert(Handle, doc.ToJson(), out var err);
+            Native.ThrowIfError(err);
+            var json = Native.TakeString(raw)
+                ?? throw new MooFileException("insert returned no document");
+            return Document.Parse(json);
         }
-        Native.moofile_cursor_free(cursor);
+    }
+
+    /// <summary>Insert several documents; returns them with <c>_id</c>s populated.</summary>
+    public List<Document> InsertMany(IEnumerable<Document> docs)
+    {
+        ArgumentNullException.ThrowIfNull(docs);
+
+        var arr = new JsonArray();
+        foreach (var d in docs) arr.Add(Document.ToNode(d));
+
+        lock (_lock)
+        {
+            var raw = Native.moofile_insert_many(Handle, arr.ToJsonString(), out var err);
+            Native.ThrowIfError(err);
+            var json = Native.TakeString(raw)
+                ?? throw new MooFileException("insertMany returned no documents");
+            return ParseDocumentArray(json);
+        }
+    }
+
+    private static List<Document> ParseDocumentArray(string json)
+    {
+        if (JsonNode.Parse(json) is not JsonArray arr)
+            throw new MooFileException("expected a JSON array of documents");
+
+        var docs = new List<Document>(arr.Count);
+        foreach (var node in arr)
+        {
+            if (Document.FromNode(node) is Document d) docs.Add(d);
+            else throw new MooFileException("expected an object in the result array");
+        }
         return docs;
     }
 
+    // -----------------------------------------------------------------
+    // Query
+    // -----------------------------------------------------------------
+
+    /// <summary>
+    /// Find documents matching a filter, optionally sorted, paged, or grouped.
+    /// </summary>
+    /// <param name="filter">Match filter, or null for everything.</param>
+    /// <param name="options">Query-builder stages, or null for none.</param>
+    public List<Document> Find(Document? filter = null, FindOptions? options = null)
+    {
+        var filterJson = filter?.ToJson() ?? "{}";
+
+        lock (_lock)
+        {
+            IntPtr cursor;
+            IntPtr err;
+            if (options is null || options.IsEmpty)
+            {
+                cursor = Native.moofile_find(Handle, filterJson, out err);
+            }
+            else
+            {
+                cursor = Native.moofile_find_ex(Handle, filterJson, options.ToJson(), out err);
+            }
+            Native.ThrowIfError(err);
+            if (cursor == IntPtr.Zero)
+                throw new MooFileException("find returned a null cursor");
+
+            return DrainCursor(cursor);
+        }
+    }
+
+    /// <summary>Consume a cursor, freeing it even if decoding throws.</summary>
+    private static List<Document> DrainCursor(IntPtr cursor)
+    {
+        var docs = new List<Document>();
+        try
+        {
+            while (true)
+            {
+                var raw = Native.moofile_cursor_next(cursor, out var err);
+                Native.ThrowIfError(err);
+                var json = Native.TakeString(raw);
+                if (json is null) break;
+                docs.Add(Document.Parse(json));
+            }
+        }
+        finally
+        {
+            Native.moofile_cursor_free(cursor);
+        }
+        return docs;
+    }
+
+    /// <summary>The first matching document, or null if there is none.</summary>
     public Document? FindOne(Document? filter = null)
     {
-        var result = CallStr(h => Native.moofile_find_one(h, (filter ?? new()).ToJson(), out _));
-        return result != null ? Document.Parse(result) : null;
+        lock (_lock)
+        {
+            var raw = Native.moofile_find_one(Handle, filter?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            var json = Native.TakeString(raw);
+            return json is null ? null : Document.Parse(json);
+        }
     }
 
+    /// <summary>Number of documents matching the filter; null counts everything.</summary>
     public long Count(Document? filter = null)
     {
-        return CallLong(h => Native.moofile_count(h, (filter ?? new()).ToJson(), out _));
+        lock (_lock)
+        {
+            var n = Native.moofile_count(Handle, filter?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            return n;
+        }
     }
 
+    /// <summary>True if at least one document matches.</summary>
     public bool Exists(Document filter)
     {
-        return CallInt(h => Native.moofile_exists(h, filter.ToJson(), out _)) == 1;
+        lock (_lock)
+        {
+            var r = Native.moofile_exists(Handle, filter?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            return r == 1;
+        }
     }
 
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
     // Update
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
-    public bool UpdateOne(Document where, Document? setValues = null,
-                          List<string>? unsetFields = null, Document? incValues = null)
+    /// <summary>Assemble the {set, unset, inc} blob the C layer expects.</summary>
+    private static string BuildUpdate(Document? set, IEnumerable<string>? unset, Document? inc)
     {
-        var update = new Document();
-        if (setValues is { Count: > 0 }) update["set"] = setValues;
-        if (unsetFields is { Count: > 0 }) update["unset"] = unsetFields;
-        if (incValues is { Count: > 0 }) update["inc"] = incValues;
-        return CallInt(h => Native.moofile_update_one(h, where.ToJson(), update.ToJson(), out _)) == 1;
+        var update = new JsonObject();
+        if (set is { Count: > 0 }) update["set"] = Document.ToNode(set);
+        if (unset is not null)
+        {
+            var arr = new JsonArray();
+            foreach (var f in unset) arr.Add(f);
+            if (arr.Count > 0) update["unset"] = arr;
+        }
+        if (inc is { Count: > 0 }) update["inc"] = Document.ToNode(inc);
+        return update.ToJsonString();
     }
 
-    public long UpdateMany(Document where, Document? setValues = null,
-                           List<string>? unsetFields = null, Document? incValues = null)
+    /// <summary>
+    /// Update the first matching document.
+    /// </summary>
+    /// <exception cref="MooFileException">
+    /// Thrown when nothing matches — the same contract as the Rust and Python
+    /// APIs. Call <see cref="Exists"/> first when a miss is expected.
+    /// </exception>
+    public bool UpdateOne(Document where, Document? set = null,
+                          IEnumerable<string>? unset = null, Document? inc = null)
     {
-        var update = new Document();
-        if (setValues is { Count: > 0 }) update["set"] = setValues;
-        if (unsetFields is { Count: > 0 }) update["unset"] = unsetFields;
-        if (incValues is { Count: > 0 }) update["inc"] = incValues;
-        return CallLong(h => Native.moofile_update_many(h, where.ToJson(), update.ToJson(), out _));
+        lock (_lock)
+        {
+            var r = Native.moofile_update_one(Handle, where?.ToJson() ?? "{}",
+                BuildUpdate(set, unset, inc), out var err);
+            Native.ThrowIfError(err);
+            return r == 1;
+        }
     }
 
+    /// <summary>
+    /// Update every matching document and return the count. Unlike
+    /// <see cref="UpdateOne"/>, matching nothing is not an error — it returns 0.
+    /// </summary>
+    public long UpdateMany(Document where, Document? set = null,
+                           IEnumerable<string>? unset = null, Document? inc = null)
+    {
+        lock (_lock)
+        {
+            var n = Native.moofile_update_many(Handle, where?.ToJson() ?? "{}",
+                BuildUpdate(set, unset, inc), out var err);
+            Native.ThrowIfError(err);
+            return n;
+        }
+    }
+
+    /// <summary>
+    /// Replace the first matching document, keeping its <c>_id</c>.
+    /// </summary>
+    /// <exception cref="MooFileException">Thrown when nothing matches.</exception>
     public bool ReplaceOne(Document where, Document replacement)
     {
-        return CallInt(h => Native.moofile_replace_one(h, where.ToJson(), replacement.ToJson(), out _)) == 1;
+        lock (_lock)
+        {
+            var r = Native.moofile_replace_one(Handle, where?.ToJson() ?? "{}",
+                replacement?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            return r == 1;
+        }
     }
 
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
     // Delete
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
+    /// <summary>
+    /// Delete the first matching document. Returns false when nothing
+    /// matched — unlike <see cref="UpdateOne"/>, that is not an error.
+    /// </summary>
     public bool DeleteOne(Document where)
     {
-        return CallInt(h => Native.moofile_delete_one(h, where.ToJson(), out _)) == 1;
+        lock (_lock)
+        {
+            var r = Native.moofile_delete_one(Handle, where?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            return r == 1;
+        }
     }
 
+    /// <summary>Delete every matching document and return the count.</summary>
     public long DeleteMany(Document where)
     {
-        return CallLong(h => Native.moofile_delete_many(h, where.ToJson(), out _));
+        lock (_lock)
+        {
+            var n = Native.moofile_delete_many(Handle, where?.ToJson() ?? "{}", out var err);
+            Native.ThrowIfError(err);
+            return n;
+        }
     }
 
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
     // Search
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
-    public List<SearchResult> VectorSearch(string field, List<double> queryVector,
+    private static string VectorJson(IEnumerable<double> v)
+    {
+        var arr = new JsonArray();
+        foreach (var x in v) arr.Add(x);
+        return arr.ToJsonString();
+    }
+
+    /// <summary>Cosine-similarity search over a vector field.</summary>
+    public List<SearchResult> VectorSearch(string field, IEnumerable<double> queryVector,
                                            int limit = 10, Document? filter = null)
     {
-        var vecJson = JsonSerializer.Serialize(queryVector);
-        var cursor = CallPtr(h => Native.moofile_vector_search(h,
-            (filter ?? new()).ToJson(), field, vecJson, limit, out _));
-        return DrainSearchCursor(cursor);
+        lock (_lock)
+        {
+            var cursor = Native.moofile_vector_search(Handle, filter?.ToJson() ?? "{}",
+                field, VectorJson(queryVector), limit, out var err);
+            Native.ThrowIfError(err);
+            return DrainSearchCursor(cursor);
+        }
     }
 
+    /// <summary>BM25 full-text search over a text field.</summary>
     public List<SearchResult> TextSearch(string field, string query,
                                          int limit = 10, Document? filter = null)
     {
-        var cursor = CallPtr(h => Native.moofile_text_search(h,
-            (filter ?? new()).ToJson(), field, query, limit, out _));
-        return DrainSearchCursor(cursor);
+        lock (_lock)
+        {
+            var cursor = Native.moofile_text_search(Handle, filter?.ToJson() ?? "{}",
+                field, query, limit, out var err);
+            Native.ThrowIfError(err);
+            return DrainSearchCursor(cursor);
+        }
     }
 
+    /// <summary>
+    /// Hybrid BM25 + vector search fused with Reciprocal Rank Fusion.
+    /// Pass a null <paramref name="queryVector"/> to auto-embed the query text.
+    /// </summary>
     public List<SearchResult> HybridSearch(string textField, string vectorField,
-                                           string queryText, List<double>? queryVector = null,
+                                           string queryText, IEnumerable<double>? queryVector = null,
                                            int limit = 10, Document? filter = null)
     {
-        var qvJson = queryVector != null ? JsonSerializer.Serialize(queryVector) : null;
-        var cursor = CallPtr(h => Native.moofile_hybrid_search(h,
-            (filter ?? new()).ToJson(), textField, vectorField, queryText, qvJson, limit, out _));
-        return DrainSearchCursor(cursor);
+        lock (_lock)
+        {
+            var cursor = Native.moofile_hybrid_search(Handle, filter?.ToJson() ?? "{}",
+                textField, vectorField, queryText,
+                queryVector is null ? null : VectorJson(queryVector),
+                limit, out var err);
+            Native.ThrowIfError(err);
+            return DrainSearchCursor(cursor);
+        }
     }
 
+    /// <summary>
+    /// Semantic search — auto-embeds <paramref name="queryText"/> with the
+    /// model configured for <paramref name="sourceField"/> via
+    /// <see cref="Config.AutoEmbed"/>.
+    /// </summary>
     public List<SearchResult> Semantic(string sourceField, string queryText,
                                        int limit = 10, Document? filter = null)
     {
-        var cursor = CallPtr(h => Native.moofile_semantic_search(h,
-            (filter ?? new()).ToJson(), sourceField, queryText, limit, out _));
-        return DrainSearchCursor(cursor);
+        lock (_lock)
+        {
+            var cursor = Native.moofile_semantic_search(Handle, filter?.ToJson() ?? "{}",
+                sourceField, queryText, limit, out var err);
+            Native.ThrowIfError(err);
+            return DrainSearchCursor(cursor);
+        }
     }
 
-    private List<SearchResult> DrainSearchCursor(IntPtr cursor)
+    /// <summary>
+    /// Consume a search cursor, freeing it even if decoding throws.
+    /// </summary>
+    /// <remarks>
+    /// Each entry is the JSON array <c>[doc, score]</c>, decoded with a real
+    /// parser — splitting on the first comma breaks on any document holding a
+    /// vector or a comma inside a string.
+    /// </remarks>
+    private static List<SearchResult> DrainSearchCursor(IntPtr cursor)
     {
-        if (cursor == IntPtr.Zero) return new();
-        var results = new List<SearchResult>();
-        while (true)
-        {
-            var s = CallStrPtr(cursor, Native.moofile_search_cursor_next);
-            if (s == null) break;
+        if (cursor == IntPtr.Zero)
+            throw new MooFileException("search returned a null cursor");
 
-            // Parse [doc, score]
-            if (s.Length > 2 && s[0] == '[' && s[^1] == ']')
+        var results = new List<SearchResult>();
+        try
+        {
+            while (true)
             {
-                var inner = s[1..^1];
-                var split = FindTopLevelComma(inner);
-                if (split >= 0)
+                var raw = Native.moofile_search_cursor_next(cursor, out var err);
+                Native.ThrowIfError(err);
+                var json = Native.TakeString(raw);
+                if (json is null) break;
+
+                if (JsonNode.Parse(json) is not JsonArray pair || pair.Count < 2)
+                    throw new MooFileException($"malformed search result: {json}");
+
+                if (Document.FromNode(pair[0]) is not Document doc)
+                    throw new MooFileException("search result is not a document");
+
+                results.Add(new SearchResult
                 {
-                    var docStr = inner[..split].Trim();
-                    var scoreStr = inner[(split + 1)..].Trim();
-                    results.Add(new SearchResult
-                    {
-                        Doc = Document.Parse(docStr),
-                        Score = double.Parse(scoreStr)
-                    });
-                }
+                    Doc = doc,
+                    Score = Convert.ToDouble(Document.FromNode(pair[1])),
+                });
             }
         }
-        Native.moofile_search_cursor_free(cursor);
+        finally
+        {
+            Native.moofile_search_cursor_free(cursor);
+        }
         return results;
     }
 
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
     // Batch
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
+    /// <summary>Begin a batch. Prefer <see cref="Batch(Action)"/>.</summary>
     public void BatchBegin()
     {
-        CheckError(Native.moofile_batch_begin(_handle, out _));
+        lock (_lock)
+        {
+            Native.moofile_batch_begin(Handle, out var err);
+            Native.ThrowIfError(err);
+        }
     }
 
+    /// <summary>Apply the buffered writes atomically.</summary>
     public void BatchCommit()
     {
-        CheckError(Native.moofile_batch_commit(_handle, out _));
+        lock (_lock)
+        {
+            Native.moofile_batch_commit(Handle, out var err);
+            Native.ThrowIfError(err);
+        }
     }
 
+    /// <summary>Discard the buffered writes.</summary>
     public void BatchRollback()
     {
-        Native.moofile_batch_rollback(_handle, out _);
+        lock (_lock)
+        {
+            Native.moofile_batch_rollback(Handle, out var err);
+            Native.ThrowIfError(err);
+        }
     }
 
-    /// <summary>Execute actions atomically; rolls back on exception.</summary>
-    public void Batch(Action fn)
+    /// <summary>
+    /// Run <paramref name="body"/> inside an atomic batch: committed if it
+    /// returns normally, rolled back if it throws. A rollback failure never
+    /// masks the original exception.
+    /// </summary>
+    public void Batch(Action body)
     {
+        ArgumentNullException.ThrowIfNull(body);
         BatchBegin();
-        try { fn(); BatchCommit(); }
-        catch { BatchRollback(); throw; }
+        var committed = false;
+        try
+        {
+            body();
+            BatchCommit();
+            committed = true;
+        }
+        finally
+        {
+            if (!committed)
+            {
+                try { BatchRollback(); }
+                catch (MooFileException) { /* keep the original exception */ }
+            }
+        }
     }
 
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
     // Utility
-    // ----------------------------------------------------------
+    // -----------------------------------------------------------------
 
+    /// <summary>
+    /// Collection statistics: <c>documents</c>, <c>dead_records</c>,
+    /// <c>file_size_bytes</c>, <c>dead_ratio</c>.
+    /// </summary>
+    /// <remarks>
+    /// One delete produces two dead records (the superseded original plus a
+    /// tombstone), so use <c>dead_ratio</c> to decide when to
+    /// <see cref="Compact"/>.
+    /// </remarks>
     public Document Stats()
     {
-        var result = CallStr(h => Native.moofile_stats(h, out _));
-        return result != null ? Document.Parse(result) : new();
+        lock (_lock)
+        {
+            var raw = Native.moofile_stats(Handle, out var err);
+            Native.ThrowIfError(err);
+            var json = Native.TakeString(raw);
+            return json is null ? new Document() : Document.Parse(json);
+        }
     }
 
+    /// <summary>Rewrite the file, reclaiming space from dead records.</summary>
     public void Compact()
     {
-        CheckError(Native.moofile_compact(_handle, out _));
+        lock (_lock)
+        {
+            Native.moofile_compact(Handle, out var err);
+            Native.ThrowIfError(err);
+        }
     }
 
+    /// <summary>Flush and fsync the data file.</summary>
     public void Sync()
     {
-        CheckError(Native.moofile_sync(_handle, out _));
+        lock (_lock)
+        {
+            Native.moofile_sync(Handle, out var err);
+            Native.ThrowIfError(err);
+        }
     }
 
+    /// <summary>Rebuild every in-memory index from the data file.</summary>
     public void Reindex()
     {
-        CheckError(Native.moofile_reindex(_handle, out _));
-    }
-
-    // ----------------------------------------------------------
-    // Helpers
-    // ----------------------------------------------------------
-
-    private static void CheckError(int code)
-    {
-        if (code != 0) throw new InvalidOperationException($"MooFile error code: {code}");
-    }
-
-    private static void CheckError(IntPtr errPtr)
-    {
-        if (errPtr != IntPtr.Zero)
+        lock (_lock)
         {
-            var msg = Marshal.PtrToStringUTF8(errPtr) ?? "unknown error";
-            Native.moofile_free_string(errPtr);
-            throw new InvalidOperationException(msg);
+            Native.moofile_reindex(Handle, out var err);
+            Native.ThrowIfError(err);
         }
-    }
-
-    private string? CallStr(Func<IntPtr, IntPtr> fn)
-    {
-        if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(Collection));
-        var result = fn(_handle);
-        CheckError(result);
-        if (result == IntPtr.Zero) return null;
-        var s = Marshal.PtrToStringUTF8(result);
-        Native.moofile_free_string(result);
-        return s;
-    }
-
-    private IntPtr CallPtr(Func<IntPtr, IntPtr> fn)
-    {
-        if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(Collection));
-        var result = fn(_handle);
-        CheckError(result);
-        return result;
-    }
-
-    private long CallLong(Func<IntPtr, long> fn)
-    {
-        if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(Collection));
-        return fn(_handle);
-    }
-
-    private int CallInt(Func<IntPtr, int> fn)
-    {
-        if (_handle == IntPtr.Zero) throw new ObjectDisposedException(nameof(Collection));
-        return fn(_handle);
-    }
-
-    private static string? CallStrPtr(IntPtr cursor, Func<IntPtr, IntPtr, IntPtr> fn)
-    {
-        if (cursor == IntPtr.Zero) return null;
-        var result = fn(cursor, out _);
-        if (result == IntPtr.Zero) return null;
-        var s = Marshal.PtrToStringUTF8(result);
-        Native.moofile_free_string(result);
-        return s;
-    }
-
-    private static int FindTopLevelComma(string s)
-    {
-        int depth = 0;
-        for (int i = 0; i < s.Length; i++)
-        {
-            if (s[i] == '{') depth++;
-            else if (s[i] == '}') depth--;
-            else if (s[i] == ',' && depth == 0) return i;
-        }
-        return -1;
     }
 }

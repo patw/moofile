@@ -37,7 +37,7 @@ if(NOT nlohmann_json_FOUND)
     message(STATUS "nlohmann_json not found — fetching single-include header")
     file(DOWNLOAD
         "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
-        "${CMAKE_BINARY_DIR}/_deps/nlohmann_json.hpp"
+        "${CMAKE_BINARY_DIR}/_deps/nlohmann/json.hpp"
         STATUS download_status
     )
     list(GET download_status 0 status_code)

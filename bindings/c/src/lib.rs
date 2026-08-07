@@ -16,7 +16,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
 use bson::{Bson, Document};
-use moofile_core::Collection as RustCollection;
+use moofile::Collection as RustCollection;
 
 // ---------------------------------------------------------------------------
 // Error handling helpers
@@ -195,7 +195,7 @@ fn bson_to_json_value(bson: &Bson) -> serde_json::Value {
             serde_json::Value::Array(json_arr)
         }
         Bson::Document(d) => bson_document_to_json_value(d),
-        Bson::DateTime(dt) => serde_json::Value::String(dt.to_chrono().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+        Bson::DateTime(dt) => serde_json::json!(dt.timestamp_millis()),
         Bson::ObjectId(oid) => serde_json::Value::String(oid.to_hex()),
         Bson::Binary(bin) => serde_json::Value::String(base64_encode(&bin.bytes)),
         Bson::RegularExpression(re) => serde_json::Value::String(format!("/{}/{}", re.pattern, re.options)),
@@ -311,9 +311,9 @@ pub extern "C" fn moofile_open(
 
     if let Some(dur) = config.get("durability").and_then(|v| v.as_str()) {
         let d = match dur {
-            "none" => moofile_core::Durability::None,
-            "os" => moofile_core::Durability::Os,
-            "fsync" => moofile_core::Durability::Fsync,
+            "none" => moofile::Durability::None,
+            "os" => moofile::Durability::Os,
+            "fsync" => moofile::Durability::Fsync,
             other => { unsafe { set_error(err_out, &format!("invalid durability '{other}': must be 'none', 'os', or 'fsync'")); } return ptr::null_mut(); }
         };
         builder = builder.durability(d);
@@ -322,7 +322,7 @@ pub extern "C" fn moofile_open(
     // Parse auto_embed config
     if let Some(ae) = config.get("auto_embed").and_then(|v| v.as_object()) {
         for (source_field, cfg_val) in ae {
-            use moofile_core::AutoEmbedConfig;
+            use moofile::AutoEmbedConfig;
             let mut ae_config = AutoEmbedConfig::default();
             if let Some(obj) = cfg_val.as_object() {
                 if let Some(model) = obj.get("model").and_then(|v| v.as_str()) {
@@ -339,10 +339,10 @@ pub extern "C" fn moofile_open(
                 }
                 if let Some(prec) = obj.get("precision").and_then(|v| v.as_str()) {
                     ae_config.precision = match prec {
-                        "f32" => moofile_core::EmbeddingPrecision::F32,
-                        "int8" => moofile_core::EmbeddingPrecision::Int8,
-                        "uint8" => moofile_core::EmbeddingPrecision::Uint8,
-                        "binary" => moofile_core::EmbeddingPrecision::Binary,
+                        "f32" => moofile::EmbeddingPrecision::F32,
+                        "int8" => moofile::EmbeddingPrecision::Int8,
+                        "uint8" => moofile::EmbeddingPrecision::Uint8,
+                        "binary" => moofile::EmbeddingPrecision::Binary,
                         other => { unsafe { set_error(err_out, &format!("auto_embed[{}]: unknown precision '{other}'", source_field)); }
                             return ptr::null_mut(); }
                     };
@@ -478,6 +478,142 @@ pub extern "C" fn moofile_find(
     }
 }
 
+/// Parse the `options_json` blob accepted by `moofile_find_ex` and apply it to
+/// a `Query`.  Unknown keys are rejected rather than ignored: a typo in
+/// `"limit"` would otherwise silently return the whole collection.
+fn apply_find_options(
+    mut q: moofile::Query,
+    options_json: &str,
+) -> Result<moofile::Query, String> {
+    let val: serde_json::Value = serde_json::from_str(options_json)
+        .map_err(|e| format!("options JSON parse error: {e}"))?;
+    let obj = match val {
+        serde_json::Value::Object(o) => o,
+        serde_json::Value::Null => return Ok(q),
+        _ => return Err("options must be a JSON object".into()),
+    };
+
+    for key in obj.keys() {
+        match key.as_str() {
+            "sort" | "skip" | "limit" | "group" | "agg" => {}
+            other => return Err(format!("unknown find option '{other}'")),
+        }
+    }
+
+    // "sort": "field" | {"field": "name", "desc": bool}
+    if let Some(sort) = obj.get("sort") {
+        match sort {
+            serde_json::Value::String(f) => q = q.sort(f.clone(), false),
+            serde_json::Value::Object(o) => {
+                let field = o
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .ok_or("sort.field must be a string")?;
+                let desc = o.get("desc").and_then(|v| v.as_bool()).unwrap_or(false);
+                q = q.sort(field.to_string(), desc);
+            }
+            serde_json::Value::Null => {}
+            _ => return Err("sort must be a string or an object".into()),
+        }
+    }
+
+    if let Some(skip) = obj.get("skip") {
+        if !skip.is_null() {
+            let n = skip.as_u64().ok_or("skip must be a non-negative integer")?;
+            q = q.skip(n as usize);
+        }
+    }
+
+    if let Some(limit) = obj.get("limit") {
+        if !limit.is_null() {
+            let n = limit.as_u64().ok_or("limit must be a non-negative integer")?;
+            q = q.limit(n as usize);
+        }
+    }
+
+    if let Some(group) = obj.get("group") {
+        match group {
+            serde_json::Value::String(f) => q = q.group(f.clone()),
+            serde_json::Value::Null => {}
+            _ => return Err("group must be a string".into()),
+        }
+    }
+
+    // "agg": [{"func": "sum", "field": "amount"}, {"func": "count"}]
+    if let Some(agg) = obj.get("agg") {
+        if !agg.is_null() {
+            let arr = agg.as_array().ok_or("agg must be an array")?;
+            let mut funcs = Vec::with_capacity(arr.len());
+            for item in arr {
+                let o = item.as_object().ok_or("each agg entry must be an object")?;
+                let func = o
+                    .get("func")
+                    .and_then(|v| v.as_str())
+                    .ok_or("agg.func must be a string")?;
+                // Every function except `count` operates on a named field.
+                let field = || -> Result<String, String> {
+                    o.get("field")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .ok_or_else(|| format!("agg func '{func}' requires a 'field'"))
+                };
+                funcs.push(match func {
+                    "count" => moofile::AggFunc::Count,
+                    "sum" => moofile::AggFunc::Sum(field()?),
+                    "mean" | "avg" => moofile::AggFunc::Mean(field()?),
+                    "min" => moofile::AggFunc::Min(field()?),
+                    "max" => moofile::AggFunc::Max(field()?),
+                    "collect" => moofile::AggFunc::Collect(field()?),
+                    "first" => moofile::AggFunc::First(field()?),
+                    "last" => moofile::AggFunc::Last(field()?),
+                    other => return Err(format!("unknown agg func '{other}'")),
+                });
+            }
+            q = q.agg(funcs);
+        }
+    }
+
+    Ok(q)
+}
+
+/// Find with the full query builder: sort, skip, limit, group, agg.
+///
+/// `options_json` is a JSON object; see `apply_find_options` for the schema.
+#[no_mangle]
+pub extern "C" fn moofile_find_ex(
+    handle: *mut MooFileCollection,
+    filter_json: *const i8,
+    options_json: *const i8,
+    err_out: *mut *mut i8,
+) -> *mut MooFileCursor {
+    unsafe { clear_error(err_out); }
+    if handle.is_null() { unsafe { set_error(err_out, "handle is null"); } return ptr::null_mut(); }
+    let coll = unsafe { &*handle };
+
+    let filter_str = if filter_json.is_null() { "{}" } else {
+        match unsafe { c_str_to_str(filter_json) } { Ok(s) => s, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } }
+    };
+    let filter = match json_to_doc(filter_str) { Ok(d) => d, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } };
+
+    let opts_str = if options_json.is_null() { "{}" } else {
+        match unsafe { c_str_to_str(options_json) } { Ok(s) => s, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } }
+    };
+
+    let query = match coll.inner.find(filter) {
+        Ok(q) => q,
+        Err(e) => { unsafe { set_error(err_out, &e.to_string()); } return ptr::null_mut(); }
+    };
+    let query = match apply_find_options(query, opts_str) {
+        Ok(q) => q,
+        Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); }
+    };
+
+    match query.to_list() {
+        Ok(docs) => Box::into_raw(Box::new(MooFileCursor { docs, index: 0 })),
+        Err(e) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn moofile_find_one(
     handle: *mut MooFileCollection,
@@ -576,11 +712,11 @@ pub extern "C" fn moofile_update_one(
         let update_str = if update_json.is_null() { "{}" } else { unsafe { c_str_to_str(update_json)? } };
         let update_val: serde_json::Value = serde_json::from_str(update_str).map_err(|e| format!("update JSON parse error: {e}"))?;
 
-        let set = update_val.get("set").map(json_value_to_bson_document).transpose()?;
+        let set = update_val.get("set").map(|v| json_value_to_bson_document(v.clone())).transpose()?;
         let unset = update_val.get("unset")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-        let inc = update_val.get("inc").map(json_value_to_bson_document).transpose()?;
+        let inc = update_val.get("inc").map(|v| json_value_to_bson_document(v.clone())).transpose()?;
 
         let ok = coll.inner.update_one(where_doc, set, unset, inc).map_err(|e| e.to_string())?;
         Ok(if ok { 1 } else { 0 })
@@ -603,11 +739,11 @@ pub extern "C" fn moofile_update_many(
         let update_str = if update_json.is_null() { "{}" } else { unsafe { c_str_to_str(update_json)? } };
         let update_val: serde_json::Value = serde_json::from_str(update_str).map_err(|e| format!("update JSON parse error: {e}"))?;
 
-        let set = update_val.get("set").map(json_value_to_bson_document).transpose()?;
+        let set = update_val.get("set").map(|v| json_value_to_bson_document(v.clone())).transpose()?;
         let unset = update_val.get("unset")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-        let inc = update_val.get("inc").map(json_value_to_bson_document).transpose()?;
+        let inc = update_val.get("inc").map(|v| json_value_to_bson_document(v.clone())).transpose()?;
 
         let count = coll.inner.update_many(where_doc, set, unset, inc).map_err(|e| e.to_string())?;
         Ok(count as i32)

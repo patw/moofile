@@ -90,14 +90,31 @@ LD_LIBRARY_PATH="$PROJECT_DIR/target/$TARGET_DIR:${LD_LIBRARY_PATH:-}" \
     "$BUILD_DIR/test_cxx_api" \
     || CXX_EXIT=$?
 
+# Cross-backend parity: pure Python vs PyO3 vs the C library.  Skipped
+# rather than failed when the Python package is not importable, so the
+# C/C++ suites remain usable without a Python environment.
+PARITY_EXIT=0
+PARITY_STATUS="SKIP (moofile not importable)"
+echo ""
+echo "=== Cross-backend Parity ==="
+if PYTHONPATH="$PROJECT_DIR" python3 -c "import moofile" >/dev/null 2>&1; then
+    PYTHONPATH="$PROJECT_DIR" python3 "$SCRIPT_DIR/test_parity.py" \
+        --c-lib "$PROJECT_DIR/target/$TARGET_DIR/libmoofile.so" \
+        || PARITY_EXIT=$?
+    PARITY_STATUS="$([ $PARITY_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+else
+    echo "  skipped — run from a checkout where 'import moofile' works"
+fi
+
 echo ""
 echo "============================================"
 echo " Results"
 echo "============================================"
 echo "  C API:        $([ $C_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
 echo "  C++ Wrapper:  $([ $CXX_EXIT -eq 0 ] && echo 'PASS' || echo 'FAIL')"
+echo "  Parity:       $PARITY_STATUS"
 
-if [ $C_EXIT -ne 0 ] || [ $CXX_EXIT -ne 0 ]; then
+if [ $C_EXIT -ne 0 ] || [ $CXX_EXIT -ne 0 ] || [ $PARITY_EXIT -ne 0 ]; then
     echo ""
     echo "  SOME TESTS FAILED!"
     exit 1

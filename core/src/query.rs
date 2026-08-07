@@ -848,17 +848,33 @@ fn apply_group_agg(
     group_field: &str,
     agg_funcs: &[AggFunc],
 ) -> Vec<Document> {
-    let mut groups: std::collections::BTreeMap<String, Vec<Document>> = std::collections::BTreeMap::new();
+    // Group rows carry the *original* Bson value of the group field, not a
+    // stringified one — `Bson::to_string()` renders a string as `"eng"`
+    // (quotes included) and an integer as text, which would make the Rust
+    // backend's group output differ from the Python one for every type.
+    // The stringified form is used only as the lookup key.
+    //
+    // First-seen order is preserved, matching the Python implementation's
+    // dict ordering; callers wanting a defined order chain `.sort()`.
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<(Bson, Vec<Document>)> = Vec::new();
 
     for doc in docs {
-        let key = doc.get(group_field).map(|v| v.to_string()).unwrap_or_default();
-        groups.entry(key).or_default().push(doc.clone());
+        let value = doc.get(group_field).cloned().unwrap_or(Bson::Null);
+        let key = value.to_string();
+        match index.get(&key) {
+            Some(&i) => groups[i].1.push(doc.clone()),
+            None => {
+                index.insert(key, groups.len());
+                groups.push((value, vec![doc.clone()]));
+            }
+        }
     }
 
     let mut result = Vec::new();
-    for (key, group_docs) in groups {
+    for (value, group_docs) in groups {
         let mut row = Document::new();
-        row.insert(group_field, key);
+        row.insert(group_field, value);
         for func in agg_funcs {
             row.insert(func.output_name(), func.compute(&group_docs));
         }

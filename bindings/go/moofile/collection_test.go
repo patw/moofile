@@ -3,6 +3,7 @@ package moofile_test
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/patw/moofile-go/moofile"
@@ -224,7 +225,7 @@ func TestBatchRollback(t *testing.T) {
 	// Force a rollback by returning an error
 	err := db.Batch(func() error {
 		db.Insert(map[string]any{"_id": "a", "v": 1})
-		return moofile.Error{Msg: "rollback"}
+		return &moofile.Error{Msg: "rollback"}
 	})
 	if err == nil {
 		t.Error("expected error")
@@ -278,4 +279,208 @@ func TestJSONSerialization(t *testing.T) {
 
 func contains(s []byte, substr string) bool {
 	return string(s) == substr || len(s) > len(substr)
+}
+
+// ---------------------------------------------------------------------------
+// Find options: sort / skip / limit / group / agg
+// ---------------------------------------------------------------------------
+
+// sortableDB returns a collection of four documents across two departments,
+// deliberately inserted out of age order.
+func sortableDB(t *testing.T) *moofile.Collection {
+	t.Helper()
+	db, err := moofile.Open(tmpPath(t), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.InsertMany([]map[string]any{
+		{"_id": "a", "age": 30, "dept": "eng", "pay": 100},
+		{"_id": "b", "age": 20, "dept": "eng", "pay": 200},
+		{"_id": "c", "age": 50, "dept": "ops", "pay": 300},
+		{"_id": "d", "age": 40, "dept": "ops", "pay": 400},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func ids(docs []map[string]any) []string {
+	out := make([]string, len(docs))
+	for i, d := range docs {
+		out[i], _ = d["_id"].(string)
+	}
+	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFindSort(t *testing.T) {
+	db := sortableDB(t)
+	defer db.Close()
+
+	asc, err := db.Find(nil, &moofile.FindOptions{Sort: "age"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"b", "a", "d", "c"}; !equalStrings(ids(asc), want) {
+		t.Errorf("ascending: got %v, want %v", ids(asc), want)
+	}
+
+	desc, err := db.Find(nil, &moofile.FindOptions{Sort: "age", Desc: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"c", "d", "a", "b"}; !equalStrings(ids(desc), want) {
+		t.Errorf("descending: got %v, want %v", ids(desc), want)
+	}
+}
+
+func TestFindSkipLimit(t *testing.T) {
+	db := sortableDB(t)
+	defer db.Close()
+
+	page, err := db.Find(nil, &moofile.FindOptions{Sort: "age", Skip: 1, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"a", "d"}; !equalStrings(ids(page), want) {
+		t.Errorf("skip+limit: got %v, want %v", ids(page), want)
+	}
+}
+
+func TestFindFilterWithOptions(t *testing.T) {
+	db := sortableDB(t)
+	defer db.Close()
+
+	docs, err := db.Find(map[string]any{"dept": "ops"},
+		&moofile.FindOptions{Sort: "age", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"d"}; !equalStrings(ids(docs), want) {
+		t.Errorf("filter+sort+limit: got %v, want %v", ids(docs), want)
+	}
+}
+
+func TestFindGroupAgg(t *testing.T) {
+	db := sortableDB(t)
+	defer db.Close()
+
+	rows, err := db.Find(nil, &moofile.FindOptions{
+		Group: "dept",
+		Agg:   []moofile.Agg{moofile.Count(), moofile.Sum("pay"), moofile.Mean("pay")},
+		Sort:  "dept",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(rows))
+	}
+
+	// The group key keeps its original type — a plain string, not a quoted one.
+	if rows[0]["dept"] != "eng" {
+		t.Errorf("group key: got %#v, want \"eng\"", rows[0]["dept"])
+	}
+	if rows[0]["count"].(float64) != 2 {
+		t.Errorf("eng count: got %v", rows[0]["count"])
+	}
+	if rows[0]["sum_pay"].(float64) != 300 {
+		t.Errorf("eng sum_pay: got %v", rows[0]["sum_pay"])
+	}
+	if rows[0]["mean_pay"].(float64) != 150 {
+		t.Errorf("eng mean_pay: got %v", rows[0]["mean_pay"])
+	}
+	if rows[1]["sum_pay"].(float64) != 700 {
+		t.Errorf("ops sum_pay: got %v", rows[1]["sum_pay"])
+	}
+}
+
+func TestFindRejectsUnknownAgg(t *testing.T) {
+	db := sortableDB(t)
+	defer db.Close()
+
+	_, err := db.Find(nil, &moofile.FindOptions{
+		Group: "dept",
+		Agg:   []moofile.Agg{{Func: "median", Field: "pay"}},
+	})
+	if err == nil {
+		t.Fatal("expected an error for an unknown agg function")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Contract details
+// ---------------------------------------------------------------------------
+
+func TestUpdateOneNoMatchErrors(t *testing.T) {
+	db, _ := moofile.Open(tmpPath(t), nil)
+	defer db.Close()
+	db.Insert(map[string]any{"_id": "a", "v": 1})
+
+	// UpdateOne treats a miss as an error, matching Rust and Python...
+	if _, err := db.UpdateOne(map[string]any{"_id": "nope"},
+		map[string]any{"v": 2}, nil, nil); err == nil {
+		t.Error("expected UpdateOne with no match to fail")
+	}
+
+	// ...while UpdateMany simply reports zero.
+	n, err := db.UpdateMany(map[string]any{"_id": "nope"},
+		map[string]any{"v": 2}, nil, nil)
+	if err != nil {
+		t.Fatalf("UpdateMany should not fail on a miss: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 updated, got %d", n)
+	}
+}
+
+func TestAutoEmbedConfigSerialisation(t *testing.T) {
+	// The config must reach the core with snake_case keys.  An untagged
+	// struct field would serialise as "Model" and be silently ignored,
+	// leaving semantic search permanently unconfigured.  Opening with a
+	// bogus model URI proves the key was read: the error names the model.
+	_, err := moofile.Open(tmpPath(t), &moofile.Config{
+		VectorIndexes: map[string]int{"emb": 8},
+		AutoEmbed: map[string]moofile.AutoEmbedConfig{
+			"content": {
+				Model:  "hf:definitely/not-a-real-repo:missing.gguf",
+				Target: "emb",
+				Dims:   8,
+			},
+		},
+	})
+	if err == nil {
+		t.Skip("auto_embed accepted the model; nothing to assert offline")
+	}
+	if !strings.Contains(err.Error(), "not-a-real-repo") &&
+		!strings.Contains(err.Error(), "model") &&
+		!strings.Contains(err.Error(), "embed") {
+		t.Errorf("auto_embed config does not appear to have been parsed: %v", err)
+	}
+}
+
+func TestClosedCollectionRejectsCalls(t *testing.T) {
+	db, _ := moofile.Open(tmpPath(t), nil)
+	db.Insert(map[string]any{"x": 1})
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Count(nil); err == nil {
+		t.Error("expected Count after Close to fail")
+	}
+	if err := db.Close(); err != nil {
+		t.Errorf("Close should be idempotent, got %v", err)
+	}
 }

@@ -186,14 +186,111 @@ static void test_find_logical() {
     moofile::Collection db(make_path("f_log.bson"));
     db.insert_many({{{"s", "a"}, {"v", 1}}, {{"s", "b"}, {"v", 2}}, {{"s", "a"}, {"v", 3}}});
 
-    auto docs = db.find({{"$and", {{{{ "s", "a" }}, {{ "v", {{"$gt", 2}} }}}}}}).to_vector();
-    ASSERT(docs.size() == 1);
+    /* Built explicitly: nested brace-init of an array-of-objects is
+     * ambiguous in nlohmann and silently adds a level of nesting. */
+    json and_filter = json::object();
+    and_filter["$and"] = json::array({
+        json{{"s", "a"}},
+        json{{"v", json{{"$gt", 2}}}},
+    });
+    auto docs = db.find(and_filter).to_vector();
+    ASSERT(docs.size() == 1); /* s=a and v=3 */
 
-    docs = db.find({{"$or", {{{{ "s", "b" }}, {{ "v", 1 }}}}}}).to_vector();
-    ASSERT(docs.size() == 2);
+    json or_filter = json::object();
+    or_filter["$or"] = json::array({
+        json{{"s", "b"}},
+        json{{"v", 1}},
+    });
+    docs = db.find(or_filter).to_vector();
+    ASSERT(docs.size() == 2); /* {b,2} and {a,1} */
 
-    docs = db.find({{"$not", {{{ "s", "a" }}}}}).to_vector();
+    json not_filter = json::object();
+    not_filter["$not"] = json{{"s", "a"}};
+    docs = db.find(not_filter).to_vector();
+    ASSERT(docs.size() == 1); /* {b,2} */
+}
+
+/* ---------------------------------------------------------------------------
+ * FindOptions — sort / skip / limit / group / agg
+ * --------------------------------------------------------------------------- */
+
+/* Four documents across two departments, deliberately not in age order. */
+static moofile::Collection make_sortable(const std::string& name) {
+    moofile::Collection db(make_path(name));
+    db.insert_many(json::array({
+        json{{"_id", "a"}, {"age", 30}, {"dept", "eng"}, {"pay", 100}},
+        json{{"_id", "b"}, {"age", 20}, {"dept", "eng"}, {"pay", 200}},
+        json{{"_id", "c"}, {"age", 50}, {"dept", "ops"}, {"pay", 300}},
+        json{{"_id", "d"}, {"age", 40}, {"dept", "ops"}, {"pay", 400}},
+    }));
+    return db;
+}
+
+static void test_find_options_sort() {
+    TEST("FindOptions sorts ascending and descending");
+    auto db = make_sortable("cxx_fo_sort.bson");
+
+    auto asc = db.find(json::object(), moofile::FindOptions().sort("age")).to_vector();
+    ASSERT(asc.size() == 4);
+    ASSERT(asc[0]["_id"] == "b");
+    ASSERT(asc[3]["_id"] == "c");
+
+    auto desc = db.find(json::object(),
+                        moofile::FindOptions().sort("age", true)).to_vector();
+    ASSERT(desc[0]["_id"] == "c");
+    ASSERT(desc[3]["_id"] == "b");
+}
+
+static void test_find_options_skip_limit() {
+    TEST("FindOptions paginates with skip and limit");
+    auto db = make_sortable("cxx_fo_page.bson");
+
+    auto page = db.find(json::object(),
+                        moofile::FindOptions().sort("age").skip(1).limit(2)).to_vector();
+    ASSERT(page.size() == 2);
+    ASSERT(page[0]["_id"] == "a"); /* b,a,d,c → skip 1, take 2 */
+    ASSERT(page[1]["_id"] == "d");
+}
+
+static void test_find_options_with_filter() {
+    TEST("FindOptions combines with a filter");
+    auto db = make_sortable("cxx_fo_filt.bson");
+
+    auto docs = db.find(json{{"dept", "ops"}},
+                        moofile::FindOptions().sort("age").limit(1)).to_vector();
     ASSERT(docs.size() == 1);
+    ASSERT(docs[0]["_id"] == "d");
+}
+
+static void test_find_options_group_agg() {
+    TEST("FindOptions groups and aggregates");
+    auto db = make_sortable("cxx_fo_group.bson");
+
+    auto rows = db.find(json::object(),
+                        moofile::FindOptions()
+                            .group("dept")
+                            .count()
+                            .sum("pay")
+                            .sort("dept")).to_vector();
+    ASSERT(rows.size() == 2);
+    /* The group key keeps its original type — a JSON string, not a quoted one. */
+    ASSERT(rows[0]["dept"] == "eng");
+    ASSERT(rows[0]["count"] == 2);
+    ASSERT(rows[0]["sum_pay"] == 300);
+    ASSERT(rows[1]["dept"] == "ops");
+    ASSERT(rows[1]["sum_pay"] == 700);
+}
+
+static void test_find_options_rejects_bad_agg() {
+    TEST("FindOptions surfaces an unknown agg function as an error");
+    auto db = make_sortable("cxx_fo_badagg.bson");
+    try {
+        db.find(json::object(),
+                moofile::FindOptions().group("dept").agg("median", "pay")).to_vector();
+        FAIL("expected an unknown agg function to throw");
+    } catch (const moofile::error& e) {
+        ASSERT(std::string(e.what()).find("unknown agg func") != std::string::npos);
+    }
 }
 
 static void test_find_one() {
@@ -240,10 +337,15 @@ static void test_update_one() {
 }
 
 static void test_update_one_no_match() {
-    TEST("update_one with no match returns false");
+    /* Matching nothing throws, as in Rust and Python — not a silent no-op. */
+    TEST("update_one with no match throws");
     moofile::Collection db(make_path("up1nm.bson"));
-    bool ok = db.update_one({{"x", 99}}, {{"x", 1}});
-    ASSERT(!ok);
+    try {
+        db.update_one({{"x", 99}}, {{"x", 1}});
+        FAIL("expected update_one to throw when nothing matches");
+    } catch (const moofile::error& e) {
+        ASSERT(std::string(e.what()).find("no document matches") != std::string::npos);
+    }
 }
 
 static void test_update_many() {
@@ -349,7 +451,7 @@ static void test_batch_commit() {
     moofile::Collection db(make_path("batch_c.bson"));
 
     {
-        auto batch = db.Batch(db);
+        moofile::Collection::Batch batch(db);
         db.insert({{"_id", "a"}, {"v", 1}});
         db.insert({{"_id", "b"}, {"v", 2}});
         batch.commit();
@@ -363,7 +465,7 @@ static void test_batch_rollback() {
     moofile::Collection db(make_path("batch_r.bson"));
 
     {
-        auto batch = db.Batch(db);
+        moofile::Collection::Batch batch(db);
         db.insert({{"_id", "a"}, {"v", 1}});
         /* No commit — destructor rolls back */
     }
@@ -376,7 +478,7 @@ static void test_batch_exception_rollback() {
     moofile::Collection db(make_path("batch_ex.bson"));
 
     try {
-        auto batch = db.Batch(db);
+        moofile::Collection::Batch batch(db);
         db.insert({{"_id", "a"}, {"v", 1}});
         throw std::runtime_error("simulated failure");
     } catch (...) {
@@ -510,6 +612,11 @@ int main() {
     test_find_filtered();
     test_find_comparison();
     test_find_logical();
+    test_find_options_sort();
+    test_find_options_skip_limit();
+    test_find_options_with_filter();
+    test_find_options_group_agg();
+    test_find_options_rejects_bad_agg();
     test_find_one();
     test_count();
     test_exists();

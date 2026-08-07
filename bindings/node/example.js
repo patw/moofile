@@ -54,7 +54,45 @@ console.log('=== MooFile Node.js Examples ===\n');
 }
 
 // -----------------------------------------------------------------------
-// 2. Vector Search
+// 2. Sorting, paging, and aggregation
+// -----------------------------------------------------------------------
+{
+    const db = new Collection(path.join(dir, 'sales.bson'));
+
+    db.insertMany([
+        { rep: 'Alice', region: 'east', amount: 100 },
+        { rep: 'Bob', region: 'east', amount: 250 },
+        { rep: 'Carol', region: 'west', amount: 175 },
+        { rep: 'Dan', region: 'west', amount: 300 },
+        { rep: 'Erin', region: 'west', amount: 125 },
+    ]);
+
+    // Sort descending, take the top 3
+    const top = db.find({}, { sort: 'amount', desc: true, limit: 3 }).toArray();
+    console.log('\n6. Top 3 sales:');
+    for (const s of top) console.log(`   ${s.rep}: ${s.amount}`);
+
+    // Page through results
+    const page2 = db.find({}, { sort: 'rep', skip: 2, limit: 2 }).toArray();
+    console.log(`   Page 2 (by name): ${page2.map(s => s.rep).join(', ')}`);
+
+    // Group and aggregate
+    const byRegion = db.find({}, {
+        group: 'region',
+        agg: ['count', { func: 'sum', field: 'amount' }, { func: 'mean', field: 'amount' }],
+        sort: 'region',
+    }).toArray();
+    console.log('   Totals by region:');
+    for (const r of byRegion) {
+        console.log(`     ${r.region}: ${r.count} deals, ` +
+                    `sum ${r.sum_amount}, avg ${r.mean_amount}`);
+    }
+
+    db.close();
+}
+
+// -----------------------------------------------------------------------
+// 3. Vector Search
 // -----------------------------------------------------------------------
 {
     const db = new Collection(path.join(dir, 'vectors.bson'), {
@@ -68,7 +106,7 @@ console.log('=== MooFile Node.js Examples ===\n');
     ]);
 
     const results = db.vectorSearch('embedding', [1.0, 0.0, 0.0], 3).toArray();
-    console.log('\n6. Vector Search Results:');
+    console.log('\n7. Vector Search Results:');
     for (const { doc, score } of results) {
         console.log(`   ${doc.title}: similarity = ${score.toFixed(4)}`);
     }
@@ -77,7 +115,7 @@ console.log('=== MooFile Node.js Examples ===\n');
 }
 
 // -----------------------------------------------------------------------
-// 3. Text Search
+// 4. Text Search
 // -----------------------------------------------------------------------
 {
     const db = new Collection(path.join(dir, 'text.bson'), {
@@ -91,7 +129,7 @@ console.log('=== MooFile Node.js Examples ===\n');
     ]);
 
     const results = db.textSearch('content', 'machine learning', 5).toArray();
-    console.log('\n7. Text Search Results:');
+    console.log('\n8. Text Search Results:');
     for (const { doc, score } of results) {
         console.log(`   [${doc._id}] ${doc.content}: score = ${score.toFixed(4)}`);
     }
@@ -100,7 +138,7 @@ console.log('=== MooFile Node.js Examples ===\n');
 }
 
 // -----------------------------------------------------------------------
-// 4. Batch Atomic Write
+// 5. Batch Atomic Write
 // -----------------------------------------------------------------------
 {
     const db = new Collection(path.join(dir, 'batch.bson'));
@@ -112,16 +150,16 @@ console.log('=== MooFile Node.js Examples ===\n');
     });
 
     const count = db.count({ type: 'transaction' });
-    console.log(`\n8. Batch insert: ${count} transactions committed atomically`);
+    console.log(`\n9. Batch insert: ${count} transactions committed atomically`);
 
     db.close();
 }
 
 // -----------------------------------------------------------------------
-// 5. Autoembedding (requires a GGUF model)
+// 6. Autoembedding (requires a GGUF model)
 // -----------------------------------------------------------------------
 {
-    console.log('\n9. Autoembedding (skipped — requires GGUF model file)');
+    console.log('\n10. Autoembedding (skipped — requires GGUF model file)');
     console.log('   To run: configure auto_embed with a model URI');
     console.log('   const db = new Collection("semantic.bson", {');
     console.log('     vector_indexes: { embedding: 1024 },');

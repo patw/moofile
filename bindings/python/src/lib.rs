@@ -405,6 +405,39 @@ impl NativeCollection {
         Ok(list.unwrap().into())
     }
 
+    /// Semantic search — auto-embeds `query_text` with the model configured
+    /// for `source_field`, then runs a vector search.  Returns a list of
+    /// (raw_bson_bytes, score) tuples.
+    #[pyo3(signature = (filter, source_field, query_text, limit=10))]
+    fn semantic_search_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+        source_field: &str,
+        query_text: &str,
+        limit: usize,
+    ) -> PyResult<PyObject> {
+        let f = match filter {
+            Some(d) => py_to_document(d)?,
+            None => Document::new(),
+        };
+        let results = self
+            .inner
+            .find(f)
+            .and_then(|q| q.semantic(source_field, query_text, limit))
+            .and_then(|vq| vq.to_list())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let list = PyList::new(
+            py,
+            results.iter().map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py);
+                (bytes, *score as f64).to_object(py)
+            }),
+        );
+        Ok(list.unwrap().into())
+    }
+
     /// Hybrid search (RRF) — returns list of (raw_bson_bytes, score) tuples.
     #[pyo3(signature = (filter, text_field, vector_field, query_text, query_vector, limit=10))]
     fn hybrid_search_raw(

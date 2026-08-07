@@ -178,10 +178,124 @@ function testUpdate() {
     db.updateOne({ _id: 'a' }, {}, ['city']);
     check(db.findOne({ _id: 'a' }).city === undefined);
 
-    // No match
-    check(db.updateOne({ _id: 'none' }, { x: 1 }) === false);
+    // No match throws, matching the Rust and Python contract
+    let threw = false;
+    try {
+        db.updateOne({ _id: 'none' }, { x: 1 });
+    } catch (e) {
+        threw = e instanceof MooFileError && /no document matches/.test(e.message);
+    }
+    check(threw, 'updateOne with no match should throw MooFileError');
+
+    // updateMany does not throw — it reports 0
+    check(db.updateMany({ _id: 'none' }, { x: 1 }) === 0);
 
     db.close();
+    cleanup(dir);
+}
+
+function testFindOptions() {
+    test('find options: sort / skip / limit');
+    const dir = tmpDir();
+    const db = new Collection(tmpPath(dir, 'findopts.bson'));
+    db.insertMany([
+        { _id: 'a', age: 30, dept: 'eng', pay: 100 },
+        { _id: 'b', age: 20, dept: 'eng', pay: 200 },
+        { _id: 'c', age: 50, dept: 'ops', pay: 300 },
+        { _id: 'd', age: 40, dept: 'ops', pay: 400 },
+    ]);
+
+    const asc = db.find({}, { sort: 'age' }).toArray().map(d => d._id);
+    checkEqual(asc, ['b', 'a', 'd', 'c'], 'ascending sort');
+
+    const desc = db.find({}, { sort: 'age', desc: true }).toArray().map(d => d._id);
+    checkEqual(desc, ['c', 'd', 'a', 'b'], 'descending sort');
+
+    const page = db.find({}, { sort: 'age', skip: 1, limit: 2 }).toArray().map(d => d._id);
+    checkEqual(page, ['a', 'd'], 'skip then limit');
+
+    const filtered = db.find({ dept: 'ops' }, { sort: 'age', limit: 1 }).toArray();
+    check(filtered.length === 1 && filtered[0]._id === 'd', 'filter + sort + limit');
+
+    // A typo in an option name is an error, not a silent full scan
+    let threw = false;
+    try {
+        db.find({}, { limt: 2 }).toArray();
+    } catch (e) {
+        threw = /unknown find option/.test(e.message);
+    }
+    check(threw, 'unknown find option should be rejected');
+
+    db.close();
+    cleanup(dir);
+}
+
+function testGroupAgg() {
+    test('find options: group / agg');
+    const dir = tmpDir();
+    const db = new Collection(tmpPath(dir, 'groupagg.bson'));
+    db.insertMany([
+        { _id: 'a', dept: 'eng', pay: 100 },
+        { _id: 'b', dept: 'eng', pay: 200 },
+        { _id: 'c', dept: 'ops', pay: 300 },
+        { _id: 'd', dept: 'ops', pay: 400 },
+    ]);
+
+    const rows = db.find({}, {
+        group: 'dept',
+        agg: ['count', { func: 'sum', field: 'pay' }, { func: 'mean', field: 'pay' }],
+        sort: 'dept',
+    }).toArray();
+
+    check(rows.length === 2, 'two groups');
+    // The group key keeps its original type — a plain string, not a quoted one
+    check(rows[0].dept === 'eng', `group key should be "eng", got ${JSON.stringify(rows[0].dept)}`);
+    check(rows[0].count === 2, 'eng count');
+    check(rows[0].sum_pay === 300, 'eng sum');
+    check(rows[0].mean_pay === 150, 'eng mean');
+    check(rows[1].dept === 'ops', 'second group key');
+    check(rows[1].sum_pay === 700, 'ops sum');
+
+    db.close();
+    cleanup(dir);
+}
+
+function testCursorIteration() {
+    test('cursors are iterable and free themselves');
+    const dir = tmpDir();
+    const db = new Collection(tmpPath(dir, 'cursor.bson'));
+    db.insertMany([{ n: 1 }, { n: 2 }, { n: 3 }]);
+
+    const seen = [];
+    for (const doc of db.find({})) seen.push(doc.n);
+    check(seen.length === 3, 'for..of over a cursor');
+
+    // Draining a cursor releases it; close() afterwards must not double-free
+    const cur = db.find({});
+    cur.toArray();
+    cur.close();
+    cur.close();
+
+    db.close();
+    cleanup(dir);
+}
+
+function testUseAfterClose() {
+    test('operations after close are rejected');
+    const dir = tmpDir();
+    const db = new Collection(tmpPath(dir, 'closed.bson'));
+    db.insert({ x: 1 });
+    db.close();
+
+    let threw = false;
+    try {
+        db.count();
+    } catch (e) {
+        threw = e instanceof MooFileError;
+    }
+    check(threw, 'count after close should throw');
+
+    db.close(); // idempotent
     cleanup(dir);
 }
 
@@ -390,6 +504,10 @@ const tests = [
     testReadonly,
     testExists,
     testReplaceOne,
+    testFindOptions,
+    testGroupAgg,
+    testCursorIteration,
+    testUseAfterClose,
 ];
 
 console.log('MooFile Node.js Test Suite');

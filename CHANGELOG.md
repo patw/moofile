@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+### Language bindings
+
+- **Node.js, Go, Java and C# bindings are now functional.** As first written
+  none of them could execute: the Node binding required `ffi-napi` (which no
+  longer builds on Node 18+), the Java binding declared JNI natives against
+  symbols `libmoofile` does not export, and the C# binding did not compile and
+  applied its error check to the result pointer rather than the error pointer.
+- **Node.js ported from `ffi-napi` to [koffi](https://koffi.dev)** — prebuilt,
+  no node-gyp. Returned strings are now freed, the library handle is cached
+  across collections, and cursors are iterable and self-freeing.
+- **Java rewritten on the Foreign Function & Memory API** (JDK 22+). No
+  third-party jars and no Maven or Gradle; `build.sh` is the whole toolchain.
+  Adds a correct JSON parser — the previous comma-splitting one corrupted any
+  document containing a vector, a nested object, or a comma inside a string.
+- **C# rewritten** on a working P/Invoke layer with UTF-8 marshalling and a
+  `NativeLibrary` resolver. Documents now hold plain CLR values instead of
+  `JsonElement`, so `doc["age"]` compares as expected. Targets `net10.0`.
+- **Go: `auto_embed` now reaches the core.** `AutoEmbedConfig` fields lacked
+  JSON tags, so they serialised as `Model`/`Target` while the C layer reads
+  `model`/`target` — semantic search could never be configured from Go. Also
+  fixes a `C.CString` leak on every call and adds `-L`/rpath link flags.
+- **C++ wrapper now compiles.** `insert`, `insert_many` and `stats` referenced
+  an undeclared `err`, so the header was unusable; missing `<optional>` and
+  `<cstdint>` includes added. `db.count({})` no longer trips over nlohmann
+  decaying `{}` to null.
+
+### C ABI
+
+- **New `moofile_find_ex()`** exposes the full query builder — sort, skip,
+  limit, group, agg — which had no C entry point, leaving every non-Python
+  language unable to sort or paginate. Surfaced in all six bindings.
+  Unrecognised option keys and aggregation names are errors, so a typo cannot
+  silently return the whole collection.
+- **Documented the ABI contract** in `moofile.h`: error conventions, string
+  and cursor ownership, no-match semantics, and `dead_records` accounting.
+- **Corrected the header's no-match documentation.** `update_one` and
+  `replace_one` fail when nothing matches (matching Rust and Python, which
+  raise `DocumentNotFound`); the header claimed they return 0.
+
+### Build
+
+- **The `embed` feature is now real.** `bindings/c/Cargo.toml` referenced
+  `moofile-core/embed`, a feature that never existed — the line was a hard
+  build error, and `llama-gguf` was an unconditional dependency, so
+  autoembedding was always compiled in with no way to opt out. `moofile-core`
+  now has a genuine `embed` feature, **on by default** and forwarded by both
+  bindings. `--no-default-features` drops `llama-gguf` and ~300 transitive
+  crates (libmoofile ~8.3 MB → ~2.8 MB); the config types remain and any
+  attempt to embed returns the new `MooFileError::EmbedDisabled`. Only
+  `core/src/embed.rs` needed `cfg` attributes: `EmbeddingEngine` becomes an
+  uninhabited stub, so the rest of the crate stays gate-free.
+- **`BUILDING.md`** — toolchain setup for all seven languages: one
+  `apt install` for Ubuntu, plus Fedora, Arch, Alpine, macOS and best-effort
+  Windows notes, version floors, and troubleshooting.
+- **`scripts/test-all.sh`** — runs every suite and prints a summary, skipping
+  languages whose toolchain is absent rather than failing.
+
+### Core
+
+- **Fixed `group()` in the Rust backend.** Group keys were stringified via
+  `Bson::to_string()`, so a group on a string field produced `"\"eng\""` and a
+  group on an integer produced text — diverging from the Python backend for
+  every type. Keys now keep their original BSON value, and first-seen ordering
+  matches Python.
+- **`semantic()` exposed in the PyO3 binding**, which lacked it even though
+  the core and C ABI both had it. The pure-Python backend raises
+  `NotImplementedError` explaining that autoembedding needs the Rust engine.
+
+### Tests
+
+- Test suites for every binding: C 73, C++ 42, parity 8, Node 22, Go 22,
+  Java 30, C# 30 — plus runnable examples for Node, Go, Java and C#.
+- **`run_tests.sh` now runs the cross-backend parity suite**, and the C/C++
+  suites build again (they were failing on missing includes and an
+  nlohmann download path that did not match the `#include`).
+- **Fixed the parity harness**, which was aborting with `free(): invalid size`:
+  it declared C string returns as `c_char_p`, so ctypes discarded the real
+  pointer and handed Python's own buffer to `moofile_free_string`. Its error
+  slot was also a NULL `char**`, which disabled error reporting entirely, and
+  its Python/Rust backends never actually opened a batch — making their
+  rollback a silent no-op.
+
 ## v0.6.0 (2026-07-28)
 
 - **Datetime parity**: BSON datetime round-tripping fixed in Rust backend (naive ↔ timezone-aware handled consistently)

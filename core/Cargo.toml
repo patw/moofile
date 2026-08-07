@@ -25,8 +25,16 @@ rayon = "1"
 bincode = "1"
 fs4 = "0.12"
 hex = "0.4"
-llama-gguf = { version = "0.14", default-features = false, features = ["cpu", "huggingface"] }
+llama-gguf = { version = "0.14", default-features = false, features = ["cpu", "huggingface"], optional = true }
 dirs = "6"
+
+[features]
+# Autoembedding: on-device GGUF inference plus HuggingFace model downloads.
+# On by default.  `--no-default-features` drops llama-gguf (~300 transitive
+# crates) and everything that runs a model; the config types stay available
+# and any attempt to embed returns MooFileError::EmbedDisabled.
+default = ["embed"]
+embed = ["dep:llama-gguf"]
 
 [dev-dependencies]
 tempfile = "3"

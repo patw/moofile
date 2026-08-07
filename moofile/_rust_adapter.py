@@ -280,6 +280,11 @@ class _NativeQuery:
             self._native, self._filter, text_field, vector_field, query_text, query_vector, limit
         )
 
+    def semantic(self, source_field, query_text, limit=10):
+        return _NativeSemanticQuery(
+            self._native, self._filter, source_field, query_text, limit
+        )
+
     def to_list(self) -> list:
         try:
             raw_docs = self._native.find_raw(self._filter)
@@ -389,6 +394,42 @@ class _NativeTextQuery:
                 self._pre_filter if self._pre_filter else None,
                 self._field,
                 self._query,
+                self._limit if self._limit is not None else 10,
+            )
+        except RuntimeError as e:
+            _map_errors(e)
+        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+
+    def first(self):
+        results = self.to_list()
+        return results[0] if results else None
+
+
+# ---------------------------------------------------------------------------
+# _NativeSemanticQuery
+# ---------------------------------------------------------------------------
+
+class _NativeSemanticQuery:
+    """
+    Semantic search results from the native engine.
+
+    The query text is embedded on the Rust side using the model configured for
+    ``source_field`` via ``auto_embed``, so no vector is passed in.
+    """
+
+    def __init__(self, native, pre_filter, source_field, query_text, limit):
+        self._native = native
+        self._pre_filter = pre_filter
+        self._source_field = source_field
+        self._query_text = query_text
+        self._limit = limit
+
+    def to_list(self) -> list:
+        try:
+            raw_results = self._native.semantic_search_raw(
+                self._pre_filter if self._pre_filter else None,
+                self._source_field,
+                self._query_text,
                 self._limit if self._limit is not None else 10,
             )
         except RuntimeError as e:

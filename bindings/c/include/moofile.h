@@ -1,6 +1,43 @@
 #ifndef MOOFILE_H
 #define MOOFILE_H
 
+/* ---------------------------------------------------------------------------
+ * ABI contract
+ * ---------------------------------------------------------------------------
+ *
+ * Error convention
+ *   Every function takes a trailing `char** err_out`, which may be NULL if the
+ *   caller does not want the message.  On entry it is set to NULL; on failure
+ *   it is set to an allocated message the caller must release with
+ *   moofile_free_string().  Failure is signalled by the return value:
+ *     - pointer-returning functions return NULL
+ *     - int-returning functions return -1
+ *     - int64_t-returning functions return -1
+ *   A NULL return with `*err_out == NULL` is not an error — it means "no
+ *   result" (an exhausted cursor, or moofile_find_one() with no match).
+ *
+ * Ownership
+ *   Every `char*` returned by this library is owned by the caller and must be
+ *   released with moofile_free_string().  That includes documents from
+ *   cursors and every error message.  Cursors are released with
+ *   moofile_cursor_free() / moofile_search_cursor_free(), and collections with
+ *   moofile_close().  Strings passed *in* are borrowed for the duration of the
+ *   call and are never retained.
+ *
+ * Missing-document semantics
+ *   The single-document mutators moofile_update_one() and
+ *   moofile_replace_one() fail with -1 and the message "no document matches
+ *   filter" when nothing matches, mirroring the Rust and Python APIs, which
+ *   raise DocumentNotFound.  The bulk and delete operations do not:
+ *   moofile_update_many(), moofile_delete_one() and moofile_delete_many()
+ *   return 0 on a miss, which is likewise how Rust and Python behave.
+ *
+ * Thread safety
+ *   A collection handle may be shared between threads; the Rust core guards it
+ *   with a lock.  Cursors are *not* thread-safe — do not iterate one cursor
+ *   from two threads at once.
+ * --------------------------------------------------------------------------- */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -104,6 +141,35 @@ char* moofile_insert_many(MooFileCollection* handle, const char* docs_json, char
 MooFileCursor* moofile_find(MooFileCollection* handle, const char* filter_json, char** err_out);
 
 /**
+ * Find documents with the full query builder — sort, skip, limit, group, agg.
+ *
+ * @param handle      The collection handle.
+ * @param filter_json JSON object filter (use "{}" for all documents).
+ * @param options_json JSON object (or NULL / "{}" for none):
+ *   {
+ *     "sort":  "age",                       // ascending, shorthand
+ *     "sort":  {"field": "age", "desc": true},
+ *     "skip":  10,
+ *     "limit": 5,
+ *     "group": "department",                 // group before sort/skip/limit
+ *     "agg":   [{"func": "count"},
+ *               {"func": "sum",  "field": "amount"},
+ *               {"func": "mean", "field": "score"}]
+ *   }
+ *   Aggregation functions: "count" (no field), "sum", "mean" (alias "avg"),
+ *   "min", "max", "collect", "first", "last".  Output fields are named
+ *   "count", "sum_<field>", "mean_<field>", and so on.  An unrecognised
+ *   option key or function name is an error rather than being ignored, so a
+ *   typo cannot silently return the whole collection.
+ *
+ *   Stages apply in this order: filter → group/agg → sort → skip → limit.
+ * @param err_out     Optional error output.
+ * @return A cursor, or NULL on error.  Must be freed with moofile_cursor_free().
+ */
+MooFileCursor* moofile_find_ex(MooFileCollection* handle, const char* filter_json,
+                                const char* options_json, char** err_out);
+
+/**
  * Find the first document matching a filter.
  *
  * @param handle     The collection handle.
@@ -171,7 +237,9 @@ void moofile_cursor_free(MooFileCursor* cursor);
  *     "inc": {"counter": 1}
  *   }
  * @param err_out    Optional error output.
- * @return 1 if a document was updated, 0 if nothing matched, -1 on error.
+ * @return 1 if a document was updated, or -1 on error.  Matching nothing *is*
+ *         an error here ("no document matches filter"), mirroring the Rust and
+ *         Python APIs — use moofile_exists() first if a miss is expected.
  */
 int moofile_update_one(MooFileCollection* handle, const char* where_json,
                         const char* update_json, char** err_out);
@@ -179,16 +247,19 @@ int moofile_update_one(MooFileCollection* handle, const char* where_json,
 /**
  * Update all documents matching a filter.
  *
- * @return The number of documents updated, or -1 on error.
+ * @return The number of documents updated, or -1 on error.  Unlike
+ *         moofile_update_one(), matching nothing is *not* an error here — it
+ *         returns 0, matching the Rust and Python bulk-update APIs.
  */
 int64_t moofile_update_many(MooFileCollection* handle, const char* where_json,
                              const char* update_json, char** err_out);
 
 /**
- * Replace the first document matching a filter.
+ * Replace the first document matching a filter.  The original _id is kept.
  *
  * @param replacement_json JSON object of the replacement document.
- * @return 1 if replaced, 0 if nothing matched, -1 on error.
+ * @return 1 if replaced, or -1 on error.  As with moofile_update_one(),
+ *         matching nothing is an error.
  */
 int moofile_replace_one(MooFileCollection* handle, const char* where_json,
                          const char* replacement_json, char** err_out);
@@ -329,7 +400,15 @@ int moofile_batch_rollback(MooFileCollection* handle, char** err_out);
  * --------------------------------------------------------------------------- */
 
 /**
- * Get collection statistics as a JSON string.
+ * Get collection statistics as a JSON string:
+ *   {"documents": 1, "dead_records": 2, "file_size_bytes": 146, "dead_ratio": 0.66}
+ *
+ * `documents` is the live document count.  `dead_records` counts every record
+ * on disk that is no longer live — note that deleting one document adds *two*
+ * (the superseded original plus the tombstone), and updating one adds one.
+ * `dead_ratio` is dead_records / total records, the figure to threshold on
+ * when deciding whether to call moofile_compact().
+ *
  * Must be freed with moofile_free_string().
  */
 char* moofile_stats(MooFileCollection* handle, char** err_out);

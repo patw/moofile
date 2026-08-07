@@ -12,6 +12,7 @@ Usage:
     python3 test_parity.py --skip-c         # skip C backend tests
 """
 
+import ctypes
 import json
 import math
 import os
@@ -34,8 +35,10 @@ g_test_name = ""
 
 
 def test(name: str):
-    global g_test_name
+    """Start a named scenario and count it."""
+    global g_test_name, g_tests_run
     g_test_name = name
+    g_tests_run += 1
 
 
 def fail(msg: str):
@@ -187,6 +190,7 @@ class PythonBackend(Backend):
         super().__init__("Python (pure)")
         self._db = None
         self._batch_active = False
+        self._batch_ctx = None
 
     def open(self, path, indexes=None, vector_indexes=None,
              text_indexes=None, readonly=False, durability="os"):
@@ -282,14 +286,27 @@ class PythonBackend(Backend):
                                 query_vector, limit).to_list()]
 
     def batch(self):
+        # __enter__ is what installs the context on the collection, so writes
+        # made through bk.insert() are actually buffered.  Merely calling
+        # db.batch() returns an unused context and leaves every write
+        # unbatched — which silently made this backend's rollback a no-op.
         self._batch_active = True
-        return self._db.batch()
+        self._batch_ctx = self._db.batch()
+        self._batch_ctx.__enter__()
+        return self._batch_ctx
 
     def batch_commit(self):
         self._batch_active = False
+        if self._batch_ctx is not None:
+            self._batch_ctx.__exit__(None, None, None)
+            self._batch_ctx = None
 
     def batch_rollback(self):
         self._batch_active = False
+        if self._batch_ctx is not None:
+            # Passing an exception type makes __exit__ roll back
+            self._batch_ctx.__exit__(RuntimeError, RuntimeError("rollback"), None)
+            self._batch_ctx = None
 
     def stats(self):
         return dict(self._db.stats())
@@ -315,6 +332,7 @@ class RustNativeBackend(Backend):
         super().__init__("Rust (native)")
         self._db = None
         self._batch_active = False
+        self._batch_ctx = None
 
     def open(self, path, indexes=None, vector_indexes=None,
              text_indexes=None, readonly=False, durability="os"):
@@ -400,14 +418,27 @@ class RustNativeBackend(Backend):
                                 query_vector, limit).to_list()]
 
     def batch(self):
+        # __enter__ is what installs the context on the collection, so writes
+        # made through bk.insert() are actually buffered.  Merely calling
+        # db.batch() returns an unused context and leaves every write
+        # unbatched — which silently made this backend's rollback a no-op.
         self._batch_active = True
-        return self._db.batch()
+        self._batch_ctx = self._db.batch()
+        self._batch_ctx.__enter__()
+        return self._batch_ctx
 
     def batch_commit(self):
         self._batch_active = False
+        if self._batch_ctx is not None:
+            self._batch_ctx.__exit__(None, None, None)
+            self._batch_ctx = None
 
     def batch_rollback(self):
         self._batch_active = False
+        if self._batch_ctx is not None:
+            # Passing an exception type makes __exit__ roll back
+            self._batch_ctx.__exit__(RuntimeError, RuntimeError("rollback"), None)
+            self._batch_ctx = None
 
     def stats(self):
         return dict(self._db.stats())
@@ -443,65 +474,72 @@ class CBackend(Backend):
         # moofile_open: (const char*, const char*, char**) -> MooFileCollection*
         self._lib.moofile_open.restype = ctypes.c_void_p
         self._lib.moofile_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p,
-                                            ctypes.POINTER(ctypes.c_char_p)]
+                                            ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_close: (MooFileCollection*, char**) -> int
         self._lib.moofile_close.restype = ctypes.c_int
         self._lib.moofile_close.argtypes = [ctypes.c_void_p,
-                                             ctypes.POINTER(ctypes.c_char_p)]
+                                             ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_insert: (MooFileCollection*, const char*, char**) -> char*
-        self._lib.moofile_insert.restype = ctypes.c_char_p
+        self._lib.moofile_insert.restype = ctypes.c_void_p
         self._lib.moofile_insert.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                              ctypes.POINTER(ctypes.c_char_p)]
+                                              ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_insert_many: ... -> char*
-        self._lib.moofile_insert_many.restype = ctypes.c_char_p
+        self._lib.moofile_insert_many.restype = ctypes.c_void_p
         self._lib.moofile_insert_many.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                                   ctypes.POINTER(ctypes.c_char_p)]
+                                                   ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_find: ... -> MooFileCursor*
         self._lib.moofile_find.restype = ctypes.c_void_p
         self._lib.moofile_find.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                            ctypes.POINTER(ctypes.c_char_p)]
+                                            ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_find_one: ... -> char*
-        self._lib.moofile_find_one.restype = ctypes.c_char_p
+        self._lib.moofile_find_one.restype = ctypes.c_void_p
         self._lib.moofile_find_one.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                                ctypes.POINTER(ctypes.c_char_p)]
+                                                ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_count: ... -> int64_t
         self._lib.moofile_count.restype = ctypes.c_int64
         self._lib.moofile_count.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                             ctypes.POINTER(ctypes.c_char_p)]
+                                             ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_exists: ... -> int
         self._lib.moofile_exists.restype = ctypes.c_int
         self._lib.moofile_exists.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                              ctypes.POINTER(ctypes.c_char_p)]
+                                              ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_cursor_next: (MooFileCursor*, char**) -> char*
-        self._lib.moofile_cursor_next.restype = ctypes.c_char_p
+        self._lib.moofile_cursor_next.restype = ctypes.c_void_p
         self._lib.moofile_cursor_next.argtypes = [ctypes.c_void_p,
-                                                   ctypes.POINTER(ctypes.c_char_p)]
+                                                   ctypes.POINTER(ctypes.c_void_p)]
 
         # moofile_cursor_free: (MooFileCursor*) -> void
         self._lib.moofile_cursor_free.restype = None
         self._lib.moofile_cursor_free.argtypes = [ctypes.c_void_p]
 
-        # Update
-        for fn in ['moofile_update_one', 'moofile_replace_one',
-                    'moofile_delete_one']:
+        # Update — (handle, where, update, err)
+        for fn in ['moofile_update_one', 'moofile_replace_one']:
             f = getattr(self._lib, fn)
             f.restype = ctypes.c_int
             f.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-                          ctypes.POINTER(ctypes.c_char_p)]
+                          ctypes.POINTER(ctypes.c_void_p)]
 
-        for fn in ['moofile_update_many', 'moofile_delete_many']:
-            f = getattr(self._lib, fn)
-            f.restype = ctypes.c_int64
-            f.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-                          ctypes.POINTER(ctypes.c_char_p)]
+        self._lib.moofile_update_many.restype = ctypes.c_int64
+        self._lib.moofile_update_many.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_void_p)]
+
+        # Delete — (handle, where, err); no update argument
+        self._lib.moofile_delete_one.restype = ctypes.c_int
+        self._lib.moofile_delete_one.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+
+        self._lib.moofile_delete_many.restype = ctypes.c_int64
+        self._lib.moofile_delete_many.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
 
         # Search
         for fn, has_vec in [('moofile_vector_search', True),
@@ -512,19 +550,19 @@ class CBackend(Backend):
 
         self._lib.moofile_vector_search.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-            ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+            ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
         self._lib.moofile_text_search.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
-            ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+            ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
         self._lib.moofile_hybrid_search.argtypes = [
             ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
             ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-            ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+            ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
 
         # Search cursor
-        self._lib.moofile_search_cursor_next.restype = ctypes.c_char_p
+        self._lib.moofile_search_cursor_next.restype = ctypes.c_void_p
         self._lib.moofile_search_cursor_next.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
         self._lib.moofile_search_cursor_free.restype = None
         self._lib.moofile_search_cursor_free.argtypes = [ctypes.c_void_p]
 
@@ -533,35 +571,63 @@ class CBackend(Backend):
                     'moofile_batch_rollback']:
             f = getattr(self._lib, fn)
             f.restype = ctypes.c_int
-            f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+            f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 
         # Utility
-        self._lib.moofile_stats.restype = ctypes.c_char_p
+        self._lib.moofile_stats.restype = ctypes.c_void_p
         self._lib.moofile_stats.argtypes = [ctypes.c_void_p,
-                                             ctypes.POINTER(ctypes.c_char_p)]
+                                             ctypes.POINTER(ctypes.c_void_p)]
 
         for fn in ['moofile_compact', 'moofile_sync', 'moofile_reindex']:
             f = getattr(self._lib, fn)
             f.restype = ctypes.c_int
-            f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+            f.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
 
         self._lib.moofile_free_string.restype = None
-        self._lib.moofile_free_string.argtypes = [ctypes.c_char_p]
+        self._lib.moofile_free_string.argtypes = [ctypes.c_void_p]
 
-    def _check_err(self, err_ptr):
+    def _check_err(self, err):
+        """
+        Read and release an error message, if the call set one.
+
+        `err` is the c_void_p slot allocated by _make_err, passed to the C
+        function by reference.
+        """
         import ctypes
-        if err_ptr and err_ptr[0]:
-            msg = ctypes.cast(err_ptr[0], ctypes.c_char_p).value
-            if msg:
-                err_str = msg.decode('utf-8')
-                self._lib.moofile_free_string(err_ptr[0])
-                err_ptr[0] = None
-                return err_str
-        return None
+        if not err.value:
+            return None
+        msg = ctypes.cast(err.value, ctypes.c_char_p).value
+        self._lib.moofile_free_string(err.value)
+        err.value = None
+        return msg.decode('utf-8') if msg else None
 
     def _make_err(self):
+        """
+        Allocate the `char**` out-parameter.
+
+        This must be a real slot passed by reference, not a NULL pointer: the
+        C layer skips writing the message entirely when err_out is NULL, so a
+        NULL slot silently disables all error reporting.
+        """
         import ctypes
-        return ctypes.POINTER(ctypes.c_char_p)()
+        return ctypes.c_void_p()
+
+    def _take_str(self, ptr):
+        """
+        Decode an owned C string and release it.
+
+        The declared restype is c_void_p rather than c_char_p on purpose:
+        c_char_p makes ctypes copy the bytes and discard the pointer, so the
+        matching moofile_free_string would be handed Python's own buffer —
+        which aborts with "free(): invalid size" — while the real Rust string
+        leaks.
+        """
+        import ctypes
+        if not ptr:
+            return None
+        value = ctypes.cast(ptr, ctypes.c_char_p).value
+        self._lib.moofile_free_string(ptr)
+        return value
 
     def _c(self, s: str) -> bytes:
         return s.encode('utf-8') if s else b''
@@ -581,9 +647,9 @@ class CBackend(Backend):
         config["durability"] = durability
 
         config_json = json.dumps(config)
-        err = ctypes.POINTER(ctypes.c_char_p)()
+        err = self._make_err()
         handle = self._lib.moofile_open(
-            self._c(path), self._c(config_json), err
+            self._c(path), self._c(config_json), ctypes.byref(err)
         )
         err_msg = self._check_err(err)
         if err_msg:
@@ -601,21 +667,25 @@ class CBackend(Backend):
 
     def _call(self, fn_name, *args):
         import ctypes
-        err = ctypes.POINTER(ctypes.c_char_p)()
+        err = self._make_err()
         fn = getattr(self._lib, fn_name)
-        result = fn(self._handle, *args, err)
+        result = fn(self._handle, *args, ctypes.byref(err))
         err_msg = self._check_err(err)
         if err_msg:
             # Some functions return None/null on error
             raise RuntimeError(err_msg)
         return result
 
+    def _call_str(self, fn_name, *args):
+        """Call a function returning an owned char*, and take ownership."""
+        return self._take_str(self._call(fn_name, *args))
+
     def _call_cursor(self, fn_name, *args):
         """Call a function that returns a cursor handle."""
         import ctypes
-        err = ctypes.POINTER(ctypes.c_char_p)()
+        err = self._make_err()
         fn = getattr(self._lib, fn_name)
-        cursor = fn(self._handle, *args, err)
+        cursor = fn(self._handle, *args, ctypes.byref(err))
         err_msg = self._check_err(err)
         if err_msg:
             raise RuntimeError(err_msg)
@@ -626,18 +696,15 @@ class CBackend(Backend):
         docs = []
         while True:
             err = self._make_err()
-            s = self._lib.moofile_cursor_next(cursor, err)
+            raw = self._lib.moofile_cursor_next(cursor, ctypes.byref(err))
             err_msg = self._check_err(err)
             if err_msg:
                 self._lib.moofile_cursor_free(cursor)
                 raise RuntimeError(err_msg)
-            if not s:
+            s = self._take_str(raw)
+            if s is None:
                 break
-            try:
-                doc = json.loads(s.decode('utf-8'))
-                docs.append(doc)
-            finally:
-                self._lib.moofile_free_string(s)
+            docs.append(json.loads(s.decode('utf-8')))
         self._lib.moofile_cursor_free(cursor)
         return docs
 
@@ -646,27 +713,25 @@ class CBackend(Backend):
         results = []
         while True:
             err = self._make_err()
-            s = self._lib.moofile_search_cursor_next(cursor, err)
+            raw = self._lib.moofile_search_cursor_next(cursor, ctypes.byref(err))
             err_msg = self._check_err(err)
             if err_msg:
                 self._lib.moofile_search_cursor_free(cursor)
                 raise RuntimeError(err_msg)
-            if not s:
+            s = self._take_str(raw)
+            if s is None:
                 break
-            try:
-                pair = json.loads(s.decode('utf-8'))
-                results.append((pair[0], pair[1]))
-            finally:
-                self._lib.moofile_free_string(s)
+            pair = json.loads(s.decode('utf-8'))
+            results.append((pair[0], pair[1]))
         self._lib.moofile_search_cursor_free(cursor)
         return results
 
     def insert(self, doc):
-        s = self._call('moofile_insert', self._c(json.dumps(doc)))
+        s = self._call_str('moofile_insert', self._c(json.dumps(doc)))
         return json.loads(s.decode('utf-8')) if s else {}
 
     def insert_many(self, docs):
-        s = self._call('moofile_insert_many', self._c(json.dumps(docs)))
+        s = self._call_str('moofile_insert_many', self._c(json.dumps(docs)))
         return json.loads(s.decode('utf-8')) if s else []
 
     def find(self, filter_dict=None):
@@ -675,14 +740,14 @@ class CBackend(Backend):
         return self._drain_cursor(cursor)
 
     def find_one(self, filter_dict=None):
-        s = self._call('moofile_find_one', self._c(json.dumps(filter_dict or {})))
+        s = self._call_str('moofile_find_one', self._c(json.dumps(filter_dict or {})))
         return json.loads(s.decode('utf-8')) if s else None
 
     def count(self, filter_dict=None):
         import ctypes
-        err = ctypes.POINTER(ctypes.c_char_p)()
+        err = self._make_err()
         n = self._lib.moofile_count(
-            self._handle, self._c(json.dumps(filter_dict or {})), err
+            self._handle, self._c(json.dumps(filter_dict or {})), ctypes.byref(err)
         )
         err_msg = self._check_err(err)
         if err_msg:
@@ -700,9 +765,16 @@ class CBackend(Backend):
             update["unset"] = unset
         if inc:
             update["inc"] = inc
-        return self._call('moofile_update_one',
-                           self._c(json.dumps(where)),
-                           self._c(json.dumps(update))) == 1
+        # Every backend raises on a miss; normalise to False here the same way
+        # the Python and Rust adapters do, so scenarios can compare results.
+        try:
+            return self._call('moofile_update_one',
+                               self._c(json.dumps(where)),
+                               self._c(json.dumps(update))) == 1
+        except RuntimeError as e:
+            if "no document matches" in str(e).lower():
+                return False
+            raise
 
     def update_many(self, where, set_vals=None, unset=None, inc=None):
         update = {}
@@ -717,9 +789,14 @@ class CBackend(Backend):
                            self._c(json.dumps(update)))
 
     def replace_one(self, where, replacement):
-        return self._call('moofile_replace_one',
-                           self._c(json.dumps(where)),
-                           self._c(json.dumps(replacement))) == 1
+        try:
+            return self._call('moofile_replace_one',
+                               self._c(json.dumps(where)),
+                               self._c(json.dumps(replacement))) == 1
+        except RuntimeError as e:
+            if "no document matches" in str(e).lower():
+                return False
+            raise
 
     def delete_one(self, where):
         return self._call('moofile_delete_one',
@@ -786,7 +863,7 @@ class CBackend(Backend):
         self._check_err(err)
 
     def stats(self):
-        s = self._call('moofile_stats')
+        s = self._call_str('moofile_stats')
         return json.loads(s.decode('utf-8')) if s else {}
 
     def compact(self):

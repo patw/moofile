@@ -224,6 +224,24 @@ class Query:
             self._filter,
         )
 
+    def semantic(self, source_field: str, query_text: str, limit: int = 10):
+        """
+        Semantic search — auto-embeds *query_text* and runs a vector search.
+
+        Only available on the Rust backend: autoembedding runs a GGUF model
+        through the Rust core, which the pure-Python implementation has no
+        counterpart for.  Raising here rather than omitting the method keeps
+        the two backends' API surfaces identical and makes the reason for the
+        failure obvious.
+        """
+        raise NotImplementedError(
+            "semantic() requires the Rust backend — the pure-Python "
+            "implementation cannot run embedding models. Install a native "
+            "wheel (pip install moofile) or build the extension with "
+            "`maturin develop --release`. Use vector_search() with a "
+            "pre-computed embedding if you need to stay on pure Python."
+        )
+
     # --- Terminal methods ---
 
     def to_list(self) -> list:

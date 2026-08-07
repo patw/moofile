@@ -894,8 +894,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "moofile-c"
+version = "0.6.0"
+dependencies = [
+ "bson",
+ "moofile-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "moofile-core"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "bincode",
  "bson",
@@ -916,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-py"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "bson",
  "moofile-core",

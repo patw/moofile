@@ -1,182 +1,134 @@
 package com.moofile;
 
-/**
- * MooFile — lightweight embedded document store (Java binding).
- *
- * Calls libmoofile via JNR-FFI or Panama FFI.  This implementation uses
- * the JNR-FFI approach which works with JDK 8+.
- *
- * Build:
- *   javac -cp jnr-ffi.jar:jnr-ffi-2.2.15.jar src/main/java/com/moofile/*.java
- *
- * Usage:
- *   import com.moofile.*;
- *
- *   Collection db = Collection.open("data.bson",
- *       Config.create().index("email").vectorIndex("emb", 384));
- *
- *   Document doc = db.insert(Document.parse("{\"name\":\"Alice\"}"));
- *   System.out.println(doc);
- *
- *   db.close();
- */
-
-import java.io.*;
-import java.nio.file.*;
-import java.util.*;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
- * A JSON-serializable document — wraps a Map&lt;String, Object&gt;.
+ * A MooFile document — an insertion-ordered map of field names to values.
+ *
+ * <p>Values are the plain Java types {@link Json} produces: {@link String},
+ * {@link Long}, {@link Double}, {@link Boolean}, {@link List}, nested
+ * {@link Map}, and null.
+ *
+ * <pre>{@code
+ * Document doc = new Document()
+ *     .put("name", "Alice")
+ *     .put("age", 30)
+ *     .put("tags", List.of("admin", "ops"));
+ * }</pre>
  */
-class Document {
-    final Map<String, Object> data;
+public class Document {
 
-    public Document() { this.data = new LinkedHashMap<>(); }
-    public Document(Map<String, Object> data) { this.data = data; }
+    private final Map<String, Object> data;
 
+    public Document() {
+        this.data = new LinkedHashMap<>();
+    }
+
+    public Document(Map<String, Object> data) {
+        this.data = data == null ? new LinkedHashMap<>() : new LinkedHashMap<>(data);
+    }
+
+    /** Build a document from alternating key/value arguments. */
+    public static Document of(Object... keyValuePairs) {
+        if (keyValuePairs.length % 2 != 0) {
+            throw new IllegalArgumentException("expected alternating key/value arguments");
+        }
+        Document d = new Document();
+        for (int i = 0; i < keyValuePairs.length; i += 2) {
+            d.put(String.valueOf(keyValuePairs[i]), keyValuePairs[i + 1]);
+        }
+        return d;
+    }
+
+    /** Set a field. Returns this, for chaining. */
     public Document put(String key, Object value) {
         data.put(key, value);
         return this;
     }
 
-    @SuppressWarnings("unchecked")
-    public Object get(String key) { return data.get(key); }
-
-    public String toJson() {
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (var e : data.entrySet()) {
-            if (!first) sb.append(",");
-            first = false;
-            sb.append(jsonEscape(e.getKey())).append(":");
-            sb.append(jsonValue(e.getValue()));
-        }
-        sb.append("}");
-        return sb.toString();
+    public Object get(String key) {
+        return data.get(key);
     }
 
+    /** Get a field as a string, or null if absent. */
+    public String getString(String key) {
+        Object v = data.get(key);
+        return v == null ? null : v.toString();
+    }
+
+    /**
+     * Get a numeric field as a long.
+     *
+     * @throws MooFileException if the field is absent or not a number
+     */
+    public long getLong(String key) {
+        Object v = data.get(key);
+        if (v instanceof Number n) return n.longValue();
+        throw new MooFileException("field '" + key + "' is not a number: " + v);
+    }
+
+    /**
+     * Get a numeric field as a double.
+     *
+     * @throws MooFileException if the field is absent or not a number
+     */
+    public double getDouble(String key) {
+        Object v = data.get(key);
+        if (v instanceof Number n) return n.doubleValue();
+        throw new MooFileException("field '" + key + "' is not a number: " + v);
+    }
+
+    /** Get a boolean field, defaulting to false when absent. */
+    public boolean getBoolean(String key) {
+        return Boolean.TRUE.equals(data.get(key));
+    }
+
+    /** Get a list field, or null if absent. */
+    @SuppressWarnings("unchecked")
+    public List<Object> getList(String key) {
+        Object v = data.get(key);
+        return v instanceof List ? (List<Object>) v : null;
+    }
+
+    /** Get a nested object field as a Document, or null if absent. */
+    @SuppressWarnings("unchecked")
+    public Document getDocument(String key) {
+        Object v = data.get(key);
+        return v instanceof Map ? new Document((Map<String, Object>) v) : null;
+    }
+
+    /** The document's {@code _id}, or null before insertion. */
+    public String id() {
+        return getString("_id");
+    }
+
+    public boolean containsKey(String key) { return data.containsKey(key); }
+    public Object remove(String key)       { return data.remove(key); }
+    public int size()                      { return data.size(); }
+    public boolean isEmpty()               { return data.isEmpty(); }
+    public java.util.Set<String> keySet()  { return data.keySet(); }
+
+    /** The backing map. Mutating it mutates the document. */
+    public Map<String, Object> asMap() { return data; }
+
+    public String toJson() { return Json.write(data); }
+
+    /** Parse a JSON object into a document. */
     public static Document parse(String json) {
-        return new Document(parseJson(json));
-    }
-
-    @SuppressWarnings("unchecked")
-    private static Map<String, Object> parseJson(String json) {
-        // Minimal JSON parser — in production use Jackson/Gson
-        Map<String, Object> map = new LinkedHashMap<>();
-        json = json.trim();
-        if (!json.startsWith("{") || !json.endsWith("}")) return map;
-        json = json.substring(1, json.length() - 1).trim();
-
-        int depth = 0;
-        int i = 0;
-        while (i < json.length()) {
-            // Skip to key
-            while (i < json.length() && Character.isWhitespace(json.charAt(i))) i++;
-            if (i >= json.length()) break;
-
-            // Parse key
-            if (json.charAt(i) != '"') break;
-            int keyEnd = json.indexOf('"', i + 1);
-            if (keyEnd < 0) break;
-            String key = json.substring(i + 1, keyEnd);
-            i = keyEnd + 1;
-
-            // Skip colon
-            while (i < json.length() && (json.charAt(i) == ':' || Character.isWhitespace(json.charAt(i)))) i++;
-
-            // Parse value
-            if (i < json.length() && json.charAt(i) == '{') {
-                int end = findMatching(json, i);
-                map.put(key, parseJson(json.substring(i, end + 1)));
-                i = end + 1;
-            } else if (i < json.length() && json.charAt(i) == '[') {
-                int end = findMatching(json, i);
-                map.put(key, parseJsonArray(json.substring(i, end + 1)));
-                i = end + 1;
-            } else if (i < json.length() && json.charAt(i) == '"') {
-                int valEnd = json.indexOf('"', i + 1);
-                if (valEnd < 0) break;
-                map.put(key, json.substring(i + 1, valEnd));
-                i = valEnd + 1;
-            } else {
-                // number, boolean, null
-                int valEnd = i;
-                while (valEnd < json.length() && json.charAt(valEnd) != ',' && json.charAt(valEnd) != '}') valEnd++;
-                String val = json.substring(i, valEnd).trim();
-                if (val.equals("null")) map.put(key, null);
-                else if (val.equals("true")) map.put(key, true);
-                else if (val.equals("false")) map.put(key, false);
-                else if (val.contains(".")) map.put(key, Double.parseDouble(val));
-                else map.put(key, Long.parseLong(val));
-                i = valEnd;
-            }
-
-            // Skip comma
-            while (i < json.length() && (json.charAt(i) == ',' || Character.isWhitespace(json.charAt(i)))) i++;
-        }
-        return map;
-    }
-
-    private static List<Object> parseJsonArray(String json) {
-        List<Object> list = new ArrayList<>();
-        json = json.trim();
-        if (!json.startsWith("[") || !json.endsWith("]")) return list;
-        json = json.substring(1, json.length() - 1).trim();
-        // Simplified: split by top-level commas
-        int depth = 0;
-        int start = 0;
-        for (int i = 0; i <= json.length(); i++) {
-            if (i == json.length() || (json.charAt(i) == ',' && depth == 0)) {
-                String item = json.substring(start, i).trim();
-                if (!item.isEmpty()) {
-                    if (item.startsWith("\"")) list.add(item.substring(1, item.length() - 1));
-                    else if (item.equals("null")) list.add(null);
-                    else if (item.equals("true")) list.add(true);
-                    else if (item.equals("false")) list.add(false);
-                    else if (item.contains(".")) list.add(Double.parseDouble(item));
-                    else list.add(Long.parseLong(item));
-                }
-                start = i + 1;
-            } else if (json.charAt(i) == '{' || json.charAt(i) == '[') depth++;
-            else if (json.charAt(i) == '}' || json.charAt(i) == ']') depth--;
-        }
-        return list;
-    }
-
-    private static int findMatching(String s, int start) {
-        char open = s.charAt(start);
-        char close = open == '{' ? '}' : ']';
-        int depth = 0;
-        for (int i = start; i < s.length(); i++) {
-            if (s.charAt(i) == open) depth++;
-            else if (s.charAt(i) == close) { depth--; if (depth == 0) return i; }
-        }
-        return s.length() - 1;
-    }
-
-    private String jsonValue(Object v) {
-        if (v == null) return "null";
-        if (v instanceof String) return jsonEscape((String) v);
-        if (v instanceof Boolean || v instanceof Number) return v.toString();
-        if (v instanceof Map) return new Document((Map<String,Object>)v).toJson();
-        if (v instanceof List) {
-            StringBuilder sb = new StringBuilder("[");
-            boolean first = true;
-            for (Object e : (List)v) {
-                if (!first) sb.append(",");
-                first = false;
-                sb.append(jsonValue(e));
-            }
-            return sb.append("]").toString();
-        }
-        return jsonEscape(v.toString());
-    }
-
-    private String jsonEscape(String s) {
-        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"")
-            .replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
+        return new Document(Json.parseObject(json));
     }
 
     @Override
     public String toString() { return toJson(); }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        return o instanceof Document other && data.equals(other.data);
+    }
+
+    @Override
+    public int hashCode() { return data.hashCode(); }
 }

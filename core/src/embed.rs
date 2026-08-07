@@ -6,11 +6,27 @@
 /// - [`EmbeddingPrecision`]: how to quantize the output vectors
 /// - [`ModelUri`]: parsing HuggingFace hub identifiers
 /// - Quantization/helper functions for int8/uint8/binary
+///
+/// ## The `embed` feature
+///
+/// Everything that actually *runs* a model lives behind the `embed` feature,
+/// which is on by default.  Building with `--no-default-features` drops the
+/// `llama-gguf` dependency (a ~300-crate tree) along with model loading and
+/// HuggingFace downloads.
+///
+/// The configuration types — [`AutoEmbedConfig`], [`EmbeddingPrecision`],
+/// [`ModelUri`] — and the quantisation helpers are always compiled, so the
+/// rest of the crate needs no `cfg` attributes: only [`EmbeddingEngine`]
+/// changes shape, becoming a stub whose constructor returns
+/// [`MooFileError::EmbedDisabled`].
 
 use std::path::{Path, PathBuf};
+#[cfg(feature = "embed")]
 use std::sync::Arc;
 
+#[cfg(feature = "embed")]
 use llama_gguf::engine::{Engine, EngineConfig};
+#[cfg(feature = "embed")]
 use llama_gguf::huggingface::HfClient;
 
 use crate::MooFileError;
@@ -86,6 +102,13 @@ impl ModelUri {
                 }
                 Ok(path.clone())
             }
+            // Downloading needs the HuggingFace client from llama-gguf.
+            // A local path still resolves without the feature, so a
+            // pre-fetched model can be pointed at directly.
+            #[cfg(not(feature = "embed"))]
+            ModelUri::HuggingFace(_, _) => Err(MooFileError::EmbedDisabled),
+
+            #[cfg(feature = "embed")]
             ModelUri::HuggingFace(repo_id, filename) => {
                 let client = HfClient::default();
 
@@ -168,9 +191,22 @@ impl Default for AutoEmbedConfig {
 /// Wraps a `llama-gguf` engine for embedding text.
 ///
 /// This is `Send + Sync` so it can be shared across threads via `Arc`.
+#[cfg(feature = "embed")]
 #[derive(Clone)]
 pub struct EmbeddingEngine {
     inner: Arc<Engine>,
+}
+
+/// Stub used when the `embed` feature is off.
+///
+/// Keeping the type (rather than removing it) is what lets the rest of the
+/// crate stay free of `cfg` attributes: `Collection` can still hold a map of
+/// engines, it just can never construct one.  The uninhabited body makes that
+/// a compile-time guarantee rather than a convention.
+#[cfg(not(feature = "embed"))]
+#[derive(Clone)]
+pub struct EmbeddingEngine {
+    _never: std::convert::Infallible,
 }
 
 impl std::fmt::Debug for EmbeddingEngine {
@@ -179,6 +215,25 @@ impl std::fmt::Debug for EmbeddingEngine {
     }
 }
 
+#[cfg(not(feature = "embed"))]
+impl EmbeddingEngine {
+    /// Always fails — this build has no embedding engine compiled in.
+    pub fn load(_model_path: &Path) -> Result<Self, MooFileError> {
+        Err(MooFileError::EmbedDisabled)
+    }
+
+    /// Unreachable: no value of this type can exist without the feature.
+    pub fn embed(&self, _text: &str) -> Result<Vec<f32>, MooFileError> {
+        match self._never {}
+    }
+
+    /// Unreachable: no value of this type can exist without the feature.
+    pub fn dims(&self) -> usize {
+        match self._never {}
+    }
+}
+
+#[cfg(feature = "embed")]
 impl EmbeddingEngine {
     /// Load an embedding model from a GGUF file.
     pub fn load(model_path: &Path) -> Result<Self, MooFileError> {
