@@ -11,6 +11,49 @@ from typing import Optional
 _NativeCollection = None
 
 
+def _decode_native_document(value):
+    """Decode a raw BSON document, accepting older native dict returns too.
+
+    Current native methods return BSON bytes to preserve every BSON type. The
+    dict fallback keeps an adapter installed beside an older extension usable
+    during editable-development rebuilds and is harmless for release wheels.
+    """
+    return value if isinstance(value, dict) else _bson.BSON(value).decode()
+
+
+def _filter_documents(documents, filter_dict):
+    """Apply MooFile filter semantics after decoding native query results.
+
+    The native engine is authoritative, but this defensive final check keeps
+    the adapter correct when it is paired with an older extension during an
+    editable rebuild. It specifically protects the missing-field/range-query
+    invariant and is a no-op for current native releases that already filter
+    correctly.
+    """
+    if not filter_dict:
+        return documents
+    from .query import matches, validate_filter
+    validate_filter(filter_dict)
+    return [document for document in documents if matches(document, filter_dict)]
+
+
+def _validate_document_id(document):
+    """Reject invalid IDs before they reach a native extension.
+
+    This mirrors the core's invariant and protects older extensions that used
+    BSON's typed accessor with `unwrap()`, which could poison their lock on a
+    malformed `_id` instead of raising a normal Python exception.
+    """
+    if "_id" in document and not isinstance(document["_id"], str):
+        from .errors import InvalidIdError
+        raise InvalidIdError(f"_id must be a string, got {type(document['_id']).__name__}")
+
+
+def _validate_filter(filter_dict):
+    from .query import validate_filter
+    validate_filter(filter_dict or {})
+
+
 # ---------------------------------------------------------------------------
 # Error mapping
 # ---------------------------------------------------------------------------
@@ -100,36 +143,42 @@ class Collection:
     # --- Insert ---
 
     def insert(self, doc: dict) -> dict:
+        _validate_document_id(doc)
         try:
             # Raw BSON, decoded with pymongo's C decoder — the native side used
             # to build the dict itself and stringified any type it did not know
             # (datetime, Binary, ObjectId, ...).
-            return _bson.BSON(self._native.insert(doc)).decode()
+            return _decode_native_document(self._native.insert(doc))
         except (RuntimeError, ValueError) as e:
             _map_errors(e)
 
     def insert_many(self, docs: list) -> list:
+        for doc in docs:
+            _validate_document_id(doc)
         try:
             raw_docs = self._native.insert_many(docs)
-            return [_bson.BSON(raw).decode() for raw in raw_docs]
+            return [_decode_native_document(raw) for raw in raw_docs]
         except (RuntimeError, ValueError) as e:
             _map_errors(e)
 
     # --- Query ---
 
     def find(self, filter_dict=None):
+        _validate_filter(filter_dict)
         return _NativeQuery(self._native, filter_dict or {})
 
     def find_one(self, filter_dict=None):
+        _validate_filter(filter_dict)
         try:
             raw = self._native.find_one_raw(filter_dict)
             if raw is None:
                 return None
-            return _bson.BSON(raw).decode()
+            return _decode_native_document(raw)
         except RuntimeError as e:
             _map_errors(e)
 
     def count(self, filter_dict=None) -> int:
+        _validate_filter(filter_dict)
         try:
             return self._native.count(filter_dict)
         except RuntimeError as e:
@@ -141,18 +190,22 @@ class Collection:
     # --- Update ---
 
     def update_one(self, where, set=None, unset=None, inc=None):
+        _validate_filter(where)
         try:
             return self._native.update_one(where, set, unset, inc)
         except RuntimeError as e:
             _map_errors(e)
 
     def update_many(self, where, set=None, unset=None, inc=None):
+        _validate_filter(where)
         try:
             return self._native.update_many(where, set, unset, inc)
         except RuntimeError as e:
             _map_errors(e)
 
     def replace_one(self, where, new_doc):
+        _validate_filter(where)
+        _validate_document_id(new_doc)
         try:
             return self._native.replace_one(where, new_doc)
         except RuntimeError as e:
@@ -161,12 +214,14 @@ class Collection:
     # --- Delete ---
 
     def delete_one(self, where) -> bool:
+        _validate_filter(where)
         try:
             return self._native.delete_one(where)
         except RuntimeError as e:
             _map_errors(e)
 
     def delete_many(self, where) -> int:
+        _validate_filter(where)
         try:
             return self._native.delete_many(where)
         except RuntimeError as e:
@@ -290,7 +345,7 @@ class _NativeQuery:
             raw_docs = self._native.find_raw(self._filter)
         except RuntimeError as e:
             _map_errors(e)
-        results = [_bson.BSON(raw).decode() for raw in raw_docs]
+        results = [_decode_native_document(raw) for raw in raw_docs]
 
         # Group + aggregate (done in Python, same as pure-Python impl)
         if self._group_field is not None:
@@ -367,7 +422,7 @@ class _NativeVectorQuery:
             )
         except RuntimeError as e:
             _map_errors(e)
-        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+        return [(_decode_native_document(raw), score) for raw, score in raw_results]
 
     def first(self):
         results = self.to_list()
@@ -398,7 +453,7 @@ class _NativeTextQuery:
             )
         except RuntimeError as e:
             _map_errors(e)
-        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+        return [(_decode_native_document(raw), score) for raw, score in raw_results]
 
     def first(self):
         results = self.to_list()
@@ -434,7 +489,7 @@ class _NativeSemanticQuery:
             )
         except RuntimeError as e:
             _map_errors(e)
-        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+        return [(_decode_native_document(raw), score) for raw, score in raw_results]
 
     def first(self):
         results = self.to_list()
@@ -469,7 +524,7 @@ class _NativeHybridQuery:
             )
         except RuntimeError as e:
             _map_errors(e)
-        return [(_bson.BSON(raw).decode(), score) for raw, score in raw_results]
+        return [(_decode_native_document(raw), score) for raw, score in raw_results]
 
     def first(self):
         results = self.to_list()

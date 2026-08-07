@@ -251,7 +251,8 @@ jobs:
           # workflow_dispatch can intentionally republish native release assets
           # for an existing tag. npm versions are immutable, so treat an
           # already-published matching version as a successful no-op.
-          if npm view "moofile@$(node -p \"require('./package.json').version\")" version \
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "moofile@$VERSION" version \
               --registry=https://registry.npmjs.org >/dev/null 2>&1; then
             echo "npm package version already published; skipping."
             exit 0

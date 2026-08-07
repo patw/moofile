@@ -83,6 +83,16 @@ pub fn matches(doc: &Document, filter: &Document) -> bool {
 }
 
 fn eval_field_condition(field_val: Option<&Bson>, condition: &Bson) -> bool {
+    // A missing field satisfies no range comparison. Keep this guard here,
+    // rather than relying only on cmp_op(), so every caller and every
+    // operator combination shares the same invariant.
+    if let Bson::Document(ops) = condition {
+        if field_val.is_none()
+            && ops.keys().any(|op| matches!(op.as_str(), "$gt" | "$gte" | "$lt" | "$lte"))
+        {
+            return false;
+        }
+    }
     match condition {
         c if !is_operator_doc(c) => field_val == Some(c),
         Bson::Document(ops) => {

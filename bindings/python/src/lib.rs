@@ -107,6 +107,26 @@ fn py_to_document(dict: &Bound<PyDict>) -> PyResult<Document> {
     }
 }
 
+/// Encode a Python document with pymongo, then decode it with Rust BSON.
+///
+/// PyO3 exact-type fast paths are useful for ordinary JSON-shaped documents,
+/// but pymongo owns the complete Python BSON type surface (datetime, Binary,
+/// ObjectId, Code, Decimal128, and more). This path preserves those types and
+/// gives the native and pure-Python implementations the same acceptance rules.
+fn py_document_via_pymongo(dict: &Bound<PyDict>) -> PyResult<Document> {
+    let py = dict.py();
+    let module = BSON_MODULE
+        .get_or_try_init(py, || py.import("bson").map(|m| m.unbind().into_any()))?
+        .bind(py);
+    let encoded = module.call_method1("encode", (dict,))?;
+    let bytes: Vec<u8> = encoded.extract()?;
+    bson::from_slice(&bytes).map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+            "could not decode document as BSON: {e}"
+        ))
+    })
+}
+
 /// Encode a BSON document to raw bytes for Python-side decoding (item #6).
 /// Returning raw bytes avoids the slow recursive PyDict building in bson_to_py
 /// and the lossy _ => val.to_string() fallback.
@@ -177,7 +197,7 @@ impl NativeCollection {
         let mut rust_docs = Vec::with_capacity(docs.len());
         for item in docs.iter() {
             let dict = item.downcast::<PyDict>()?;
-            rust_docs.push(py_to_document(dict)?);
+            rust_docs.push(py_document_via_pymongo(dict)?);
         }
         let results = self.inner.insert_many(rust_docs).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
@@ -190,7 +210,7 @@ impl NativeCollection {
     /// Single PyO3 round-trip, no per-doc conversion overhead in Python.
     fn find(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
@@ -209,7 +229,7 @@ impl NativeCollection {
     /// Building a PyDict here went through `bson_to_py`, which stringified
     /// every type it did not know (datetime, Binary, ObjectId, ...).
     fn insert(&self, py: Python<'_>, doc: &Bound<PyDict>) -> PyResult<PyObject> {
-        let d = py_to_document(doc)?;
+        let d = py_document_via_pymongo(doc)?;
         let result = self.inner.insert(d).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
         })?;
@@ -222,7 +242,7 @@ impl NativeCollection {
         filter: Option<&Bound<PyDict>>,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let result = self.inner.find_one(f).map_err(|e| {
@@ -243,7 +263,7 @@ impl NativeCollection {
     /// Find all matching documents and return as a list of raw BSON bytes.
     fn find_raw(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
@@ -263,7 +283,7 @@ impl NativeCollection {
         filter: Option<&Bound<PyDict>>,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let result = self.inner.find_one(f).map_err(|e| {
@@ -277,7 +297,7 @@ impl NativeCollection {
 
     fn count(&self, filter: Option<&Bound<PyDict>>) -> PyResult<usize> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         self.inner.count(f).map_err(|e| {
@@ -292,9 +312,9 @@ impl NativeCollection {
         unset: Option<Vec<String>>,
         inc: Option<&Bound<PyDict>>,
     ) -> PyResult<bool> {
-        let w = py_to_document(where_clause)?;
-        let s = set.map(|d| py_to_document(d)).transpose()?;
-        let i = inc.map(|d| py_to_document(d)).transpose()?;
+        let w = py_document_via_pymongo(where_clause)?;
+        let s = set.map(|d| py_document_via_pymongo(d)).transpose()?;
+        let i = inc.map(|d| py_document_via_pymongo(d)).transpose()?;
         self.inner.update_one(w, s, unset, i).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
@@ -307,9 +327,9 @@ impl NativeCollection {
         unset: Option<Vec<String>>,
         inc: Option<&Bound<PyDict>>,
     ) -> PyResult<usize> {
-        let w = py_to_document(where_clause)?;
-        let s = set.map(|d| py_to_document(d)).transpose()?;
-        let i = inc.map(|d| py_to_document(d)).transpose()?;
+        let w = py_document_via_pymongo(where_clause)?;
+        let s = set.map(|d| py_document_via_pymongo(d)).transpose()?;
+        let i = inc.map(|d| py_document_via_pymongo(d)).transpose()?;
         self.inner.update_many(w, s, unset, i).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
@@ -320,22 +340,22 @@ impl NativeCollection {
         where_clause: &Bound<PyDict>,
         replacement: &Bound<PyDict>,
     ) -> PyResult<bool> {
-        let w = py_to_document(where_clause)?;
-        let r = py_to_document(replacement)?;
+        let w = py_document_via_pymongo(where_clause)?;
+        let r = py_document_via_pymongo(replacement)?;
         self.inner.replace_one(w, r).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
     }
 
     fn delete_one(&self, where_clause: &Bound<PyDict>) -> PyResult<bool> {
-        let w = py_to_document(where_clause)?;
+        let w = py_document_via_pymongo(where_clause)?;
         self.inner.delete_one(w).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
     }
 
     fn delete_many(&self, where_clause: &Bound<PyDict>) -> PyResult<usize> {
-        let w = py_to_document(where_clause)?;
+        let w = py_document_via_pymongo(where_clause)?;
         self.inner.delete_many(w).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })
@@ -352,7 +372,7 @@ impl NativeCollection {
         limit: usize,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
@@ -384,7 +404,7 @@ impl NativeCollection {
         limit: usize,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
@@ -418,7 +438,7 @@ impl NativeCollection {
         limit: usize,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
@@ -451,7 +471,7 @@ impl NativeCollection {
         limit: usize,
     ) -> PyResult<PyObject> {
         let f = match filter {
-            Some(d) => py_to_document(d)?,
+            Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
         let results = self
