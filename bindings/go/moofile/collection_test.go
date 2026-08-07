@@ -224,7 +224,7 @@ func TestBatchRollback(t *testing.T) {
 	// Force a rollback by returning an error
 	err := db.Batch(func() error {
 		db.Insert(map[string]any{"_id": "a", "v": 1})
-		return moofile.Error{Msg: "rollback"}
+		return &moofile.Error{Msg: "rollback"}
 	})
 	if err == nil {
 		t.Error("expected error")

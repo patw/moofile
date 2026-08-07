@@ -1,8 +1,5 @@
 /**
- * MooFile — Node.js binding via ffi-napi.
- *
- * Calls the C shared library (libmoofile.so / .dylib / .dll) directly.
- * All documents are passed as JSON strings across the FFI boundary.
+ * MooFile — Node.js binding via koffi (modern C FFI).
  *
  * Usage:
  *   const moo = require('./moofile');
@@ -12,73 +9,65 @@
  *   db.close();
  */
 
-const ffi = require('ffi-napi');
-const ref = require('ref-napi');
-const Struct = require('ref-struct-napi');
+const koffi = require('koffi');
+const path = require('path');
+const fs = require('fs');
 
 // ---------------------------------------------------------------------------
-// Load the shared library
+// Library singleton — registers opaque types once globally
 // ---------------------------------------------------------------------------
 
-function loadLibrary(libPath) {
-    const lib = ffi.Library(libPath, {
-        // Lifecycle
-        'moofile_open': ['pointer', ['string', 'string', 'pointer']],
-        'moofile_close': ['int', ['pointer', 'pointer']],
+let _lib = null;
+let _libPath = null;
+let _typesRegistered = false;
 
-        // Insert
-        'moofile_insert': ['string', ['pointer', 'string', 'pointer']],
-        'moofile_insert_many': ['string', ['pointer', 'string', 'pointer']],
+function registerTypes() {
+    if (_typesRegistered) return;
+    koffi.pointer('MooFileCollection', koffi.opaque());
+    koffi.pointer('MooFileCursor', koffi.opaque());
+    koffi.pointer('MooFileSearchCursor', koffi.opaque());
+    _typesRegistered = true;
+}
 
-        // Query
-        'moofile_find': ['pointer', ['pointer', 'string', 'pointer']],
-        'moofile_find_one': ['string', ['pointer', 'string', 'pointer']],
-        'moofile_count': ['int64', ['pointer', 'string', 'pointer']],
-        'moofile_exists': ['int', ['pointer', 'string', 'pointer']],
+function getLibrary(libPath) {
+    if (_lib && _libPath === libPath) return _lib;
 
-        // Cursor
-        'moofile_cursor_next': ['string', ['pointer', 'pointer']],
-        'moofile_cursor_free': ['void', ['pointer']],
+    registerTypes();
+    const lib = koffi.load(libPath);
 
-        // Update
-        'moofile_update_one': ['int', ['pointer', 'string', 'string', 'pointer']],
-        'moofile_update_many': ['int64', ['pointer', 'string', 'string', 'pointer']],
-        'moofile_replace_one': ['int', ['pointer', 'string', 'string', 'pointer']],
+    // All functions - store as method references on lib
+    lib._open       = lib.func('MooFileCollection* moofile_open(const char* path, const char* config_json, void* err_out)');
+    lib._close      = lib.func('int moofile_close(MooFileCollection* handle, void* err_out)');
+    lib._insert     = lib.func('char* moofile_insert(MooFileCollection* handle, const char* doc_json, void* err_out)');
+    lib._insertMany = lib.func('char* moofile_insert_many(MooFileCollection* handle, const char* docs_json, void* err_out)');
+    lib._find       = lib.func('MooFileCursor* moofile_find(MooFileCollection* handle, const char* filter_json, void* err_out)');
+    lib._findOne    = lib.func('char* moofile_find_one(MooFileCollection* handle, const char* filter_json, void* err_out)');
+    lib._count      = lib.func('int64_t moofile_count(MooFileCollection* handle, const char* filter_json, void* err_out)');
+    lib._exists     = lib.func('int moofile_exists(MooFileCollection* handle, const char* filter_json, void* err_out)');
+    lib._cursorNext = lib.func('char* moofile_cursor_next(MooFileCursor* cursor, void* err_out)');
+    lib._cursorFree = lib.func('void moofile_cursor_free(MooFileCursor* cursor)');
+    lib._updateOne  = lib.func('int moofile_update_one(MooFileCollection* handle, const char* where_json, const char* update_json, void* err_out)');
+    lib._updateMany = lib.func('int64_t moofile_update_many(MooFileCollection* handle, const char* where_json, const char* update_json, void* err_out)');
+    lib._replaceOne = lib.func('int moofile_replace_one(MooFileCollection* handle, const char* where_json, const char* replacement_json, void* err_out)');
+    lib._deleteOne  = lib.func('int moofile_delete_one(MooFileCollection* handle, const char* where_json, void* err_out)');
+    lib._deleteMany = lib.func('int64_t moofile_delete_many(MooFileCollection* handle, const char* where_json, void* err_out)');
+    lib._vecSearch  = lib.func('MooFileSearchCursor* moofile_vector_search(MooFileCollection* handle, const char* filter_json, const char* field, const char* query_vector_json, int limit, void* err_out)');
+    lib._txtSearch  = lib.func('MooFileSearchCursor* moofile_text_search(MooFileCollection* handle, const char* filter_json, const char* field, const char* query, int limit, void* err_out)');
+    lib._hybSearch  = lib.func('MooFileSearchCursor* moofile_hybrid_search(MooFileCollection* handle, const char* filter_json, const char* text_field, const char* vector_field, const char* query_text, const char* query_vector_json, int limit, void* err_out)');
+    lib._semSearch  = lib.func('MooFileSearchCursor* moofile_semantic_search(MooFileCollection* handle, const char* filter_json, const char* source_field, const char* query_text, int limit, void* err_out)');
+    lib._searchNext = lib.func('char* moofile_search_cursor_next(MooFileSearchCursor* cursor, void* err_out)');
+    lib._searchFree = lib.func('void moofile_search_cursor_free(MooFileSearchCursor* cursor)');
+    lib._batchBegin = lib.func('int moofile_batch_begin(MooFileCollection* handle, void* err_out)');
+    lib._batchCommit = lib.func('int moofile_batch_commit(MooFileCollection* handle, void* err_out)');
+    lib._batchRollback = lib.func('int moofile_batch_rollback(MooFileCollection* handle, void* err_out)');
+    lib._stats      = lib.func('char* moofile_stats(MooFileCollection* handle, void* err_out)');
+    lib._compact    = lib.func('int moofile_compact(MooFileCollection* handle, void* err_out)');
+    lib._sync       = lib.func('int moofile_sync(MooFileCollection* handle, void* err_out)');
+    lib._reindex    = lib.func('int moofile_reindex(MooFileCollection* handle, void* err_out)');
+    lib._freeString = lib.func('void moofile_free_string(char* s)');
 
-        // Delete
-        'moofile_delete_one': ['int', ['pointer', 'string', 'pointer']],
-        'moofile_delete_many': ['int64', ['pointer', 'string', 'pointer']],
-
-        // Vector search
-        'moofile_vector_search': ['pointer', ['pointer', 'string', 'string', 'string', 'int', 'pointer']],
-
-        // Text search
-        'moofile_text_search': ['pointer', ['pointer', 'string', 'string', 'string', 'int', 'pointer']],
-
-        // Hybrid search
-        'moofile_hybrid_search': ['pointer', ['pointer', 'string', 'string', 'string', 'string', 'string', 'int', 'pointer']],
-
-        // Semantic search
-        'moofile_semantic_search': ['pointer', ['pointer', 'string', 'string', 'string', 'int', 'pointer']],
-
-        // Search cursor
-        'moofile_search_cursor_next': ['string', ['pointer', 'pointer']],
-        'moofile_search_cursor_free': ['void', ['pointer']],
-
-        // Batch
-        'moofile_batch_begin': ['int', ['pointer', 'pointer']],
-        'moofile_batch_commit': ['int', ['pointer', 'pointer']],
-        'moofile_batch_rollback': ['int', ['pointer', 'pointer']],
-
-        // Utility
-        'moofile_stats': ['string', ['pointer', 'pointer']],
-        'moofile_compact': ['int', ['pointer', 'pointer']],
-        'moofile_sync': ['int', ['pointer', 'pointer']],
-        'moofile_reindex': ['int', ['pointer', 'pointer']],
-
-        // Memory
-        'moofile_free_string': ['void', ['string']],
-    });
+    _lib = lib;
+    _libPath = libPath;
     return lib;
 }
 
@@ -93,21 +82,6 @@ class MooFileError extends Error {
     }
 }
 
-function checkError(errPtr, lib) {
-    if (errPtr && !errPtr.isNull() && errPtr.deref()) {
-        const msg = errPtr.deref().readCString();
-        lib.moofile_free_string(errPtr.deref());
-        errPtr.writePointer(ref.NULL);
-        throw new MooFileError(msg);
-    }
-}
-
-function makeErrPtr() {
-    const buf = Buffer.alloc(ref.sizeof.pointer);
-    ref.writePointer(buf, 0, ref.NULL);
-    return buf;
-}
-
 // ---------------------------------------------------------------------------
 // SearchCursor
 // ---------------------------------------------------------------------------
@@ -119,9 +93,8 @@ class SearchCursor {
     }
 
     next() {
-        const errPtr = makeErrPtr();
-        const s = this.lib.moofile_search_cursor_next(this.ptr, errPtr);
-        checkError(errPtr, this.lib);
+        if (!this.ptr) return null;
+        const s = this.lib._searchNext(this.ptr, null);
         if (s === null) return null;
         const pair = JSON.parse(s);
         return { doc: pair[0], score: pair[1] };
@@ -130,17 +103,12 @@ class SearchCursor {
     toArray() {
         const results = [];
         let item;
-        while ((item = this.next()) !== null) {
-            results.push(item);
-        }
+        while ((item = this.next()) !== null) results.push(item);
         return results;
     }
 
     close() {
-        if (this.ptr) {
-            this.lib.moofile_search_cursor_free(this.ptr);
-            this.ptr = null;
-        }
+        if (this.ptr) { this.lib._searchFree(this.ptr); this.ptr = null; }
     }
 }
 
@@ -155,9 +123,8 @@ class Cursor {
     }
 
     next() {
-        const errPtr = makeErrPtr();
-        const s = this.lib.moofile_cursor_next(this.ptr, errPtr);
-        checkError(errPtr, this.lib);
+        if (!this.ptr) return null;
+        const s = this.lib._cursorNext(this.ptr, null);
         if (s === null) return null;
         return JSON.parse(s);
     }
@@ -165,17 +132,12 @@ class Cursor {
     toArray() {
         const docs = [];
         let doc;
-        while ((doc = this.next()) !== null) {
-            docs.push(doc);
-        }
+        while ((doc = this.next()) !== null) docs.push(doc);
         return docs;
     }
 
     close() {
-        if (this.ptr) {
-            this.lib.moofile_cursor_free(this.ptr);
-            this.ptr = null;
-        }
+        if (this.ptr) { this.lib._cursorFree(this.ptr); this.ptr = null; }
     }
 }
 
@@ -186,7 +148,7 @@ class Cursor {
 class Collection {
     constructor(path, config = {}) {
         const libPath = config.libPath || Collection._defaultLibPath();
-        this.lib = loadLibrary(libPath);
+        this.lib = getLibrary(libPath);
 
         const configJson = JSON.stringify({
             indexes: config.indexes,
@@ -198,17 +160,11 @@ class Collection {
             model_cache_dir: config.model_cache_dir,
         });
 
-        const errPtr = makeErrPtr();
-        const handle = this.lib.moofile_open(path, configJson, errPtr);
-        checkError(errPtr, this.lib);
-        if (ref.isNull(handle)) {
-            throw new MooFileError('moofile_open returned null');
-        }
+        const handle = this.lib._open(path, configJson, null);
+        if (handle === null) throw new MooFileError('moofile_open returned null');
         this.handle = handle;
-        this.path = path;
     }
 
-    /** @private Auto-detect the shared library path. */
     static _defaultLibPath() {
         const candidates = [
             '../target/release/libmoofile.so',
@@ -217,44 +173,31 @@ class Collection {
             '../../target/debug/libmoofile.so',
             './libmoofile.so',
         ];
-        const fs = require('fs');
         for (const c of candidates) {
             try {
-                if (fs.statSync(c).isFile()) return require('path').resolve(c);
+                const p = path.resolve(__dirname, c);
+                if (fs.statSync(p).isFile()) return p;
             } catch (_) {}
         }
-        return '../target/release/libmoofile.so'; // best guess
+        return path.resolve(__dirname, '../target/release/libmoofile.so');
     }
 
-    /** Call a method, check for error, return result. */
-    _call(method, ...args) {
-        const errPtr = makeErrPtr();
-        const result = method(this.handle, ...args, errPtr);
-        checkError(errPtr, this.lib);
-        return result;
-    }
-
-    /** Call a method that returns a handle pointer. */
-    _callPtr(method, ...args) {
-        const errPtr = makeErrPtr();
-        const ptr = method(this.handle, ...args, errPtr);
-        checkError(errPtr, this.lib);
-        if (ref.isNull(ptr)) throw new MooFileError('null pointer returned');
-        return ptr;
-    }
+    _call(fn, ...args) { return fn(this.handle, ...args, null); }
 
     // ----------------------------------------------------------
     // Insert
     // ----------------------------------------------------------
 
     insert(doc) {
-        const result = this._call(this.lib.moofile_insert, JSON.stringify(doc));
-        return result ? JSON.parse(result) : doc;
+        const result = this._call(this.lib._insert, JSON.stringify(doc));
+        if (result === null) throw new MooFileError('moofile_insert failed (check err_out)');
+        return JSON.parse(result);
     }
 
     insertMany(docs) {
-        const result = this._call(this.lib.moofile_insert_many, JSON.stringify(docs));
-        return result ? JSON.parse(result) : docs;
+        const result = this._call(this.lib._insertMany, JSON.stringify(docs));
+        if (result === null) throw new MooFileError('moofile_insert_many failed');
+        return JSON.parse(result);
     }
 
     // ----------------------------------------------------------
@@ -262,21 +205,22 @@ class Collection {
     // ----------------------------------------------------------
 
     find(filter = {}) {
-        const ptr = this._callPtr(this.lib.moofile_find, JSON.stringify(filter));
+        const ptr = this._call(this.lib._find, JSON.stringify(filter));
+        if (!ptr) return [];
         return new Cursor(ptr, this.lib);
     }
 
     findOne(filter = {}) {
-        const result = this._call(this.lib.moofile_find_one, JSON.stringify(filter));
+        const result = this._call(this.lib._findOne, JSON.stringify(filter));
         return result ? JSON.parse(result) : null;
     }
 
     count(filter = {}) {
-        return Number(this._call(this.lib.moofile_count, JSON.stringify(filter)));
+        return Number(this._call(this.lib._count, JSON.stringify(filter)));
     }
 
     exists(filter) {
-        return this._call(this.lib.moofile_exists, JSON.stringify(filter)) === 1;
+        return this._call(this.lib._exists, JSON.stringify(filter)) === 1;
     }
 
     // ----------------------------------------------------------
@@ -288,7 +232,7 @@ class Collection {
         if (Object.keys(setValues).length > 0) update.set = setValues;
         if (unsetFields.length > 0) update.unset = unsetFields;
         if (Object.keys(incValues).length > 0) update.inc = incValues;
-        return this._call(this.lib.moofile_update_one, JSON.stringify(where), JSON.stringify(update)) === 1;
+        return this._call(this.lib._updateOne, JSON.stringify(where), JSON.stringify(update)) === 1;
     }
 
     updateMany(where, setValues = {}, unsetFields = [], incValues = {}) {
@@ -296,59 +240,42 @@ class Collection {
         if (Object.keys(setValues).length > 0) update.set = setValues;
         if (unsetFields.length > 0) update.unset = unsetFields;
         if (Object.keys(incValues).length > 0) update.inc = incValues;
-        return Number(this._call(this.lib.moofile_update_many, JSON.stringify(where), JSON.stringify(update)));
+        return Number(this._call(this.lib._updateMany, JSON.stringify(where), JSON.stringify(update)));
     }
 
     replaceOne(where, replacement) {
-        return this._call(this.lib.moofile_replace_one, JSON.stringify(where), JSON.stringify(replacement)) === 1;
+        return this._call(this.lib._replaceOne, JSON.stringify(where), JSON.stringify(replacement)) === 1;
     }
 
     // ----------------------------------------------------------
     // Delete
     // ----------------------------------------------------------
 
-    deleteOne(where) {
-        return this._call(this.lib.moofile_delete_one, JSON.stringify(where)) === 1;
-    }
-
-    deleteMany(where) {
-        return Number(this._call(this.lib.moofile_delete_many, JSON.stringify(where)));
-    }
+    deleteOne(where) { return this._call(this.lib._deleteOne, JSON.stringify(where)) === 1; }
+    deleteMany(where) { return Number(this._call(this.lib._deleteMany, JSON.stringify(where))); }
 
     // ----------------------------------------------------------
     // Search
     // ----------------------------------------------------------
 
     vectorSearch(field, queryVector, limit = 10, filter = {}) {
-        const ptr = this._callPtr(
-            this.lib.moofile_vector_search,
-            JSON.stringify(filter), field, JSON.stringify(queryVector), limit
-        );
+        const ptr = this._call(this.lib._vecSearch, JSON.stringify(filter), field, JSON.stringify(queryVector), limit);
         return new SearchCursor(ptr, this.lib);
     }
 
     textSearch(field, query, limit = 10, filter = {}) {
-        const ptr = this._callPtr(
-            this.lib.moofile_text_search,
-            JSON.stringify(filter), field, query, limit
-        );
+        const ptr = this._call(this.lib._txtSearch, JSON.stringify(filter), field, query, limit);
         return new SearchCursor(ptr, this.lib);
     }
 
     hybridSearch(textField, vectorField, queryText, queryVector = null, limit = 10, filter = {}) {
         const qv = queryVector ? JSON.stringify(queryVector) : null;
-        const ptr = this._callPtr(
-            this.lib.moofile_hybrid_search,
-            JSON.stringify(filter), textField, vectorField, queryText, qv, limit
-        );
+        const ptr = this._call(this.lib._hybSearch, JSON.stringify(filter), textField, vectorField, queryText, qv, limit);
         return new SearchCursor(ptr, this.lib);
     }
 
     semantic(sourceField, queryText, limit = 10, filter = {}) {
-        const ptr = this._callPtr(
-            this.lib.moofile_semantic_search,
-            JSON.stringify(filter), sourceField, queryText, limit
-        );
+        const ptr = this._call(this.lib._semSearch, JSON.stringify(filter), sourceField, queryText, limit);
         return new SearchCursor(ptr, this.lib);
     }
 
@@ -356,28 +283,14 @@ class Collection {
     // Batch
     // ----------------------------------------------------------
 
-    batchBegin() {
-        this._call(this.lib.moofile_batch_begin);
-    }
+    batchBegin() { this._call(this.lib._batchBegin); }
+    batchCommit() { this._call(this.lib._batchCommit); }
+    batchRollback() { this._call(this.lib._batchRollback); }
 
-    batchCommit() {
-        this._call(this.lib.moofile_batch_commit);
-    }
-
-    batchRollback() {
-        this._call(this.lib.moofile_batch_rollback);
-    }
-
-    /** Run operations atomically.  Rolls back on exception. */
     batch(fn) {
         this.batchBegin();
-        try {
-            fn();
-            this.batchCommit();
-        } catch (e) {
-            this.batchRollback();
-            throw e;
-        }
+        try { fn(); this.batchCommit(); }
+        catch (e) { this.batchRollback(); throw e; }
     }
 
     // ----------------------------------------------------------
@@ -385,32 +298,17 @@ class Collection {
     // ----------------------------------------------------------
 
     stats() {
-        const result = this._call(this.lib.moofile_stats);
+        const result = this._call(this.lib._stats);
         return result ? JSON.parse(result) : {};
     }
 
-    compact() {
-        this._call(this.lib.moofile_compact);
-    }
-
-    sync() {
-        this._call(this.lib.moofile_sync);
-    }
-
-    reindex() {
-        this._call(this.lib.moofile_reindex);
-    }
+    compact()  { this._call(this.lib._compact); }
+    sync()     { this._call(this.lib._sync); }
+    reindex()  { this._call(this.lib._reindex); }
 
     close() {
-        if (this.handle) {
-            this._call(this.lib.moofile_close);
-            this.handle = null;
-        }
+        if (this.handle) { this._call(this.lib._close); this.handle = null; }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Exports
-// ---------------------------------------------------------------------------
 
 module.exports = { Collection, Cursor, SearchCursor, MooFileError };

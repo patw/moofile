@@ -6,8 +6,6 @@
   "license": "MIT",
   "repository": "github:patw/moofile",
   "dependencies": {
-    "ffi-napi": "^4.0.3",
-    "ref-napi": "^4.0.3",
-    "ref-struct-napi": "^1.0.2"
+    "koffi": "^2.5.0"
   }
 }

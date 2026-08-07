@@ -1,7 +1,7 @@
 // Package moofile provides a Go binding for the MooFile embedded document store.
 //
-// It calls the C shared library (libmoofile.so) via cgo.  Documents and
-// configuration are passed as JSON strings across the FFI boundary.
+// It calls the C shared library (libmoofile.so) via cgo.
+// Documents and configuration are passed as JSON strings.
 //
 // Usage:
 //
@@ -14,13 +14,9 @@
 //     defer db.Close()
 //
 //     doc, err := db.Insert(map[string]any{"name": "Alice", "age": 30})
-//     if err != nil { log.Fatal(err) }
-//
 //     results, err := db.Find(map[string]any{"age": map[string]any{"$gt": 25}})
 //
-// Package moofile's JSON-in/JSON-out design means every language binding
-// follows the same patterns — see the Python, Node.js, Java, C#, and C++
-// bindings in the same repository.
+// All errors returned from the C library are surfaced as *moofile.Error.
 
 package moofile
 
@@ -35,8 +31,6 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
-	"os"
-	"runtime"
 	"sync"
 	"unsafe"
 )
@@ -52,12 +46,12 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Msg }
 
-func newError(errPtr *C.char) error {
-	if errPtr == nil {
+func newError(errPtr **C.char) error {
+	if errPtr == nil || *errPtr == nil {
 		return nil
 	}
-	msg := C.GoString(errPtr)
-	C.moofile_free_string(errPtr)
+	msg := C.GoString(*errPtr)
+	C.moofile_free_string(*errPtr)
 	return &Error{Msg: msg}
 }
 
@@ -67,11 +61,11 @@ func newError(errPtr *C.char) error {
 
 // AutoEmbedConfig configures on-device embedding for a source text field.
 type AutoEmbedConfig struct {
-	Model       string // GGUF model URI (e.g. "hf:user/repo:file.gguf")
-	Target      string // Target vector field name
-	Dims        int    `json:",omitempty"`    // Embedding dimensions (default 1024)
-	Precision   string `json:",omitempty"`    // "f32", "int8", "uint8", "binary"
-	Normalize   *bool  `json:",omitempty"`    // L2-normalize (default true)
+	Model       string `json:"model"`
+	Target      string `json:"target"`
+	Dims        int    `json:"dims,omitempty"`
+	Precision   string `json:"precision,omitempty"`
+	Normalize   *bool  `json:"normalize,omitempty"`
 	QueryPrefix string `json:"query_prefix,omitempty"`
 	DocPrefix   string `json:"doc_prefix,omitempty"`
 }
@@ -83,7 +77,7 @@ type Config struct {
 	TextIndexes   []string                   `json:"text_indexes,omitempty"`
 	AutoEmbed     map[string]AutoEmbedConfig `json:"auto_embed,omitempty"`
 	Readonly      bool                       `json:"readonly,omitempty"`
-	Durability    string                     `json:"durability,omitempty"` // "none", "os" (default), "fsync"
+	Durability    string                     `json:"durability,omitempty"`
 	ModelCacheDir string                     `json:"model_cache_dir,omitempty"`
 }
 
@@ -112,11 +106,10 @@ type SearchResult struct {
 // Collection is a handle to an open MooFile database.
 type Collection struct {
 	mu     sync.Mutex
-	handle unsafe.Pointer
-	libOnce sync.Once
+	handle *C.MooFileCollection
 }
 
-// Open opens a MooFile collection.  The file is created if it does not exist.
+// Open opens a MooFile collection. The file is created if it does not exist.
 func Open(path string, config *Config) (*Collection, error) {
 	configJSON := config.toJSON()
 	cPath := C.CString(path)
@@ -126,54 +119,48 @@ func Open(path string, config *Config) (*Collection, error) {
 
 	var errPtr *C.char
 	handle := C.moofile_open(cPath, cConfig, &errPtr)
-	if err := newError(errPtr); err != nil {
+	if err := newError(&errPtr); err != nil {
 		return nil, err
 	}
 	if handle == nil {
 		return nil, &Error{Msg: "moofile_open returned null"}
 	}
 
-	c := &Collection{handle: handle}
-	runtime.SetFinalizer(c, (*Collection).close)
-	return c, nil
+	return &Collection{handle: handle}, nil
 }
 
 // Close closes the collection and frees native resources.
 func (c *Collection) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.close()
-}
-
-func (c *Collection) close() error {
 	if c.handle == nil {
 		return nil
 	}
 	var errPtr *C.char
 	C.moofile_close(c.handle, &errPtr)
-	err := newError(errPtr)
+	err := newError(&errPtr)
 	c.handle = nil
 	return err
 }
 
-// call calls a C function that takes (handle, ...) and returns an int status.
-func (c *Collection) call(fn func(handle unsafe.Pointer, errPtr *C.char) C.int) error {
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+// ccall1 calls a C function that takes (handle, *) and returns int.
+func (c *Collection) ccall1(fn func(*C.MooFileCollection, **C.char) C.int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.handle == nil {
 		return &Error{Msg: "collection is closed"}
 	}
 	var errPtr *C.char
-	ret := fn(c.handle, &errPtr)
-	if err := newError(errPtr); err != nil {
-		return err
-	}
-	_ = ret
-	return nil
+	fn(c.handle, &errPtr)
+	return newError(&errPtr)
 }
 
-// callStr calls a C function that returns a C string (to be freed).
-func (c *Collection) callStr(fn func(handle unsafe.Pointer, errPtr *C.char) *C.char) (string, error) {
+// ccallStr calls a C function that returns a C string.
+func (c *Collection) ccallStr(fn func(*C.MooFileCollection, **C.char) *C.char) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.handle == nil {
@@ -181,7 +168,7 @@ func (c *Collection) callStr(fn func(handle unsafe.Pointer, errPtr *C.char) *C.c
 	}
 	var errPtr *C.char
 	result := fn(c.handle, &errPtr)
-	if err := newError(errPtr); err != nil {
+	if err := newError(&errPtr); err != nil {
 		return "", err
 	}
 	if result == nil {
@@ -192,8 +179,8 @@ func (c *Collection) callStr(fn func(handle unsafe.Pointer, errPtr *C.char) *C.c
 	return s, nil
 }
 
-// callDocs calls a find-like function and returns parsed documents.
-func (c *Collection) callDocs(fn func(handle unsafe.Pointer, errPtr *C.char) unsafe.Pointer) ([]map[string]any, error) {
+// ccallCur calls a find-like function and returns parsed documents.
+func (c *Collection) ccallCur(fn func(*C.MooFileCollection, **C.char) *C.MooFileCursor) ([]map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.handle == nil {
@@ -201,7 +188,7 @@ func (c *Collection) callDocs(fn func(handle unsafe.Pointer, errPtr *C.char) uns
 	}
 	var errPtr *C.char
 	cursor := fn(c.handle, &errPtr)
-	if err := newError(errPtr); err != nil {
+	if err := newError(&errPtr); err != nil {
 		return nil, err
 	}
 	if cursor == nil {
@@ -213,7 +200,7 @@ func (c *Collection) callDocs(fn func(handle unsafe.Pointer, errPtr *C.char) uns
 	for {
 		var nextErr *C.char
 		s := C.moofile_cursor_next(cursor, &nextErr)
-		if err := newError(nextErr); err != nil {
+		if err := newError(&nextErr); err != nil {
 			return nil, err
 		}
 		if s == nil {
@@ -230,8 +217,8 @@ func (c *Collection) callDocs(fn func(handle unsafe.Pointer, errPtr *C.char) uns
 	return docs, nil
 }
 
-// callSearch calls a search function and returns (doc, score) pairs.
-func (c *Collection) callSearch(fn func(handle unsafe.Pointer, errPtr *C.char) unsafe.Pointer) ([]SearchResult, error) {
+// ccallSearch calls a search function and returns (doc, score) pairs.
+func (c *Collection) ccallSearch(fn func(*C.MooFileCollection, **C.char) *C.MooFileSearchCursor) ([]SearchResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.handle == nil {
@@ -239,7 +226,7 @@ func (c *Collection) callSearch(fn func(handle unsafe.Pointer, errPtr *C.char) u
 	}
 	var errPtr *C.char
 	cursor := fn(c.handle, &errPtr)
-	if err := newError(errPtr); err != nil {
+	if err := newError(&errPtr); err != nil {
 		return nil, err
 	}
 	if cursor == nil {
@@ -251,7 +238,7 @@ func (c *Collection) callSearch(fn func(handle unsafe.Pointer, errPtr *C.char) u
 	for {
 		var nextErr *C.char
 		s := C.moofile_search_cursor_next(cursor, &nextErr)
-		if err := newError(nextErr); err != nil {
+		if err := newError(&nextErr); err != nil {
 			return nil, err
 		}
 		if s == nil {
@@ -280,7 +267,7 @@ func (c *Collection) callSearch(fn func(handle unsafe.Pointer, errPtr *C.char) u
 
 func (c *Collection) Insert(doc map[string]any) (map[string]any, error) {
 	b, _ := json.Marshal(doc)
-	s, err := c.callStr(func(h unsafe.Pointer, e *C.char) *C.char {
+	s, err := c.ccallStr(func(h *C.MooFileCollection, e **C.char) *C.char {
 		return C.moofile_insert(h, C.CString(string(b)), e)
 	})
 	if err != nil {
@@ -295,7 +282,7 @@ func (c *Collection) Insert(doc map[string]any) (map[string]any, error) {
 
 func (c *Collection) InsertMany(docs []map[string]any) ([]map[string]any, error) {
 	b, _ := json.Marshal(docs)
-	s, err := c.callStr(func(h unsafe.Pointer, e *C.char) *C.char {
+	s, err := c.ccallStr(func(h *C.MooFileCollection, e **C.char) *C.char {
 		return C.moofile_insert_many(h, C.CString(string(b)), e)
 	})
 	if err != nil {
@@ -313,16 +300,14 @@ func (c *Collection) InsertMany(docs []map[string]any) ([]map[string]any, error)
 // -----------------------------------------------------------------------
 
 func (c *Collection) Find(filter map[string]any) ([]map[string]any, error) {
-	b, _ := json.Marshal(filter)
-	return c.callDocs(func(h unsafe.Pointer, e *C.char) unsafe.Pointer {
-		return C.moofile_find(h, C.CString(string(b)), e)
+	return c.ccallCur(func(h *C.MooFileCollection, e **C.char) *C.MooFileCursor {
+		return C.moofile_find(h, C.CString(string(jsonOrEmpty(filter))), e)
 	})
 }
 
 func (c *Collection) FindOne(filter map[string]any) (map[string]any, error) {
-	b, _ := json.Marshal(filter)
-	s, err := c.callStr(func(h unsafe.Pointer, e *C.char) *C.char {
-		return C.moofile_find_one(h, C.CString(string(b)), e)
+	s, err := c.ccallStr(func(h *C.MooFileCollection, e **C.char) *C.char {
+		return C.moofile_find_one(h, C.CString(string(jsonOrEmpty(filter))), e)
 	})
 	if err != nil || s == "" {
 		return nil, err
@@ -335,25 +320,17 @@ func (c *Collection) FindOne(filter map[string]any) (map[string]any, error) {
 func (c *Collection) Count(filter map[string]any) (int64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, _ := json.Marshal(filter)
 	var errPtr *C.char
-	n := int64(C.moofile_count(c.handle, C.CString(string(b)), &errPtr))
-	if err := newError(errPtr); err != nil {
-		return 0, err
-	}
-	return n, nil
+	n := int64(C.moofile_count(c.handle, C.CString(string(jsonOrEmpty(filter))), &errPtr))
+	return n, newError(&errPtr)
 }
 
 func (c *Collection) Exists(filter map[string]any) (bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, _ := json.Marshal(filter)
 	var errPtr *C.char
-	r := C.moofile_exists(c.handle, C.CString(string(b)), &errPtr)
-	if err := newError(errPtr); err != nil {
-		return false, err
-	}
-	return r == 1, nil
+	r := C.moofile_exists(c.handle, C.CString(string(jsonOrEmpty(filter))), &errPtr)
+	return r == 1, newError(&errPtr)
 }
 
 // -----------------------------------------------------------------------
@@ -378,10 +355,7 @@ func (c *Collection) UpdateOne(where, setValues map[string]any, unsetFields []st
 	defer c.mu.Unlock()
 	var errPtr *C.char
 	r := C.moofile_update_one(c.handle, C.CString(string(bWhere)), C.CString(string(bUpdate)), &errPtr)
-	if err := newError(errPtr); err != nil {
-		return false, err
-	}
-	return r == 1, nil
+	return r == 1, newError(&errPtr)
 }
 
 func (c *Collection) UpdateMany(where, setValues map[string]any, unsetFields []string, incValues map[string]any) (int64, error) {
@@ -402,10 +376,7 @@ func (c *Collection) UpdateMany(where, setValues map[string]any, unsetFields []s
 	defer c.mu.Unlock()
 	var errPtr *C.char
 	n := int64(C.moofile_update_many(c.handle, C.CString(string(bWhere)), C.CString(string(bUpdate)), &errPtr))
-	if err := newError(errPtr); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return n, newError(&errPtr)
 }
 
 func (c *Collection) ReplaceOne(where, replacement map[string]any) (bool, error) {
@@ -415,10 +386,7 @@ func (c *Collection) ReplaceOne(where, replacement map[string]any) (bool, error)
 	defer c.mu.Unlock()
 	var errPtr *C.char
 	r := C.moofile_replace_one(c.handle, C.CString(string(bWhere)), C.CString(string(bRepl)), &errPtr)
-	if err := newError(errPtr); err != nil {
-		return false, err
-	}
-	return r == 1, nil
+	return r == 1, newError(&errPtr)
 }
 
 // -----------------------------------------------------------------------
@@ -431,10 +399,7 @@ func (c *Collection) DeleteOne(where map[string]any) (bool, error) {
 	defer c.mu.Unlock()
 	var errPtr *C.char
 	r := C.moofile_delete_one(c.handle, C.CString(string(b)), &errPtr)
-	if err := newError(errPtr); err != nil {
-		return false, err
-	}
-	return r == 1, nil
+	return r == 1, newError(&errPtr)
 }
 
 func (c *Collection) DeleteMany(where map[string]any) (int64, error) {
@@ -443,10 +408,7 @@ func (c *Collection) DeleteMany(where map[string]any) (int64, error) {
 	defer c.mu.Unlock()
 	var errPtr *C.char
 	n := int64(C.moofile_delete_many(c.handle, C.CString(string(b)), &errPtr))
-	if err := newError(errPtr); err != nil {
-		return 0, err
-	}
-	return n, nil
+	return n, newError(&errPtr)
 }
 
 // -----------------------------------------------------------------------
@@ -454,60 +416,63 @@ func (c *Collection) DeleteMany(where map[string]any) (int64, error) {
 // -----------------------------------------------------------------------
 
 func (c *Collection) VectorSearch(field string, queryVector []float64, limit int, filter map[string]any) ([]SearchResult, error) {
-	bFilter, _ := json.Marshal(filter)
-	bVec, _ := json.Marshal(queryVector)
-	cFilter := C.CString(string(bFilter))
-	cField := C.CString(field)
-	cVec := C.CString(string(bVec))
-	cLimit := C.int(limit)
-
-	return c.callSearch(func(h unsafe.Pointer, e *C.char) unsafe.Pointer {
-		return C.moofile_vector_search(h, cFilter, cField, cVec, cLimit, e)
+	bFilter := jsonOrEmpty(filter)
+	return c.ccallSearch(func(h *C.MooFileCollection, e **C.char) *C.MooFileSearchCursor {
+		return C.moofile_vector_search(h,
+			C.CString(string(bFilter)), C.CString(field), C.CString(jsonString(queryVector)),
+			C.int(limit), e)
 	})
 }
 
 func (c *Collection) TextSearch(field, query string, limit int, filter map[string]any) ([]SearchResult, error) {
-	bFilter, _ := json.Marshal(filter)
-	return c.callSearch(func(h unsafe.Pointer, e *C.char) unsafe.Pointer {
+	bFilter := jsonOrEmpty(filter)
+	return c.ccallSearch(func(h *C.MooFileCollection, e **C.char) *C.MooFileSearchCursor {
 		return C.moofile_text_search(h, C.CString(string(bFilter)), C.CString(field), C.CString(query), C.int(limit), e)
 	})
 }
 
 func (c *Collection) HybridSearch(textField, vectorField, queryText string, queryVector []float64, limit int, filter map[string]any) ([]SearchResult, error) {
-	bFilter, _ := json.Marshal(filter)
+	bFilter := jsonOrEmpty(filter)
 	var qvStr string
 	if queryVector != nil {
-		bVec, _ := json.Marshal(queryVector)
-		qvStr = string(bVec)
+		qvStr = jsonString(queryVector)
 	}
-	return c.callSearch(func(h unsafe.Pointer, e *C.char) unsafe.Pointer {
+	return c.ccallSearch(func(h *C.MooFileCollection, e **C.char) *C.MooFileSearchCursor {
 		var qvPtr *C.char
 		if qvStr != "" {
 			qvPtr = C.CString(qvStr)
 		}
-		return C.moofile_hybrid_search(h, C.CString(string(bFilter)), C.CString(textField), C.CString(vectorField), C.CString(queryText), qvPtr, C.int(limit), e)
+		return C.moofile_hybrid_search(h,
+			C.CString(string(bFilter)), C.CString(textField), C.CString(vectorField),
+			C.CString(queryText), qvPtr, C.int(limit), e)
 	})
 }
 
 func (c *Collection) Semantic(sourceField, queryText string, limit int, filter map[string]any) ([]SearchResult, error) {
-	bFilter, _ := json.Marshal(filter)
-	return c.callSearch(func(h unsafe.Pointer, e *C.char) unsafe.Pointer {
-		return C.moofile_semantic_search(h, C.CString(string(bFilter)), C.CString(sourceField), C.CString(queryText), C.int(limit), e)
+	bFilter := jsonOrEmpty(filter)
+	return c.ccallSearch(func(h *C.MooFileCollection, e **C.char) *C.MooFileSearchCursor {
+		return C.moofile_semantic_search(h,
+			C.CString(string(bFilter)), C.CString(sourceField), C.CString(queryText),
+			C.int(limit), e)
 	})
+}
+
+func jsonString(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
 }
 
 // -----------------------------------------------------------------------
 // Batch
 // -----------------------------------------------------------------------
 
-// Batch runs fn inside an atomic batch context.  If fn returns an error,
-// the batch is rolled back; otherwise it is committed.
+// Batch runs fn inside an atomic batch context.
 func (c *Collection) Batch(fn func() error) error {
 	c.mu.Lock()
 	var errPtr *C.char
 	if int(C.moofile_batch_begin(c.handle, &errPtr)) != 0 {
 		c.mu.Unlock()
-		return newError(errPtr)
+		return newError(&errPtr)
 	}
 	c.mu.Unlock()
 
@@ -529,7 +494,7 @@ func (c *Collection) Batch(fn func() error) error {
 		return batchErr
 	}
 	if int(C.moofile_batch_commit(c.handle, &errPtr)) != 0 {
-		return newError(errPtr)
+		return newError(&errPtr)
 	}
 	return nil
 }
@@ -538,9 +503,8 @@ func (c *Collection) Batch(fn func() error) error {
 // Utility
 // -----------------------------------------------------------------------
 
-// Stats returns collection statistics.
 func (c *Collection) Stats() (map[string]any, error) {
-	s, err := c.callStr(func(h unsafe.Pointer, e *C.char) *C.char {
+	s, err := c.ccallStr(func(h *C.MooFileCollection, e **C.char) *C.char {
 		return C.moofile_stats(h, e)
 	})
 	if err != nil {
@@ -552,22 +516,27 @@ func (c *Collection) Stats() (map[string]any, error) {
 }
 
 func (c *Collection) Compact() error {
-	return c.call(func(h unsafe.Pointer, e *C.char) C.int {
+	return c.ccall1(func(h *C.MooFileCollection, e **C.char) C.int {
 		return C.moofile_compact(h, e)
 	})
 }
 
 func (c *Collection) Sync() error {
-	return c.call(func(h unsafe.Pointer, e *C.char) C.int {
+	return c.ccall1(func(h *C.MooFileCollection, e **C.char) C.int {
 		return C.moofile_sync(h, e)
 	})
 }
 
 func (c *Collection) Reindex() error {
-	return c.call(func(h unsafe.Pointer, e *C.char) C.int {
+	return c.ccall1(func(h *C.MooFileCollection, e **C.char) C.int {
 		return C.moofile_reindex(h, e)
 	})
 }
 
-// Ensure interface compliance
-var _ = os.DevNull
+func jsonOrEmpty(m map[string]any) []byte {
+	if m == nil {
+		return []byte("{}")
+	}
+	b, _ := json.Marshal(m)
+	return b
+}

@@ -40,3 +40,7 @@ target/
 
 # Compiled native extensions
 *.so
+bindings/node/node_modules/
+bindings/csharp/**/obj/
+bindings/csharp/**/bin/
+bindings/csharp/**/*.user

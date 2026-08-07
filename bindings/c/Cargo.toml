@@ -17,4 +17,3 @@ serde = { version = "1", features = ["derive"] }
 
 [features]
 default = []
-embed = ["moofile-core/embed"]  # Enable autoembedding support
