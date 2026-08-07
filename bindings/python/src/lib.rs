@@ -5,14 +5,17 @@
 
 use std::collections::HashMap;
 
-use bson::{Bson, Document};
+use bson::Document;
 use moofile_core::Collection as RustCollection;
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 // ---------------------------------------------------------------------------
 // Helpers: PyObject ↔ Bson
 // ---------------------------------------------------------------------------
+
+/// Cached handle to pymongo's BSON module.
+static BSON_MODULE: pyo3::sync::GILOnceCell<PyObject> = pyo3::sync::GILOnceCell::new();
 
 /// Encode a Python document with pymongo, then decode it with Rust BSON.
 ///

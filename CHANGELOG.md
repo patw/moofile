@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.2 (2026-08-07)
+
+### Python native binding fixes
+
+- Repaired PyO3/Python adapter parity for BSON-rich documents, including datetimes, binary values, ObjectIds, Code, and Decimal128.
+- Validate document IDs and filters in the Python adapter before crossing the native boundary, preventing malformed inputs from poisoning a native collection lock.
+- Restored consistent missing-field range-filter behavior for native full scans and indexed queries.
+
 ## v1.0.1 (2026-08-07)
 
 ### Minor refinements to language bindings
