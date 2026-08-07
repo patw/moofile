@@ -16,6 +16,7 @@
  * using json = nlohmann::json;
  *
  * int main() {
+ *     // Basic usage
  *     moofile::Collection db("data.bson",
  *         moofile::Config{}
  *             .index("email")
@@ -25,12 +26,30 @@
  *
  *     db.insert({{"name", "Alice"}, {"email", "a@example.com"}});
  *
- *     for (auto doc : db.find({{"age", {{"$gt", 25}}}})) {
+ *     for (auto doc : db.find({{"age", {{"$gt", 25}}}}).to_vector()) {
  *         std::cout << doc.dump() << std::endl;
  *     }
  *
- *     auto results = db.vector_search("embedding", {0.1, 0.2, 0.3}, 5);
+ *     auto results = db.vector_search("embedding", {0.1, 0.2, 0.3}, 5).to_vector();
  *     for (auto [doc, score] : results) {
+ *         std::cout << score << ": " << doc.dump() << std::endl;
+ *     }
+ *
+ *     // Autoembedding (local GGUF model, no external API)
+ *     moofile::Config auto_cfg;
+ *     auto_cfg.vector_index("embedding", 1024)
+ *             .auto_embed("content", {
+ *                 .model = "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+ *                 .target = "embedding",
+ *                 .dims = 1024,
+ *                 .precision = "int8",
+ *             });
+ *     moofile::Collection auto_db("semantic.bson", auto_cfg);
+ *     auto_db.insert({{"content", "Machine learning is fascinating"}});
+ *     // embedding auto-generated in doc["embedding"]
+ *
+ *     auto sem_results = auto_db.semantic("content", "deep learning", 5).to_vector();
+ *     for (auto [doc, score] : sem_results) {
  *         std::cout << score << ": " << doc.dump() << std::endl;
  *     }
  * }
@@ -76,13 +95,26 @@ inline json parse_json(const char* s) {
 // Config builder
 // ---------------------------------------------------------------------------
 
+/** Auto-embedding configuration for a single source text field. */
+struct AutoEmbedConfig {
+    std::string model;           // GGUF model URI (e.g. "hf:user/repo:file.gguf")
+    std::string target;          // Target vector field name
+    int dims = 1024;             // Embedding dimensions
+    std::string precision = "int8";  // "f32", "int8", "uint8", "binary"
+    bool normalize = true;       // L2-normalize the output
+    std::string query_prefix = "Represent the query for retrieving supporting documents: ";
+    std::string doc_prefix = "Represent the document for retrieval: ";
+};
+
 /** Configuration builder for opening a collection. */
 struct Config {
     std::vector<std::string> indexes;
     std::vector<std::pair<std::string, int>> vector_indexes;
     std::vector<std::string> text_indexes;
+    std::vector<std::pair<std::string, AutoEmbedConfig>> auto_embeds;
     bool readonly = false;
     std::string durability = "os";
+    std::string model_cache_dir;
 
     Config& index(const std::string& field) {
         indexes.push_back(field);
@@ -99,6 +131,11 @@ struct Config {
         return *this;
     }
 
+    Config& auto_embed(const std::string& source_field, const AutoEmbedConfig& cfg) {
+        auto_embeds.emplace_back(source_field, cfg);
+        return *this;
+    }
+
     Config& set_readonly(bool r = true) {
         readonly = r;
         return *this;
@@ -106,6 +143,11 @@ struct Config {
 
     Config& set_durability(const std::string& d) {
         durability = d;
+        return *this;
+    }
+
+    Config& set_model_cache_dir(const std::string& d) {
+        model_cache_dir = d;
         return *this;
     }
 
@@ -118,8 +160,24 @@ struct Config {
             j["vector_indexes"] = vi;
         }
         if (!text_indexes.empty()) j["text_indexes"] = text_indexes;
+        if (!auto_embeds.empty()) {
+            json ae = json::object();
+            for (auto& [field, cfg] : auto_embeds) {
+                ae[field] = {
+                    {"model", cfg.model},
+                    {"target", cfg.target},
+                    {"dims", cfg.dims},
+                    {"precision", cfg.precision},
+                    {"normalize", cfg.normalize},
+                    {"query_prefix", cfg.query_prefix},
+                    {"doc_prefix", cfg.doc_prefix},
+                };
+            }
+            j["auto_embed"] = ae;
+        }
         if (readonly) j["readonly"] = true;
         j["durability"] = durability;
+        if (!model_cache_dir.empty()) j["model_cache_dir"] = model_cache_dir;
         return j.dump();
     }
 };
@@ -567,6 +625,42 @@ public:
             text_field.c_str(), vector_field.c_str(),
             query_text.c_str(),
             vec_str.empty() ? nullptr : vec_str.c_str(),
+            limit, &err
+        );
+        if (err) {
+            std::string msg(err);
+            moofile_free_string(err);
+            throw error(msg);
+        }
+        return SearchCursor(c);
+    }
+
+    // ----------------------------------------------------------
+    // Semantic search (autoembedding)
+    // ----------------------------------------------------------
+
+    /**
+     * Semantic search — auto-embeds the query text.
+     *
+     * The `source_field` must have been configured with `auto_embed` at
+     * collection open time.  The query text is automatically prefixed
+     * with the configured `query_prefix` and embedded.
+     *
+     * @param source_field The text field configured in auto_embed.
+     * @param query_text   The search query (auto-embedded).
+     * @param limit        Max results.
+     * @param filter       Optional pre-filter.
+     */
+    SearchCursor semantic(
+        const std::string& source_field,
+        const std::string& query_text,
+        int limit = 10,
+        const json& filter = json::object()
+    ) {
+        char* err = nullptr;
+        auto* c = moofile_semantic_search(
+            handle_, filter.dump().c_str(),
+            source_field.c_str(), query_text.c_str(),
             limit, &err
         );
         if (err) {

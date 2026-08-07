@@ -1,0 +1,13 @@
+{
+  "name": "moofile",
+  "version": "0.6.0",
+  "description": "Lightweight embedded document store — No server. No infra. Just a file.",
+  "main": "moofile.js",
+  "license": "MIT",
+  "repository": "github:patw/moofile",
+  "dependencies": {
+    "ffi-napi": "^4.0.3",
+    "ref-napi": "^4.0.3",
+    "ref-struct-napi": "^1.0.2"
+  }
+}

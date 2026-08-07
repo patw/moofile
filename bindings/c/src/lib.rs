@@ -319,6 +319,53 @@ pub extern "C" fn moofile_open(
         builder = builder.durability(d);
     }
 
+    // Parse auto_embed config
+    if let Some(ae) = config.get("auto_embed").and_then(|v| v.as_object()) {
+        for (source_field, cfg_val) in ae {
+            use moofile_core::AutoEmbedConfig;
+            let mut ae_config = AutoEmbedConfig::default();
+            if let Some(obj) = cfg_val.as_object() {
+                if let Some(model) = obj.get("model").and_then(|v| v.as_str()) {
+                    ae_config.model = model.to_string();
+                } else {
+                    unsafe { set_error(err_out, &format!("auto_embed[{}]: 'model' is required", source_field)); }
+                    return ptr::null_mut();
+                }
+                if let Some(target) = obj.get("target").and_then(|v| v.as_str()) {
+                    ae_config.target_field = target.to_string();
+                }
+                if let Some(dims) = obj.get("dims").and_then(|v| v.as_u64()) {
+                    ae_config.dims = dims as usize;
+                }
+                if let Some(prec) = obj.get("precision").and_then(|v| v.as_str()) {
+                    ae_config.precision = match prec {
+                        "f32" => moofile_core::EmbeddingPrecision::F32,
+                        "int8" => moofile_core::EmbeddingPrecision::Int8,
+                        "uint8" => moofile_core::EmbeddingPrecision::Uint8,
+                        "binary" => moofile_core::EmbeddingPrecision::Binary,
+                        other => { unsafe { set_error(err_out, &format!("auto_embed[{}]: unknown precision '{other}'", source_field)); }
+                            return ptr::null_mut(); }
+                    };
+                }
+                if let Some(norm) = obj.get("normalize").and_then(|v| v.as_bool()) {
+                    ae_config.normalize = norm;
+                }
+                if let Some(qp) = obj.get("query_prefix").and_then(|v| v.as_str()) {
+                    ae_config.query_prefix = qp.to_string();
+                }
+                if let Some(dp) = obj.get("doc_prefix").and_then(|v| v.as_str()) {
+                    ae_config.doc_prefix = dp.to_string();
+                }
+            }
+            builder = builder.auto_embed(source_field.as_str(), ae_config);
+        }
+    }
+
+    // Parse model_cache_dir
+    if let Some(mcd) = config.get("model_cache_dir").and_then(|v| v.as_str()) {
+        builder = builder.model_cache_dir(mcd);
+    }
+
     match builder.open() {
         Ok(inner) => Box::into_raw(Box::new(MooFileCollection { inner })),
         Err(e) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
@@ -735,6 +782,50 @@ pub extern "C" fn moofile_hybrid_search(
     let lim = if limit <= 0 { 10 } else { limit as usize };
 
     match coll.inner.find(filter).and_then(|q| q.hybrid_search(tf, vf, qt, qv, lim).to_list()) {
+        Ok(results) => Box::into_raw(Box::new(MooFileSearchCursor { results, index: 0 })),
+        Err(e) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Semantic search (autoembedding)
+// ---------------------------------------------------------------------------
+
+/// Perform semantic search — auto-embeds the query text using the configured
+/// embedding model and returns vector search results.
+///
+/// `source_field` must have been configured with `auto_embed` at collection
+/// open time.  The query text is automatically prefixed with the configured
+/// `query_prefix`.
+///
+/// Returns a search cursor with `(doc_json, score)` pairs.
+#[no_mangle]
+pub extern "C" fn moofile_semantic_search(
+    handle: *mut MooFileCollection,
+    filter_json: *const i8,
+    source_field: *const i8,
+    query_text: *const i8,
+    limit: i32,
+    err_out: *mut *mut i8,
+) -> *mut MooFileSearchCursor {
+    unsafe { clear_error(err_out); }
+    if handle.is_null() { unsafe { set_error(err_out, "handle is null"); } return ptr::null_mut(); }
+    let coll = unsafe { &*handle };
+
+    let filter_str = if filter_json.is_null() { "{}" } else {
+        match unsafe { c_str_to_str(filter_json) } { Ok(s) => s, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } }
+    };
+    let filter = match json_to_doc(filter_str) { Ok(d) => d, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } };
+
+    let source = match unsafe { c_str_to_str(source_field) } { Ok(s) => s, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } };
+    let qt = match unsafe { c_str_to_str(query_text) } { Ok(s) => s, Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); } };
+
+    let lim = if limit <= 0 { 10 } else { limit as usize };
+
+    match coll.inner.find(filter)
+        .and_then(|q| q.semantic(source, qt, lim))
+        .and_then(|vq| vq.to_list())
+    {
         Ok(results) => Box::into_raw(Box::new(MooFileSearchCursor { results, index: 0 })),
         Err(e) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
     }

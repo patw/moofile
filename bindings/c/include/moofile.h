@@ -34,7 +34,19 @@ typedef struct MooFileSearchCursor MooFileSearchCursor;
  *     "vector_indexes": {"embedding": 384},
  *     "text_indexes": ["content"],
  *     "readonly": false,
- *     "durability": "os"   // "none", "os" (default), "fsync"
+ *     "durability": "os",   // "none", "os" (default), "fsync"
+ *     "auto_embed": {        // on-device embedding (v0.5.0+)
+ *       "content": {
+ *         "model": "hf:user/repo:filename.gguf",  // required
+ *         "target": "embedding",                   // target vector field
+ *         "dims": 1024,                            // embedding dimensions
+ *         "precision": "int8",                     // "f32", "int8", "uint8", "binary"
+ *         "normalize": true,
+ *         "query_prefix": "Represent the query: ",
+ *         "doc_prefix": "Represent the document: "
+ *       }
+ *     },
+ *     "model_cache_dir": "/path/to/cache"  // default: ~/.cache/moofile/models/
  *   }
  * @param err_out     Optional pointer to receive an error message string
  *                    (must be freed with moofile_free_string).
@@ -251,6 +263,27 @@ MooFileSearchCursor* moofile_hybrid_search(MooFileCollection* handle, const char
                                             const char* text_field, const char* vector_field,
                                             const char* query_text, const char* query_vector_json,
                                             int limit, char** err_out);
+
+/* ---------------------------------------------------------------------------
+ * Semantic search (autoembedding)
+ * --------------------------------------------------------------------------- */
+
+/**
+ * Perform semantic search — auto-embeds the query text using the configured
+ * embedding model and returns vector similarity results.
+ *
+ * The `source_field` must have been configured with `auto_embed` at collection
+ * open time.  The query text is automatically prefixed with the configured
+ * `query_prefix` before embedding.
+ *
+ * @param source_field The text field name configured in auto_embed.
+ * @param query_text   The search query text (auto-embedded).
+ * @param limit        Max results (use 0 for default of 10).
+ * @return A search cursor with (doc_json, score) pairs.
+ */
+MooFileSearchCursor* moofile_semantic_search(MooFileCollection* handle, const char* filter_json,
+                                              const char* source_field, const char* query_text,
+                                              int limit, char** err_out);
 
 /* ---------------------------------------------------------------------------
  * Search cursor iteration
