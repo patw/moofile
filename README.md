@@ -227,7 +227,28 @@ moo2sqlite users.bson users.db --table people
 
 - **[Specification](moofile-spec.md)** — file format, architecture, design decisions
 - **[API Reference](docs/README.md)** — complete Python API, filter operators, aggregation
+- **[Language Bindings](bindings/README.md)** — C, C++, Node.js, Go, Java, C#
 - **[bench_native.py](bench_native.py)** — Python vs Rust head-to-head benchmark
+
+---
+
+## Language Bindings
+
+MooFile is implemented in **Rust** with a **Python** binding (via PyO3). A **C shared library** (`libmoofile.so`) exposes the full API via `extern "C"` functions, and all other languages consume that:
+
+| Language | Approach | Directory | Lines | Tests |
+|----------|----------|-----------|:-----:|:-----:|
+| **Python** | PyO3 native (or pure-Python fallback) | `bindings/python/` | — | ✅ |
+| **C** | `extern "C"` from Rust core | `bindings/c/` | 867 | 62 |
+| **C++** | RAII wrapper over C API | `bindings/c/include/moofile.hpp` | 686 | 39 |
+| **Node.js** | `koffi` FFI (pure JS, no native compile) | `bindings/node/` | 240 | 18 |
+| **Go** | cgo + C header | `bindings/go/` | 550 | 14 |
+| **Java** | JNR-FFI / Panama FFI | `bindings/java/` | 430 | 📝 |
+| **C#** | P/Invoke + `DllImport` | `bindings/csharp/` | 420 | 12 |
+
+Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local GGUF embedding models) works transparently in all languages — the model loading and inference happen entirely inside the Rust core.
+
+See [`bindings/README.md`](bindings/README.md) for build instructions, usage examples, and test results for each language.
 
 ---
 
@@ -258,17 +279,24 @@ moofile/
 ├── core/                    # Rust engine (cargo build)
 │   ├── src/{lib,storage,index,query,text,cache,embed,errors}.rs
 │   └── examples/bench.rs    # Pure-Rust benchmark
-├── bindings/python/         # PyO3 binding (maturin build)
-│   └── src/lib.rs
+├── bindings/
+│   ├── python/              # PyO3 binding (maturin build)
+│   ├── c/                   # C API (extern "C") + C++ wrapper
+│   ├── node/                # Node.js via koffi
+│   ├── go/                  # Go via cgo
+│   ├── java/                # Java via JNR-FFI
+│   └── csharp/              # C# via P/Invoke
 ├── moofile/                 # Python package
 │   ├── __init__.py          # Auto-detects Rust, falls back to Python
-│   ├── _rust_adapter.py     # Adapts NativeCollection → Collection API
+│   ├── _rust_adapter.py     # Adapts Rust NativeCollection → Python API
 │   ├── collection.py        # Pure-Python reference implementation
 │   ├── query.py, index.py, storage.py, ...
 │   └── cli/                 # moosh, moo2json, moo2mongo, moo2sqlite
 ├── tests/                   # Python test suite
 ├── tests-cross/             # Cross-implementation validation
-└── pyproject.toml
+├── docs/README.md           # Full Python API reference
+├── moofile-spec.md          # File format & architecture spec
+└── pyproject.toml           # Python package config
 ```
 
 ---

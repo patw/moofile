@@ -1,4 +1,4 @@
-# MooFile — Specification v0.5.3
+# MooFile — Specification v0.6.0
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, **on-device autoembedding**, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
@@ -170,11 +170,13 @@ moofile/
 │       ├── embed.rs         # Autoembedding engine (llama-gguf wrapper, quantization)
 │       └── errors.rs        # MooFileError enum
 │
-├── bindings/python/         # PyO3 binding (maturin build)
-│   ├── Cargo.toml
-│   ├── pyproject.toml
-│   └── src/
-│       └── lib.rs           # NativeCollection PyO3 wrapper
+├── bindings/
+│   ├── python/              # PyO3 binding (maturin build)
+│   ├── c/                   # C API (extern "C") + C++ RAII wrapper
+│   ├── node/                # Node.js via koffi FFI
+│   ├── go/                  # Go via cgo
+│   ├── java/                # Java via JNR-FFI
+│   └── csharp/              # C# via P/Invoke
 │
 ├── moofile/                 # Python package (both impls)
 │   ├── __init__.py          # Auto-detects Rust, falls back to Python
@@ -191,6 +193,7 @@ moofile/
 │
 ├── tests/                   # Python test suite (both impls)
 ├── tests-cross/             # Cross-implementation validation tests
+├── docs/README.md           # Full Python API reference
 ├── moofile-spec.md          # This file
 └── pyproject.toml           # maturin build config
 ```
@@ -234,6 +237,57 @@ moofile/
 | Delete (200×) | 287 ms | 82 ms | **3.5×** |
 | Vector search (50×) | 60 ms | 47 ms | 1.3× |
 | Text search (50×) | 73 ms | 32 ms | 2.3× |
+
+---
+
+## Language Bindings (v0.6.0)
+
+MooFile now ships with bindings for **C, C++, Node.js, Go, Java, and C#** — all
+consuming the same C shared library (`libmoofile.so` / `.dylib` / `.dll`).
+
+### Architecture
+
+```
+                    ┌─ Python (PyO3) ──── Rust core (direct FFI)
+                    │
+Language code ──→ JSON strings ──→ C shared library ──→ Rust core
+                    │               (libmoofile.so)
+                    ├─ C / C++ (direct C API)
+                    ├─ Node.js (koffi FFI)
+                    ├─ Go (cgo)
+                    ├─ Java (JNR-FFI)
+                    └─ C# (P/Invoke)
+```
+
+Every binding passes documents and configuration as **JSON strings** across the
+FFI boundary. The Rust core handles all parsing, BSON conversion, indexing, and
+search — the binding is just a thin translation layer.
+
+### What's shared
+
+All bindings support the complete API surface:
+- **CRUD**: insert, insert_many, find, find_one, count, exists
+- **Update**: update_one, update_many, replace_one ($set, $unset, $inc)
+- **Delete**: delete_one, delete_many
+- **Search**: vector_search, text_search, hybrid_search (RRF), semantic
+- **Batch**: atomic batch commit with rollback on error
+- **Utility**: stats, compact, sync, reindex
+- **Autoembedding**: on-device GGUF models, transparent to all languages
+
+### Test coverage
+
+| Binding | Tests | Platform |
+|---------|:-----:|----------|
+| C | 62 | Linux, macOS, Windows |
+| C++ | 39 | Linux, macOS, Windows |
+| Node.js | 18 | Linux, macOS, Windows |
+| Go | 14 | Linux, macOS |
+| Java | (source) | Linux, macOS, Windows |
+| C# | 12 | Linux, macOS, Windows |
+
+A cross-backend parity test suite (`bindings/c/tests/test_parity.py`) validates
+identical results across Python (pure), Python (Rust native), and C (shared library)
+for every major operation.
 
 ---
 
@@ -645,12 +699,13 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 |---|---|
 | 0.1.0 | Initial release — pure-Python, basic CRUD, sorted indexes |
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
-| 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents, Exact/Candidates index result classification, Range lookup via BTreeMap Bound API, Cross-implementation test suite, Native wheel build pipeline |
-| 0.4.0 | **Hybrid search (RRF)** — Reciprocal Rank Fusion of BM25 + vector cosine in one call. **Atomic batch writes** — `with db.batch():` context manager with transactional visibility, batched I/O, and rollback-on-exception. **Disposable index snapshot cache** — `mydata.bson.cache` memoises the in-memory index rebuild, validated against the data file's length + mtime and silently ignored on any mismatch |
-| 0.5.3 | **Multi-process safety** — handles reconcile with the data file by replaying the appended suffix; the index cache records the state it describes; `compact()` reconciles under the lock; inode changes reopen the storage handle. **Full BSON type support in the native backend** — datetime/Binary/ObjectId/Decimal128/… encode through pymongo, byte-identical to the Python impl. **Correctness** — `_id` must be a string; missing fields satisfy no range operator; malformed filters raise instead of panicking or matching nothing; ranked results break ties on `_id`; returned documents are copies. **Performance** — set-backed posting lists (bulk writes on a low-cardinality index no longer quadratic), incremental vector index maintenance, one lock hold per operation |
-| 0.5.2 | **Concurrent multi-process access** — the lifetime-long advisory lock is replaced by a brief exclusive lock around each write, allowing several processes to hold the same file open |
+| 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents |
+| 0.4.0 | **Hybrid search (RRF)**. **Atomic batch writes**. **Disposable index snapshot cache** |
+| 0.5.0 | **On-device autoembedding** — local GGUF models via `llama-gguf`. `.semantic()` method |
 | 0.5.1 | `hybrid_search` type fix, dead code removal, API guard tests |
-| 0.5.0 | **On-device autoembedding** — local GGUF embedding models via `llama-gguf`, auto-downloaded from HuggingFace on first use. `.semantic()` query method. `hybrid_search()` accepts `None` query_vector for auto-embedding. Multiple precision modes: f32, int8, uint8, binary. QAT-trained models retain quality after quantization |
+| 0.5.2 | **Concurrent multi-process access** — brief exclusive lock per write, not lifetime hold |
+| 0.5.3 | Multi-process safety, full BSON type support, `_id` enforcement, performance fixes |
+| **0.6.0** | **Language bindings** — C, C++, Node.js, Go, Java, C# all consuming the same C shared library. **BSON normalisation** — all documents round-tripped through BSON encode/decode on write. **`InvalidIdError`/`InvalidFilterError`** — structured errors for non-string `_id` and malformed filters. **Cross-backend parity tests** — 8 automated scenarios validated across Python (pure), Python (Rust native), and C (shared library) |
 
 ---
 
