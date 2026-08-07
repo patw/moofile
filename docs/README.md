@@ -94,7 +94,7 @@ MooFile's API looks like MongoDB but has important differences that can trip up 
 - **update_one/replace_one are strict**: Raise `DocumentNotFoundError` if no match (MongoDB silently no-ops)
 - **delete_one returns bool**: Returns `True`/`False`, NOT a result object like MongoDB
 - **Vector/text search return tuples**: `[(doc, score), ...]` NOT plain document lists like `find()`
-- **Single-threaded writes**: Concurrent writes from multiple threads are not protected — serialise writes at the application layer. (Cross-process concurrent access is detected and rejected with `ConcurrentAccessError`.)
+- **Single-threaded writes**: Concurrent writes from multiple threads are not protected — serialise writes at the application layer. (Cross-process concurrent access: Python backend uses blocking `flock(LOCK_EX)` to wait; Rust backend raises `ConcurrentAccessError`.)
 - **No nested field indexes**: Only top-level fields can be indexed (no `"user.name"` paths)
 - **No joins or $lookup**: No cross-document references or aggregation pipelines
 - **No async API**: All operations are synchronous
@@ -114,7 +114,7 @@ users.bson.lock   ← advisory lock file (prevents concurrent multi-process acce
 users.bson.cache  ← disposable index snapshot (optional, accelerates cold opens)
 ```
 
-The `.lock` file is disposable — safe to delete, re-created on next open. It exists only to detect and reject concurrent access from another process (raising `ConcurrentAccessError`).
+The `.lock` file is disposable — safe to delete, re-created on next open. It serialises cross-process write access: the Python backend uses blocking `flock(LOCK_EX)` (waits for the other process), while the Rust backend raises `ConcurrentAccessError`.
 
 The `.meta` file is a small JSON file:
 
@@ -145,7 +145,7 @@ from moofile import (
     Collection,
     count, sum, mean, min, max, collect, first, last,
     MooFileError, DuplicateKeyError, DocumentNotFoundError, ReadOnlyError,
-    ConcurrentAccessError,
+    ConcurrentAccessError, InvalidIdError, InvalidFilterError,
 )
 ```
 
@@ -182,6 +182,7 @@ db = Collection(
     indexes=[],                  # list of top-level field names to index
     vector_indexes={},           # dict: field -> vector_dimension
     text_indexes=[],             # list of field names for full-text search
+    auto_embed={},               # dict: source_field -> config (v0.5.0+)
     readonly=False,              # True to prevent all writes
     schema=None,                 # optional hints, ignored in v1
     durability="os",             # "none" | "os" (default) | "fsync"
@@ -216,13 +217,13 @@ docs = db.insert_many([{...}, {...}])
 ```
 
 - If `_id` is absent, a random 24-char hex string is generated.
-- Providing a custom `_id` of any hashable type is allowed.
+- Custom `_id` must be a **string** — non-string `_id` values raise `InvalidIdError`.
 - `DuplicateKeyError` is raised if `_id` already exists.
 
 ### _id Behavior
 
 - **Auto-generated type**: 24-character hex string (e.g., `"507f1f77bcf86cd799439011"`)
-- **Custom _id**: Any hashable type allowed (`str`, `int`, `tuple`, etc.) 
+- **Custom _id**: Must be a **string** — both backends enforce this. Non-string `_id` values raise `InvalidIdError`. (The Rust backend silently skips non-string `_id` records on replay, so both backends reject them up front to prevent silent data loss.)
 - **Always present**: `_id` is populated on all returned documents after insert
 - **Uniqueness**: Enforced at insert time — duplicates raise `DuplicateKeyError`
 - **Preserved**: `_id` cannot be changed by updates, always preserved during `replace_one()`
@@ -737,7 +738,9 @@ from moofile import (
     DuplicateKeyError,       # _id conflict on insert
     DocumentNotFoundError,   # update_one / replace_one with no match
     ReadOnlyError,           # write attempted on read-only collection
-    ConcurrentAccessError,   # another process already has the file open
+    ConcurrentAccessError,   # Rust: raised on concurrent process access; Python: blocks via flock
+    InvalidIdError,          # non-string _id provided
+    InvalidFilterError,      # malformed query filter
 )
 ```
 
@@ -804,7 +807,7 @@ On open, MooFile also acquires an advisory lock on `mydata.bson.lock` (exclusive
 
 Within a single process, MooFile is single-threaded for writes — concurrent writes from multiple threads are not protected, so serialise writes at the application layer if needed. Concurrent reads from multiple threads are safe.
 
-Across processes, MooFile detects concurrent access via an advisory lock on `mydata.bson.lock` and raises `ConcurrentAccessError` rather than silently corrupting the file. Multiple read-only opens are allowed (shared lock); a writer takes an exclusive lock. One writer **or** multiple readers, never both.
+Across processes, MooFile serialises write access via an advisory lock on `mydata.bson.lock`. The **Python backend** uses blocking `flock(LOCK_EX)` (a second writer waits until the first finishes). The **Rust backend** detects concurrent access and raises `ConcurrentAccessError`. Multiple read-only opens are allowed (shared lock); a writer takes an exclusive lock. One writer **or** multiple readers, never both.
 
 ---
 
@@ -812,7 +815,7 @@ Across processes, MooFile detects concurrent access via an advisory lock on `myd
 
 - No server or network interface
 - No replication or clustering
-- No multi-process concurrent writes — detected and rejected with `ConcurrentAccessError` rather than silently corrupting data
+- No multi-process concurrent writes — Python backend blocks via `flock`; Rust backend raises `ConcurrentAccessError`
 - No `$lookup` / joins
 - No nested field indexes
 - No async API
