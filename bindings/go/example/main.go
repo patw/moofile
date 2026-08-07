@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/patw/moofile-go/moofile"
+	"github.com/patw/moofile/bindings/go/moofile"
 )
 
 func main() {

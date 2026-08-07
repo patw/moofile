@@ -7,6 +7,11 @@ If you only want to *use* MooFile from Python, you need none of this — `pip
 install moofile` ships a pure-Python fallback that works on its own, and
 platform wheels carry the Rust engine prebuilt.
 
+If you want another language but not a Rust toolchain, you do not need this
+either: download a prebuilt library from the
+[releases page](https://github.com/patw/moofile/releases) and point
+`MOOFILE_LIB` at it. See [DISTRIBUTION.md](DISTRIBUTION.md).
+
 ---
 
 ## Quick start (Ubuntu)

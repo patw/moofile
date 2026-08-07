@@ -19,7 +19,16 @@ configuration cross the FFI boundary as **JSON strings**.
 **[BUILDING.md](../BUILDING.md)** has the full toolchain setup — a single
 `apt install` for Ubuntu, plus notes for Fedora, Arch, macOS and Windows.
 
-Build the C library first — everything but the Python binding needs it:
+Everything but the Python binding needs the C shared library. Either download
+a prebuilt one from the [releases page](https://github.com/patw/moofile/releases)
+— every binding reads `MOOFILE_LIB` —
+
+```bash
+tar xzf moofile-linux-x86_64.tar.gz
+export MOOFILE_LIB=$PWD/moofile-linux-x86_64/lib/libmoofile.so
+```
+
+or build it yourself:
 
 ```bash
 cargo build -p moofile-c --release

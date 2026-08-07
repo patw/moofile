@@ -1,0 +1,166 @@
+name: Release native libraries
+
+# Builds libmoofile for every supported platform and attaches the results to
+# the GitHub Release.  Python gets its own wheels from build-wheels.yml; this
+# job serves every other language, all of which need the shared library at
+# runtime.
+#
+# Each archive contains:
+#   include/moofile.h, include/moofile.hpp
+#   lib/<libmoofile.so|dylib|moofile.dll>   (plus the import .lib on Windows)
+#   LICENSE, README
+#
+# Run manually (workflow_dispatch) to smoke-test without cutting a release.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            lib: libmoofile.so
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            rust-target: aarch64-unknown-linux-gnu
+            lib: libmoofile.so
+          - os: macos-13          # Intel runner
+            target: macos-x86_64
+            rust-target: x86_64-apple-darwin
+            lib: libmoofile.dylib
+          - os: macos-14          # Apple Silicon runner
+            target: macos-aarch64
+            rust-target: aarch64-apple-darwin
+            lib: libmoofile.dylib
+          - os: windows-latest
+            target: windows-x86_64
+            rust-target: x86_64-pc-windows-msvc
+            lib: moofile.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build libmoofile
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: cargo build --release -p moofile-c --target ${{ matrix.rust-target }}
+
+      # Sanity check: the archive is worthless if the symbols are missing.
+      # 30 exported moofile_* functions are expected.
+      - name: Verify exports (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          LIB="target/${{ matrix.rust-target }}/release/${{ matrix.lib }}"
+          test -f "$LIB" || { echo "::error::$LIB not produced"; exit 1; }
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            COUNT=$(nm -D --defined-only "$LIB" | grep -c ' T moofile_' || true)
+          else
+            COUNT=$(nm -gU "$LIB" | grep -c ' T _moofile_' || true)
+          fi
+          echo "exported moofile_* symbols: $COUNT"
+          [ "$COUNT" -ge 30 ] || { echo "::error::expected >=30 exports, got $COUNT"; exit 1; }
+
+      - name: Verify exports (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $lib = "target/${{ matrix.rust-target }}/release/${{ matrix.lib }}"
+          if (-not (Test-Path $lib)) { throw "$lib not produced" }
+          Write-Host "built $lib ($((Get-Item $lib).Length) bytes)"
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          STAGE="moofile-${{ matrix.target }}"
+          mkdir -p "$STAGE/include" "$STAGE/lib"
+          cp bindings/c/include/moofile.h bindings/c/include/moofile.hpp "$STAGE/include/"
+          cp "target/${{ matrix.rust-target }}/release/${{ matrix.lib }}" "$STAGE/lib/"
+          # Windows also needs the import library to link against.
+          if [ -f "target/${{ matrix.rust-target }}/release/moofile.dll.lib" ]; then
+            cp "target/${{ matrix.rust-target }}/release/moofile.dll.lib" "$STAGE/lib/moofile.lib"
+          fi
+          cp LICENSE "$STAGE/" 2>/dev/null || true
+          cat > "$STAGE/README.txt" <<'TXT'
+          MooFile native library
+          ======================
+
+          include/  C header (moofile.h) and C++ wrapper (moofile.hpp)
+          lib/      the shared library
+
+          Point a binding at it with the MOOFILE_LIB environment variable:
+
+              export MOOFILE_LIB=/path/to/lib/libmoofile.so
+
+          Java uses a system property instead:
+
+              java -Dmoofile.library.path=/path/to/lib/libmoofile.so ...
+
+          To link C or C++ against it:
+
+              cc myapp.c -Iinclude -Llib -lmoofile
+
+          Autoembedding is compiled in.  See https://github.com/patw/moofile
+          TXT
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: tar czf "moofile-${{ matrix.target }}.tar.gz" "moofile-${{ matrix.target }}"
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "moofile-${{ matrix.target }}" -DestinationPath "moofile-${{ matrix.target }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: |
+            moofile-*.tar.gz
+            moofile-*.zip
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum moofile-*.tar.gz moofile-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/moofile-*.tar.gz
+            dist/moofile-*.zip
+            dist/SHA256SUMS

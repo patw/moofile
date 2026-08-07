@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	import "github.com/patw/moofile-go/moofile"
+//	import "github.com/patw/moofile/bindings/go/moofile"
 //
 //	db, err := moofile.Open("data.bson", &moofile.Config{
 //	    Indexes: []string{"email"},

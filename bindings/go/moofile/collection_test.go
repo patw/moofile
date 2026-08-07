@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/patw/moofile-go/moofile"
+	"github.com/patw/moofile/bindings/go/moofile"
 )
 
 func tmpPath(t *testing.T) string {
