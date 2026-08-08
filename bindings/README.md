@@ -280,6 +280,8 @@ db.insert({ name: 'Alice', email: 'a@test.com', age: 30 });
 for (const doc of db.find({ age: { $gte: 30 } })) console.log(doc);
 
 // Sorting, paging, aggregation
+// ⚠️ Pass {} (not null) for "match everything" when using options — null is sent
+// literally to the C layer, which tries to parse it as JSON and throws.
 db.find({}, { sort: 'age', desc: true, limit: 10 }).toArray();
 db.find({}, { group: 'dept', agg: ['count', { func: 'sum', field: 'pay' }] }).toArray();
 
@@ -326,7 +328,9 @@ doc, _ := db.Insert(map[string]any{"name": "Alice", "age": 30})
 // nil filter matches everything; nil options skips the query builder
 results, _ := db.Find(map[string]any{"age": map[string]any{"$gt": 25}}, nil)
 
-oldest, _ := db.Find(nil, &moofile.FindOptions{Sort: "age", Desc: true, Limit: 10})
+// ❗ Pass an empty Document (not nil) for "match everything" when using options —
+// nil is sent literally to the C layer, which tries to parse it as JSON.
+oldest, _ := db.Find(Document{}, &moofile.FindOptions{Sort: "age", Desc: true, Limit: 10})
 
 byDept, _ := db.Find(nil, &moofile.FindOptions{
     Group: "dept",
@@ -386,6 +390,11 @@ examples.
 
 ```java
 import com.moofile.*;
+
+// ❗ Avoid `import java.util.*` alongside `import com.moofile.*` — both export
+// `Collection`, and the compiler will reject the ambiguity. Import explicitly:
+//   import com.moofile.Collection;
+//   import java.util.List;
 
 try (Collection db = Collection.open("data.bson",
         Config.create().index("email"))) {
