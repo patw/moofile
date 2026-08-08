@@ -96,7 +96,7 @@ unsafe fn c_str_to_str<'a>(s: *const i8) -> Result<&'a str, String> {
     if s.is_null() {
         return Err("null pointer".into());
     }
-    unsafe { CStr::from_ptr(s) }
+    unsafe { CStr::from_ptr(s.cast()) }
         .to_str()
         .map_err(|e| format!("invalid UTF-8: {e}"))
 }
