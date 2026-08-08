@@ -75,6 +75,7 @@ jobs:
           esac
           python -m pip install --upgrade pip
           pip install "${wheels[0]}"
+          cd /tmp
           python -c "
           import moofile
           assert moofile._NATIVE_LOADED, 'native extension did not load from the wheel'
@@ -99,6 +100,7 @@ jobs:
           python -VV
           python -m pip install --upgrade pip
           pip install dist/*.whl
+          cd /tmp
           python -c "
           import moofile, sys
           assert moofile._NATIVE_LOADED, 'abi3 wheel failed to load on ' + sys.version
@@ -141,6 +143,7 @@ jobs:
             exit 1
           fi
           pip install dist/*-py3-none-any.whl
+          cd /tmp
           python -c "
           import moofile
           assert not moofile._NATIVE_LOADED, 'pure wheel should not load a native extension'
