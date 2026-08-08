@@ -679,17 +679,19 @@ The two newer exceptions subclass a builtin so ordinary `except TypeError` / `ex
 
 ```bash
 pip install maturin
-cd bindings/python && maturin develop --release
+maturin develop --release   # from the repo root, not bindings/python
 ```
 
 ### Prebuilt wheels
 
-Platform wheels built via GitHub Actions CI for:
-- Linux x86_64 (manylinux)
-- macOS x86_64 + ARM64
+One **abi3** wheel per platform, built via GitHub Actions CI. Because they target the
+stable ABI, a single wheel covers every CPython from 3.10 up:
+- Linux x86_64 (manylinux 2_17)
+- Linux aarch64 (manylinux 2_17)
+- macOS ARM64 (Apple Silicon)
 - Windows x86_64
 
-Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms without prebuilt native wheels.
+Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms without prebuilt native wheels — musl/Alpine and Intel macOS. Importing it emits a `RuntimeWarning`, since it silently lacks autoembedding.
 
 ---
 

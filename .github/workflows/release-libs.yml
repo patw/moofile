@@ -18,9 +18,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing release tag to publish (for example v1.0.2)"
+        description: "Existing release tag to publish (for example v1.0.3)"
         required: true
-        default: "v1.0.2"
+        default: "v1.0.3"
 
 permissions:
   contents: write
@@ -36,6 +36,14 @@ jobs:
           - os: ubuntu-latest
             target: linux-x86_64
             rust-target: x86_64-unknown-linux-gnu
+            lib: libmoofile.so
+          # Native ARM runner rather than cross-compilation: autoembedding
+          # pulls a C/C++ toolchain in through llama-gguf, and cross-builds of
+          # that are what failed when this target was first attempted.
+          # Covers Docker on Apple Silicon and ARM servers.
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+            rust-target: aarch64-unknown-linux-gnu
             lib: libmoofile.so
           - os: macos-14          # Apple Silicon runner
             target: macos-aarch64
@@ -190,7 +198,7 @@ jobs:
             dist/SHA256SUMS
 
   # ── npm ───────────────────────────────────────────────────────────
-  # One package carrying every platform binary (~16 MB compressed). Simpler
+  # One package carrying every platform binary (~13 MB compressed). Simpler
   # and more robust than per-platform optionalDependencies at this scale, and
   # avoids a postinstall downloader — those break under --ignore-scripts,
   # offline, and behind proxies.
@@ -227,9 +235,14 @@ jobs:
             cp "/tmp/moofile-$target/lib/$lib" "native/$dir/$lib"
           }
           stage linux-x86_64    linux-x64    libmoofile.so
+          stage linux-aarch64   linux-arm64  libmoofile.so
           stage macos-aarch64   darwin-arm64 libmoofile.dylib
           stage windows-x86_64  win32-x64    moofile.dll
           find native -type f -exec ls -la {} +
+          for d in linux-x64 linux-arm64 darwin-arm64 win32-x64; do
+            compgen -G "native/$d/*" > /dev/null || {
+              echo "::error::no binary staged for native/$d"; exit 1; }
+          done
 
       - uses: actions/setup-node@v4
         with:
@@ -295,9 +308,14 @@ jobs:
             cp "/tmp/moofile-$target/lib/$lib" "runtimes/$rid/native/$lib"
           }
           stage linux-x86_64    linux-x64    libmoofile.so
+          stage linux-aarch64   linux-arm64  libmoofile.so
           stage macos-aarch64   osx-arm64    libmoofile.dylib
           stage windows-x86_64  win-x64      moofile.dll
           find runtimes -type f -exec ls -la {} +
+          for rid in linux-x64 linux-arm64 osx-arm64 win-x64; do
+            compgen -G "runtimes/$rid/native/*" > /dev/null || {
+              echo "::error::no binary staged for runtimes/$rid"; exit 1; }
+          done
 
       - uses: actions/setup-dotnet@v4
         with:

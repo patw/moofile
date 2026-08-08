@@ -182,7 +182,8 @@ db = Collection(
     indexes=[],                  # list of top-level field names to index
     vector_indexes={},           # dict: field -> vector_dimension
     text_indexes=[],             # list of field names for full-text search
-    auto_embed={},               # dict: source_field -> config (v0.5.0+)
+    auto_embed={},               # dict: source_field -> config (v0.5.0+, Rust core only)
+    model_cache_dir=None,        # override the model download cache (see note below)
     readonly=False,              # True to prevent all writes
     schema=None,                 # optional hints, ignored in v1
     durability="os",             # "none" | "os" (default) | "fsync"
@@ -554,6 +555,10 @@ No other embedded single-file document store offers BM25 + cosine + RRF fusion b
 
 MooFile can run local GGUF embedding models on-device, eliminating the need for external embedding APIs.
 
+> **Requires the Rust core.** The pure-Python fallback cannot run a GGUF model, so
+> `auto_embed` and `.semantic()` both raise `NotImplementedError` there. Check which
+> backend you are on with `moofile._NATIVE_LOADED`; the fallback also warns at import.
+
 **Configuration — `auto_embed` parameter on `Collection`:**
 
 ```python
@@ -572,6 +577,12 @@ db = Collection("docs.bson",
     })
 ```
 
+Unknown keys and unknown `precision` values are rejected with a `ValueError` naming the
+offender, rather than being ignored — silently dropping a misspelled `precision` would
+leave the vectors at `f32` and quadruple their stored size.
+
+The same block is accepted verbatim as JSON by every other binding.
+
 **Model URIs:**
 
 ```
@@ -582,7 +593,7 @@ hf:user/repo:filename.gguf  → HuggingFace Hub, auto-downloaded and cached
 
 On first open with an `hf:` URI, the model is downloaded from HuggingFace (~355 MB for Q8_0) and cached. Subsequent opens are instant.
 
-**On insert/update:** if a document has a source text field, MooFile automatically generates the embedding and stores it in the target field:
+**On insert/update/replace:** if a document has a source text field, MooFile automatically generates the embedding and stores it in the target field:
 
 ```python
 db.insert({"content": "Machine learning is fascinating"})
@@ -601,7 +612,7 @@ The query text is automatically prefixed with `query_prefix` and embedded using 
 **Hybrid search with autoembedding — pass `None` for query_vector:**
 
 ```python
-results = db.find({}).hybrid_search("content", "content", "deep learning", None, 10).to_list()
+results = db.find({}).hybrid_search("content", "embedding", "deep learning", None, 10).to_list()
 # The vector leg auto-embeds "deep learning" from query_text
 ```
 
@@ -638,15 +649,24 @@ All precisions benefit from the model's Quantization-Aware Training (QAT), which
 
 **Error handling:**
 
-```python
-# No autoembed configured for this source field
-db.find({}).semantic("unknown_field", "query", 5)
-# → raises MooFileError: No autoembed configured for source field 'unknown_field'
+| Situation | Exception | Message |
+|---|---|---|
+| Semantic search on a field with no `auto_embed` entry | `MooFileError` | `no autoembed configured for source field '<field>'` |
+| `"model"` path does not exist | `MooFileError` | `autoembed model not found: <path>` |
+| Unknown config key, or unknown `precision` | `ValueError` | names the offending key or value |
+| Config value is not a dict | `TypeError` | `auto_embed['<field>']: config must be a dict` |
+| Running on the pure-Python fallback | `NotImplementedError` | points at installing a native wheel |
+| Library built with `--no-default-features` | `MooFileError` | `autoembedding is not available: this build of moofile was compiled without the 'embed' feature` |
 
-# Model file not found
-Collection("data.bson", auto_embed={"content": {"model": "./missing.gguf"}})
-# → raises MooFileError: ModelNotFound("./missing.gguf")
-```
+> **`model_cache_dir` is currently ignored.** It is accepted by every binding, but
+> `ModelUri::resolve()` in `core/src/embed.rs` never passes it to the HuggingFace client,
+> so downloads always land in llama-gguf's own cache (`~/.cache/llama-rs/models/`).
+
+Autoembedding is on by default. Building without it (`--no-default-features`) drops `llama-gguf` and ~300 transitive crates, taking `libmoofile` from ~8.3 MB to ~2.8 MB; `auto_embed` and semantic search then fail with the error above and everything else works unchanged.
+
+---
+
+### Atomic Batch Writes
 
 The `batch()` context manager buffers all write operations and applies them atomically on commit — a single storage append, a single flush/fsync, and all index mutations applied together.
 
@@ -973,9 +993,9 @@ across the boundary.
 ### Autoembedding across languages
 
 The autoembedding feature (local GGUF models for semantic search) works
-**transparently in all bindings** — the model loading and inference happen
-entirely inside the Rust core. The `auto_embed` config JSON is identical
-across all languages:
+**in every binding**, Python included. Model loading and inference happen entirely
+inside the Rust core, so the `auto_embed` config is identical across all of them
+(the pure-Python fallback is the one exception — it cannot run a model):
 
 ```json
 {

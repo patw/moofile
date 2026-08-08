@@ -1,5 +1,78 @@
 # Changelog
 
+## v1.0.3 (2026-08-08)
+
+### Autoembedding reaches Python
+
+- **`Collection(..., auto_embed={...})` now works from Python.** The PyO3 constructor
+  never grew the parameter, so on-device embedding was reachable from every binding
+  *except* the one most users are on. It accepted exactly the keys the C ABI parses,
+  so an `auto_embed` block is now portable verbatim between Python and the other
+  bindings. `model_cache_dir` is exposed alongside it.
+- Malformed config is rejected with a message naming the offender — an unknown key,
+  an unknown `precision`, a missing `model`, or a non-dict value. Silently ignoring a
+  misspelled `precision` would have left vectors at f32 and quadrupled stored size.
+- Autoembedding failures (missing model file, no config for a source field, a build
+  without the `embed` feature) now raise `MooFileError` from the Python adapter
+  instead of a bare `RuntimeError`.
+- The pure-Python backend accepts `auto_embed` and raises `NotImplementedError`,
+  rather than `TypeError`, so a portable config block no longer looks like a typo.
+
+### The pure-Python fallback announces itself
+
+- Falling back to the pure-Python implementation now emits a `RuntimeWarning` naming
+  the underlying import error. Same import, same class name, different feature set —
+  the silence is how the autoembedding gap above survived several releases.
+  `MOOFILE_PURE_PYTHON=1` silences it; `moofile._NATIVE_IMPORT_ERROR` holds the reason.
+- Fixed `Collection.__del__` raising `AttributeError` during GC when the constructor
+  failed before assigning its attributes, which buried the real construction error.
+
+### Wheels: abi3, Linux ARM, and a working pure-Python floor
+
+- **Wheels are now `abi3` (`abi3-py310`)** — one wheel per platform covers every
+  CPython from 3.10 up. Previously each wheel was pinned to a single minor version
+  and only the versions CI happened to build could install. On everything else pip
+  did not fail, it resolved *backwards*: `pip install moofile` on macOS 3.12 or
+  Windows 3.11 silently installed **0.2.1**, the last release from before the Rust
+  core existed. Five of fifteen common platform/version combinations were getting
+  1.0.2; nine were getting 0.2.1.
+- **Linux ARM64 wheels are built again**, natively on `ubuntu-24.04-arm` rather than
+  cross-compiled — cross-builds are what failed here before, and the embedding engine
+  pulls a C/C++ toolchain through `llama-gguf`. This covers Docker on Apple Silicon
+  and ARM servers.
+- **The pure-Python wheel actually ships again.** Its CI job wrote the setuptools
+  build backend to `pyproject.toml.bak` and never moved it into place, so it built
+  through maturin and produced a native wheel that the publish step then deleted; no
+  `py3-none-any` wheel has reached PyPI since 0.3.1. Replaced with
+  `scripts/build_pure_wheel.py`, which swaps the backend, builds, and restores.
+- **The release refuses to publish an incomplete artifact set.** A missing wheel does
+  not break a release, it quietly narrows coverage — which is how the above went
+  unnoticed. CI also asserts each wheel is abi3, installs it, and re-checks it on a
+  newer interpreter than it was built against.
+- Corrected the build instructions: `maturin build` must run from the repo root. Run
+  inside `bindings/python/` it produces a wheel containing the compiled module and no
+  `moofile/` package at all.
+
+### Native libraries: Linux ARM64
+
+- **`libmoofile` is built for `linux-aarch64`**, natively on `ubuntu-24.04-arm`, and
+  ships in the release archives, the npm package (`native/linux-arm64/`) and the
+  NuGet package (`runtimes/linux-arm64/`). C, C++, Node, Go, Java and C# all reach
+  ARM Linux now — Docker on Apple Silicon and ARM servers included.
+- The Node binding's `SUPPORTED_PLATFORMS` list advertised `darwin-x64` and
+  `linux-arm64`, neither of which shipped. That list exists to turn an unsupported
+  platform into a clear message instead of a dlopen error, so listing a platform that
+  is not there produced exactly the confusing failure it is meant to prevent. It now
+  matches what CI stages, and both packaging jobs fail if a binary is missing.
+
+### Docs
+
+- Corrected every claim that autoembedding works "transparently in all languages", and
+  the platform tables: the native-library archives and the npm/NuGet packages carry
+  Linux x64, macOS ARM64 and Windows x64 only, not the Intel macOS and Linux ARM builds
+  they advertised. (Python wheels do now cover Linux ARM again — see above.)
+- Added `llms.txt`, a compressed full-engine reference for coding agents.
+
 ## v1.0.2 (2026-08-07)
 
 ### Python native binding fixes

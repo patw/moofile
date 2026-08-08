@@ -7,8 +7,8 @@ BM25 text search over a single file. No server, no infrastructure.
 dotnet add package MooFile
 ```
 
-Native libraries for linux (x64, arm64), macOS (Intel, Apple Silicon) and
-Windows (x64) ship inside the package. The SDK copies the right one to your
+Native libraries for linux (x64, arm64), macOS (Apple Silicon) and Windows
+(x64) ship inside the package. The SDK copies the right one to your
 output directory automatically — there is no build step and nothing to install.
 
 ## Usage

@@ -78,10 +78,18 @@ function defaultLibPath() {
     return name;
 }
 
-/** Platform/arch combinations the published package carries binaries for. */
+/**
+ * Platform/arch combinations the published package carries binaries for.
+ *
+ * Keep this in step with the staging step in
+ * `.github/workflows/release-libs.yml` — it exists to turn an unsupported
+ * platform into a clear message instead of a dlopen error, so listing one that
+ * does not ship (this claimed `darwin-x64`, and `linux-arm64` before it was
+ * built) produces exactly the confusing failure it is meant to prevent.
+ */
 const SUPPORTED_PLATFORMS = [
     'linux-x64', 'linux-arm64',
-    'darwin-x64', 'darwin-arm64',
+    'darwin-arm64',
     'win32-x64',
 ];
 

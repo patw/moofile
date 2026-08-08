@@ -103,7 +103,22 @@ class Collection:
         readonly: bool = False,
         schema=None,
         durability: str = "os",
+        auto_embed=None,
+        model_cache_dir=None,
     ) -> None:
+        # Accepted so that both backends have the same constructor signature —
+        # a TypeError here would make a portable `auto_embed` block look like a
+        # typo rather than a missing capability.  Running a GGUF model is the
+        # one thing this implementation cannot do; see semantic() below.
+        if auto_embed:
+            raise NotImplementedError(
+                "auto_embed requires the Rust backend — the pure-Python "
+                "implementation cannot run embedding models. Install a native "
+                "wheel (pip install moofile) or build the extension with "
+                "`maturin develop --release`. Embed text yourself and pass the "
+                "vectors to vector_search() if you need to stay on pure Python."
+            )
+
         self._path = path
         self._readonly = readonly
         self._schema = schema  # informational only in v1; not enforced
@@ -513,6 +528,12 @@ class Collection:
         self.close()
 
     def __del__(self) -> None:
+        # A constructor that raised before its attributes were assigned still
+        # leaves an object for the collector to finalise.  Without this guard
+        # the AttributeError from close() is reported as an unraisable
+        # exception during GC, which buries the real construction error.
+        if getattr(self, "_storage", None) is None and not hasattr(self, "_lock_fd"):
+            return
         self.close()
 
     # -----------------------------------------------------------------------

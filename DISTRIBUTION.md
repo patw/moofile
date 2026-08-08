@@ -27,8 +27,13 @@ itself, once, for every platform. Everything else layers on top.
 | Target | Runner | Artifact |
 |---|---|---|
 | linux-x86_64 | ubuntu-latest | `moofile-linux-x86_64.tar.gz` |
+| linux-aarch64 | ubuntu-24.04-arm | `moofile-linux-aarch64.tar.gz` |
 | macos-aarch64 | macos-14 | `moofile-macos-aarch64.tar.gz` |
 | windows-x86_64 | windows-latest | `moofile-windows-x86_64.zip` |
+
+ARM Linux builds on a native ARM runner rather than cross-compiling: autoembedding
+pulls a C/C++ toolchain in through `llama-gguf`, and cross-builds of that are what
+failed when the target was first attempted.
 
 Each archive holds `include/` (both headers), `lib/` (the shared library, plus
 the import `.lib` on Windows), and a README. `SHA256SUMS` is published
@@ -45,9 +50,15 @@ export MOOFILE_LIB=$PWD/moofile-linux-x86_64/lib/libmoofile.so
 
 ### Python — PyPI
 
-`.github/workflows/build-wheels.yml`, unchanged and already working. Platform
-wheels with the Rust core, plus a pure-Python wheel as fallback. This is the
-best experience of any language here and needs nothing further.
+`.github/workflows/build-wheels.yml` builds one **abi3** wheel per platform —
+linux x86_64/aarch64, macOS arm64, Windows x86_64 — each covering CPython 3.10 and
+up, plus a pure-Python wheel as the fallback for everything else. This is the best
+experience of any language here.
+
+Before abi3 each wheel was pinned to one CPython minor version, so most
+platform/version combinations had no wheel at all; pip did not fail on those, it
+silently installed 0.2.1, the last release from before the Rust core. The publish
+job now refuses to ship an incomplete artifact set for that reason.
 
 ```bash
 pip install moofile
@@ -80,16 +91,16 @@ Python. "Idiomatic" is the goal, but not at any cost.
 | C / C++ | Release tarball + headers | **Done** | There is no registry convention for C. A tarball with `include/` and `lib/` *is* the idiom. |
 | Go | `go get` from the repo | **Done** | Module path fixed. Needing a system library is normal for cgo. |
 | C# | NuGet with `runtimes/<rid>/native/` | **Done** | `dotnet add package MooFile`. The SDK copies the matching native file into the consumer's output automatically. |
-| Node.js | npm | **Done** | `npm install moofile`. All three currently built platform binaries ship in the package; no compile step, no postinstall download. |
+| Node.js | npm | **Done** | `npm install moofile`. All four currently built platform binaries ship in the package; no compile step, no postinstall download. |
 | Java | GitHub Release JAR + native archive | **Done, no Maven Central** | Maven Central is still disproportionate: Sonatype namespace verification, GPG signing, and staging. A versioned binding JAR and each platform's native archive attach to the same GitHub Release; [the Java guide](bindings/java/README.md) covers javac, Maven/Gradle local consumption, and fat-JAR deployment. |
 
 ### Node sizing
 
 Two shapes are available:
 
-1. **One package carrying all five platform libraries.** Simplest possible
+1. **One package carrying all four platform libraries.** Simplest possible
    thing; never breaks. Measured at 3.3 MB compressed per platform, so about
-   16 MB for the published package (8.3 MB unpacked each, because
+   13 MB for the published package (8.3 MB unpacked each, because
    autoembedding pulls `llama-gguf` into every binary).
 2. **Per-platform optional dependencies** (`@moofile/linux-x64` and friends,
    selected by npm through the `os`/`cpu` fields). This is what esbuild and

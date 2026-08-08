@@ -66,6 +66,7 @@ def _map_errors(e):
         DuplicateKeyError,
         InvalidFilterError,
         InvalidIdError,
+        MooFileError,
         ReadOnlyError,
     )
     msg = str(e).lower()
@@ -81,6 +82,16 @@ def _map_errors(e):
         raise InvalidIdError(str(e)) from e
     if "invalid filter" in msg:
         raise InvalidFilterError(str(e)) from e
+    # Autoembedding failures (missing model file, no config for the source
+    # field, a build without the `embed` feature, a failed download).  The
+    # core has no dedicated exception for these, so they surface as the base
+    # MooFileError rather than leaking a bare RuntimeError.
+    if (
+        "autoembed" in msg
+        or "embedding error" in msg
+        or "download error" in msg
+    ):
+        raise MooFileError(str(e)) from e
     raise e
 
 
@@ -113,6 +124,8 @@ class Collection:
         readonly: bool = False,
         schema=None,
         durability: str = "os",
+        auto_embed=None,
+        model_cache_dir=None,
     ):
         if _NativeCollection is None:
             raise ImportError("Native moofile extension not loaded")
@@ -124,6 +137,8 @@ class Collection:
                 text_indexes=list(text_indexes) if text_indexes else None,
                 readonly=readonly,
                 durability=durability,
+                auto_embed=dict(auto_embed) if auto_embed else None,
+                model_cache_dir=str(model_cache_dir) if model_cache_dir else None,
             )
         except RuntimeError as e:
             _map_errors(e)

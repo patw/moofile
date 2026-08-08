@@ -45,6 +45,76 @@ fn doc_to_bson_bytes(doc: &Document, py: Python<'_>) -> PyObject {
     PyBytes::new(py, &bytes).into()
 }
 
+/// Build an [`AutoEmbedConfig`] from the Python dict for one source field.
+///
+/// The accepted keys are exactly those the C ABI parses out of `config_json`
+/// (`bindings/c/src/lib.rs`), so an `auto_embed` block is portable verbatim
+/// between Python and every other binding. Unknown keys are rejected rather
+/// than ignored: a typo like `precison` would otherwise silently leave the
+/// vectors at f32 and quadruple the stored size.
+fn py_auto_embed_config(
+    source_field: &str,
+    cfg: &Bound<PyDict>,
+) -> PyResult<moofile_core::AutoEmbedConfig> {
+    let err = |msg: String| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg);
+
+    for key in cfg.keys() {
+        let key: String = key.extract()?;
+        if !matches!(
+            key.as_str(),
+            "model" | "target" | "dims" | "precision" | "normalize" | "query_prefix" | "doc_prefix"
+        ) {
+            return Err(err(format!(
+                "auto_embed['{source_field}']: unknown key '{key}' (expected one of: \
+                 model, target, dims, precision, normalize, query_prefix, doc_prefix)"
+            )));
+        }
+    }
+
+    let mut out = moofile_core::AutoEmbedConfig::default();
+
+    match cfg.get_item("model")? {
+        Some(v) => out.model = v.extract()?,
+        None => {
+            return Err(err(format!(
+                "auto_embed['{source_field}']: 'model' is required"
+            )))
+        }
+    }
+    if let Some(v) = cfg.get_item("target")? {
+        out.target_field = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("dims")? {
+        out.dims = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("precision")? {
+        let p: String = v.extract()?;
+        out.precision = match p.as_str() {
+            "f32" => moofile_core::EmbeddingPrecision::F32,
+            "int8" => moofile_core::EmbeddingPrecision::Int8,
+            "uint8" => moofile_core::EmbeddingPrecision::Uint8,
+            "binary" => moofile_core::EmbeddingPrecision::Binary,
+            other => {
+                return Err(err(format!(
+                    "auto_embed['{source_field}']: unknown precision '{other}' \
+                     (expected 'f32', 'int8', 'uint8' or 'binary')"
+                )))
+            }
+        };
+    }
+    if let Some(v) = cfg.get_item("normalize")? {
+        out.normalize = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("query_prefix")? {
+        out.query_prefix = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("doc_prefix")? {
+        out.doc_prefix = v.extract()?;
+    }
+
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // NativeCollection
 // ---------------------------------------------------------------------------
@@ -57,7 +127,7 @@ struct NativeCollection {
 #[pymethods]
 impl NativeCollection {
     #[new]
-    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false, durability="os"))]
+    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false, durability="os", auto_embed=None, model_cache_dir=None))]
     fn new(
         path: String,
         indexes: Option<Vec<String>>,
@@ -65,6 +135,8 @@ impl NativeCollection {
         text_indexes: Option<Vec<String>>,
         readonly: bool,
         durability: &str,
+        auto_embed: Option<&Bound<PyDict>>,
+        model_cache_dir: Option<String>,
     ) -> PyResult<Self> {
         let dur = match durability {
             "none" => moofile_core::Durability::None,
@@ -88,6 +160,21 @@ impl NativeCollection {
             for field in ti {
                 builder = builder.text_index(field.as_str());
             }
+        }
+        if let Some(ae) = auto_embed {
+            for (source_field, cfg) in ae.iter() {
+                let source_field: String = source_field.extract()?;
+                let cfg = cfg.downcast::<PyDict>().map_err(|_| {
+                    PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                        "auto_embed['{source_field}']: config must be a dict"
+                    ))
+                })?;
+                builder =
+                    builder.auto_embed(source_field.as_str(), py_auto_embed_config(&source_field, cfg)?);
+            }
+        }
+        if let Some(dir) = model_cache_dir {
+            builder = builder.model_cache_dir(dir);
         }
         if readonly {
             builder = builder.readonly();

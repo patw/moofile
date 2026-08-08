@@ -7,8 +7,8 @@ BM25 text search over a single file. No server, no infrastructure.
 npm install moofile
 ```
 
-Prebuilt native libraries for linux (x64, arm64), macOS (Intel, Apple Silicon)
-and Windows (x64) ship inside the package. There is no compile step and no
+Prebuilt native libraries for linux (x64, arm64), macOS (Apple Silicon) and
+Windows (x64) ship inside the package. There is no compile step and no
 `postinstall` download.
 
 ## Usage

@@ -14,38 +14,33 @@ from moofile import Collection, count, mean
 with Collection("mydata.bson", 
                 indexes=["email", "age"],
                 vector_indexes={"embedding": 1024},
-                text_indexes=["content"],
-                auto_embed={
-                    "content": {
-                        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
-                        "target": "embedding",
-                        "precision": "int8",
-                    },
-                }) as db:
+                text_indexes=["content"]) as db:
     
-    # Insert — auto-embeds content into embedding (int8, 1KB/doc)
     db.insert({
         "name": "Alice", 
         "email": "alice@example.com", 
         "age": 30,
         "content": "Machine learning and data science expert",
+        "embedding": embedding_vector,   # 1024 floats, from your embedding model
     })
 
     # Traditional query
     results = db.find({"age": {"$gt": 25}}).sort("age").to_list()
     
-    # Vector similarity search (raw vector)
+    # Vector similarity search
     similar = db.find({}).vector_search("embedding", query_vector, limit=5).to_list()
-    
-    # Semantic search — auto-embeds query text
-    similar = db.find({}).semantic("content", "data science", limit=5).to_list()
     
     # BM25 text search
     text = db.find({}).text_search("content", "machine learning", limit=10).to_list()
     
-    # Hybrid search — auto-embeds query vector from query text
-    results = db.find({}).hybrid_search("content", "content", "data science", None, 10).to_list()
+    # Hybrid search — BM25 + cosine, fused with Reciprocal Rank Fusion
+    results = db.find({}).hybrid_search("content", "embedding",
+                                        "data science", query_vector, 10).to_list()
 ```
+
+> Prefer not to manage embeddings yourself? [Autoembedding](#autoembedding) runs a local
+> GGUF model on-device, filling in the vector on insert and embedding your query text at
+> search time. It needs the Rust core (`pip install moofile` ships it for most platforms).
 
 ---
 
@@ -98,7 +93,9 @@ many simultaneous writers will queue.
 pip install moofile
 ```
 
-This installs the pure-Python version which works everywhere. See [Native install](#native-install-rust-core) below for the Rust-powered version.
+On Linux (x86_64/ARM64), macOS (Apple Silicon) and Windows (x86_64) this installs the
+Rust-powered wheel. Elsewhere it installs the pure-Python fallback, which warns at
+import. See [Native install](#native-install-rust-core) below.
 
 ---
 
@@ -142,36 +139,57 @@ db.delete_one({"email": "c@ex.com"})
 db.delete_many({"status": "expired"})
 ```
 
-### With Autoembedding
+### Autoembedding
+
+MooFile can run a local GGUF embedding model on-device, so text is embedded on
+insert and query text is embedded at search time — no external embedding API.
 
 ```python
 from moofile import Collection
 
-# Autoembedding: text in "abstract" is automatically embedded into
-# "embedding" on insert, using a local GGUF model (downloaded on first use).
 db = Collection("papers.bson",
     indexes=["year", "category"],
     vector_indexes={"embedding": 1024},
     auto_embed={
-        "abstract": {
+        "abstract": {                             # source text field
             "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
-            "target": "embedding",
+            "target": "embedding",                # target vector field
             "dims": 1024,
-            "precision": "int8",
+            "precision": "int8",                  # f32 | int8 | uint8 | binary
         },
     })
 
-# Insert — auto-embeds abstract → embedding (1 KB, int8 quantized)
+# Insert — auto-embeds abstract → embedding (1 KB/doc at int8)
 db.insert({"title": "Quantum ML", "abstract": "Quantum computing for ML...", "year": 2025})
 
-# Semantic search — query text is auto-embedded using the same model
-results = db.find({"year": 2025}).semantic("abstract", "quantum algorithms", 5).to_list()
-for doc, score in results:
+# Semantic search — the query text is embedded with the same model
+for doc, score in db.find({"year": 2025}).semantic("abstract", "quantum algorithms", 5).to_list():
     print(f"{doc['title']}: {score:.3f}")
 
-# Hybrid search — auto-embeds query_text for the vector leg
-results = db.find({}).hybrid_search("abstract", "abstract", "quantum", None, 10).to_list()
+# Hybrid search — pass None for the query vector and the vector leg auto-embeds
+db.find({}).hybrid_search("abstract", "embedding", "quantum", None, 10).to_list()
 ```
+
+**Requires the Rust core.** The pure-Python fallback cannot run a GGUF model — it
+raises `NotImplementedError` from both `auto_embed` and `semantic()`. Everything else
+works there unchanged.
+
+The same config block is accepted verbatim by every other binding, as JSON:
+
+```jsonc
+{
+  "vector_indexes": {"embedding": 1024},
+  "auto_embed": {
+    "abstract": {"model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+                 "target": "embedding", "dims": 1024, "precision": "int8"}
+  }
+}
+```
+
+The model is downloaded from HuggingFace on first use (~355 MB for Q8_0) and cached.
+Autoembedding is on by default; building with `--no-default-features` drops it and
+~300 transitive crates (~8.3 MB → ~2.8 MB), after which `auto_embed` and semantic
+search return a clear "not available" error and everything else works unchanged.
 
 ---
 
@@ -185,22 +203,30 @@ When the Rust native extension is installed, `import moofile` transparently uses
 # Install Rust: https://rustup.rs
 curl --proto '=https' --tls v1.2 -sSf https://sh.rustup.rs | sh
 
-# Build and install with native extension
+# Build and install the native extension — from the REPO ROOT.
+# The root pyproject.toml is what points maturin at bindings/python and adds
+# the moofile/ package; running maturin inside bindings/python builds a wheel
+# containing only the compiled module, with no Python package in it.
 pip install maturin
-cd moofile
-maturin develop --release
+maturin develop --release      # or: maturin build --release
 ```
 
 ### Prebuilt wheels
 
-Coming soon — GitHub Actions CI will build platform wheels for:
-| Platform | Architectures |
-|---|---|
-| Linux | x86_64 (manylinux) |
-| macOS | x86_64, ARM64 (Apple Silicon) |
-| Windows | x86_64 |
+GitHub Actions builds one **abi3** wheel per platform on tag push — a single wheel
+that works on every CPython from 3.10 up, rather than one per minor version:
 
-In the meantime, `pip install moofile` always works (pure Python fallback).
+| Platform | Architecture | Python |
+|---|---|---|
+| Linux (manylinux 2_17) | x86_64 | 3.10+ |
+| Linux (manylinux 2_17) | aarch64 / ARM64 | 3.10+ |
+| macOS | ARM64 (Apple Silicon) | 3.10+ |
+| Windows | x86_64 | 3.10+ |
+
+Anything else — musl/Alpine, Intel macOS — gets the pure-Python wheel, which has no
+autoembedding and is several times slower. That fallback emits a `RuntimeWarning` at
+import naming the reason; set `MOOFILE_PURE_PYTHON=1` to silence it if you are on it
+deliberately.
 
 ---
 
@@ -249,7 +275,7 @@ MooFile is implemented in **Rust** with a **Python** binding (via PyO3). A **C s
 
 Plus 8 cross-backend parity scenarios comparing pure-Python, PyO3 and C.
 
-Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local GGUF embedding models) works transparently in all languages — the model loading and inference happen entirely inside the Rust core.
+Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local GGUF embedding models) works in every binding — model loading and inference happen entirely inside the Rust core, so the `auto_embed` config block is identical in all of them. The one exception is the pure-Python fallback, which cannot run a model at all.
 
 See [`bindings/README.md`](bindings/README.md) for build instructions, usage examples, and test results for each language.
 

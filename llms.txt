@@ -1,0 +1,549 @@
+# MooFile — LLM Reference (v1.0.2)
+
+Embedded single-file document store. MongoDB-style queries, SQLite-style deployment.
+No server, no daemon, no network. Rust core + pure-Python fallback; C ABI for 6 more languages.
+Target size: MB to low single-digit GB. Repo: github.com/patw/moofile. MIT.
+
+This file is the complete operating contract, verified against source. Where the prose docs
+(README.md, docs/README.md, moofile-spec.md) disagree, this file wins — known stale spots are
+moofile-spec.md's Python autoembedding examples (§7) and docs/README.md's concurrency section,
+which still describes the pre-v0.5.2 whole-handle locking model (§4).
+
+---
+
+## 1. MENTAL MODEL
+
+One collection == one `.bson` file. Append-only log of BSON records; all indexes are in RAM,
+rebuilt by scanning the log at open (or restored from a disposable snapshot cache).
+Last record wins per `_id`. Deletes/updates append; space is reclaimed only by explicit `compact()`.
+
+```
+users.bson        data, append-only, THE source of truth
+users.bson.meta   JSON index declarations {version, indexes, vector_indexes, text_indexes}
+users.bson.lock   advisory flock target; held only during a write. Deletable.
+users.bson.cache  index snapshot; disposable, deletable, never authoritative
+```
+
+Record framing: `[u32 LE payload_len][u8 type][BSON payload]`
+type `0x01` live doc · `0x02` tombstone · `0x03` replacement.
+
+Two implementations, one byte-identical file format:
+- `moofile/` pure Python (reference oracle, always installed). Falling back to it emits a
+  `RuntimeWarning` at import; `MOOFILE_PURE_PYTHON=1` silences it.
+- `core/` Rust (`moofile-core`) → `bindings/python` PyO3 `_native.so`, `bindings/c` `libmoofile.so`
+- `import moofile` tries `_native` first, falls back to pure Python with a warning.
+  Check with `moofile._NATIVE_LOADED` (bool); `moofile._NATIVE_IMPORT_ERROR` holds why it failed.
+
+---
+
+## 2. PYTHON API (exact signatures)
+
+```python
+from moofile import (Collection,
+                     count, sum, mean, min, max, collect, first, last,
+                     MooFileError, DuplicateKeyError, DocumentNotFoundError,
+                     ReadOnlyError, ConcurrentAccessError)
+from moofile.errors import InvalidIdError, InvalidFilterError   # NOT in moofile.__all__
+```
+
+### Open
+
+```python
+Collection(path, indexes=None, vector_indexes=None, text_indexes=None,
+           readonly=False, schema=None, durability="os",
+           auto_embed=None, model_cache_dir=None)
+```
+- `indexes: list[str]` — top-level field names only. No dotted paths.
+- `vector_indexes: dict[str,int]` — field → dimension.
+- `text_indexes: list[str]` — BM25 fields.
+- `schema` — accepted and ignored (v1).
+- `durability` — `"none" | "os" | "fsync"`.
+- `auto_embed: dict[str, dict]` — source field → config; **native backend only** (the pure-Python
+  backend raises `NotImplementedError`). See §7.
+- `model_cache_dir: str` — accepted, but **currently ignored by the core in every binding**;
+  models land in `~/.cache/llama-rs/models/`.
+- Context manager: `with Collection(...) as db:` → calls `close()`.
+- Declaring more indexes later is free: just reopen with the new list (they merge into `.meta`).
+
+### CRUD
+
+| Call | Returns | Miss behaviour |
+|---|---|---|
+| `db.insert(doc)` | `dict` with `_id` | `DuplicateKeyError` on existing `_id` |
+| `db.insert_many(docs)` | `list[dict]` | same |
+| `db.find(filter=None)` | lazy Query | — |
+| `db.find_one(filter=None)` | `dict \| None` | `None` |
+| `db.count(filter=None)` | `int` | `0` |
+| `db.exists(filter)` | `bool` | `False` |
+| `db.update_one(where, set=None, unset=None, inc=None)` | `True` | **raises `DocumentNotFoundError`** |
+| `db.update_many(where, set=None, unset=None, inc=None)` | `int` updated | `0` |
+| `db.replace_one(where, new_doc)` | `True` | **raises `DocumentNotFoundError`** |
+| `db.delete_one(where)` | `bool` | `False` |
+| `db.delete_many(where)` | `int` deleted | `0` |
+| `db.stats()` | `dict` | — |
+| `db.compact()` / `db.sync()` / `db.close()` | `None` | — |
+| `db.batch()` | context manager | — |
+| `db.reindex()` | `None` | **pure-Python backend only** |
+
+Update kwargs are **not** MongoDB operator dicts:
+`update_one({"_id": x}, set={"a": 1}, unset=["b"], inc={"n": 1})`.
+Passing `{"$set": {...}}` as the second positional arg is a `TypeError`. Only `$set`/`$unset`/`$inc`
+semantics exist. `_id` is never modified by update; `replace_one` preserves it.
+
+`stats()` → `{"documents", "dead_records", "file_size_bytes", "dead_ratio"}`.
+One delete adds **two** dead records (superseded doc + tombstone); one update adds one.
+Compact when `dead_ratio > ~0.30`. Never automatic.
+
+### Query chain
+
+Builders: `.sort(field, descending=False)` `.skip(n)` `.limit(n)` `.group(field)` `.agg(*funcs)`
+Terminals: `.to_list() -> list[dict]` · `.first() -> dict|None` · `.count() -> int` · `.to_df()` (pandas)
+
+Stage order is fixed regardless of chaining order: **filter → group/agg → sort → skip → limit**.
+
+```python
+db.find({"status": "active"}).sort("age", descending=True).skip(20).limit(10).to_list()
+db.find({}).group("city").agg(count(), mean("age"), sum("rev")).sort("count", descending=True).to_list()
+```
+
+Aggregations and output field names:
+`count()`→`count` · `sum(f)`→`sum_f` · `mean(f)`→`mean_f` (C ABI alias `avg`) · `min(f)`→`min_f` ·
+`max(f)`→`max_f` · `collect(f)`→`collect_f` · `first(f)`→`first_f` · `last(f)`→`last_f`.
+Group rows are `{group_field: key, <agg outputs>...}`. Docs missing the aggregated field are skipped
+by the aggregate but still counted by `count()`. No docs → `[]`.
+
+Search entry points on a Query (each replaces the terminal set with `(doc, score)` tuples):
+```python
+.vector_search(field, query_vector, limit=10)                    # cosine
+.text_search(field, query, limit=10)                             # BM25
+.hybrid_search(text_field, vector_field, query_text, query_vector, limit=10)   # RRF
+.semantic(source_field, query_text, limit=10)                    # auto-embeds query text
+```
+
+### Filters (complete surface — nothing else exists)
+
+```python
+{"age": 30}                          # implicit $eq
+{"age": {"$eq":30}} {"age":{"$ne":30}}
+{"age": {"$gt":25}} {"$gte":25} {"$lt":40} {"$lte":40}
+{"age": {"$gte":25, "$lt":40}}       # range, one field
+{"s": {"$in":[...]}} {"s": {"$nin":[...]}}
+{"$and":[{...},{...}]} {"$or":[{...},{...}]} {"$not":{...}}
+{"email": {"$exists": True|False}}
+{"tags":  {"$elemMatch": {"$eq":"vip"}}}         # array element ops
+{"items": {"$elemMatch": {"product":"x","qty":{"$gt":5}}}}   # sub-doc match
+```
+No `$regex`, `$where`, `$lookup`/joins, geo, projections, or pipelines. Multiple keys at the top
+level are ANDed. `{}` / `None` matches everything.
+
+Malformed filters raise `InvalidFilterError` (subclass of `ValueError`) at **every** entry point
+— unknown operator, non-document `$and`/`$or` element, non-document `$not`. Filter *evaluation*
+is total and never raises (a Rust panic would poison the collection lock and brick the handle).
+
+### Errors
+
+| Exception | Bases | Cause |
+|---|---|---|
+| `MooFileError` | `Exception` | base of all |
+| `DuplicateKeyError` | MooFileError | duplicate `_id` on insert |
+| `DocumentNotFoundError` | MooFileError | `update_one`/`replace_one` matched nothing |
+| `ReadOnlyError` | MooFileError | write on `readonly=True`, or on a closed handle |
+| `InvalidIdError` | MooFileError, **TypeError** | `_id` not a string |
+| `InvalidFilterError` | MooFileError, **ValueError** | malformed filter |
+| `ConcurrentAccessError` | MooFileError | vestigial — **not raised since v0.5.2** |
+
+---
+
+## 3. HARD INVARIANTS (violating these loses data / diverges backends)
+
+1. **`_id` must be a BSON string.** Auto-generated as a 24-char hex string (12 random bytes).
+   Non-string `_id` → `InvalidIdError` at insert, because the Rust loader *skips* non-string-`_id`
+   records on replay: they would be written and then silently vanish on the next open.
+2. **A missing field satisfies no range operator.** `{"age": {"$gt": 10}}` never matches a doc with
+   no `age`. Must hold on the index path and the scan path alike.
+3. **Documents returned to callers are copies.** Indexes hold documents by reference and `close()`
+   serialises the index into `.cache`; a live reference would let caller mutation persist across a
+   reopen and then vanish on cache invalidation.
+4. **Cross-type comparison never matches and never orders.** Comparison is defined only within
+   compatible types (int/long/double interconvert; str/bool/datetime/Timestamp/ObjectId/Binary
+   each with themselves). Anything else → no match in filters, "equal" in `sort()`.
+5. **Ranked search results are a total order** — vector/text ties break on `_id`, so results are
+   stable across runs, processes and backends.
+6. **Only top-level fields are indexable.** Nested values are still queryable only as whole values
+   (`{"user": {"name": "a"}}` matches the exact sub-document); there are no dotted paths.
+
+---
+
+## 4. CONCURRENCY (v0.5.2+, SQLite-style)
+
+**No lock is held for the lifetime of a handle.** Many processes may hold the same file open —
+the intended shape is one writer + many readers (a worker appending, a web app reading).
+An exclusive `flock` is taken only for the duration of a write, and covers the whole operation
+(match + append + index update), so `update_many`/`insert_many`/batches are atomic against other
+processes and take the lock once, not per document.
+
+A handle's in-memory index is a **private snapshot**. Every index-trusting operation reconciles
+first (`catch_up`):
+
+| data file vs. last-seen | action |
+|---|---|
+| same length, mtime, inode | one `stat`, no work (common path) |
+| grew | replay only the new suffix — append-only, so it's always a contiguous tail |
+| shrank, or inode changed | full reload **plus** storage handle reopen |
+
+Load-bearing consequences:
+1. The `.cache` is stamped with the file state the index *actually describes* (`known_len`/mtime),
+   not the file's current size — otherwise it validates on next open while permanently omitting
+   another writer's records.
+2. `compact()` computes its live set **after** catch-up, under the lock. It rewrites the file
+   wholesale, so a stale snapshot erases unseen records irrecoverably.
+3. An inode change forces `storage.reopen()`. `compact()` renames a new file over the path; other
+   handles' append fds would otherwise write into the unlinked old inode. Detected via `st_ino` on
+   Unix; elsewhere only the shrink case is caught, so compaction with concurrent writers is less
+   safe on Windows.
+
+Guaranteed: no lost writes, readers converge on writers, cross-process duplicate `_id` detection.
+NOT guaranteed: cross-process transactions, or a stable read view within one operation.
+
+**Threads:** concurrent reads are safe. Pure-Python writes are *not* thread-guarded — serialise at
+the app layer. The Rust core guards a handle with a `RwLock`, so a native handle may be shared
+across threads; cursors (C ABI) are never thread-safe.
+
+A partial trailing record is truncated **only at open**, never during mid-session catch-up — with
+multiple processes a short tail usually means another writer is mid-append.
+
+---
+
+## 5. DURABILITY, BATCHES, COMPACTION
+
+| `durability` | Behaviour | Survives | SQLite analogue |
+|---|---|---|---|
+| `"none"` | no flush | nothing | `synchronous=OFF` |
+| `"os"` (default) | `flush()` → page cache | process crash | `synchronous=NORMAL` |
+| `"fsync"` | `sync_all()` per write | power loss | `synchronous=FULL` |
+
+Batched durability: stay on `"os"` and call `db.sync()` once after a run of writes.
+There is no WAL — you lose at most the last in-flight record.
+`compact()` always fsyncs the temp file and parent directory regardless of mode; it writes
+`.tmp`, fsyncs, then atomically renames. Interrupting it leaves the original untouched.
+
+```python
+with db.batch():                       # nested batches are an error
+    db.insert({...})
+    db.update_one({"_id": "a"}, inc={"credits": -50})
+    db.delete_one({"_id": "b"})
+# committed atomically here: one append, one flush/fsync, all index mutations together
+```
+- Reads inside the batch see the **pre-batch** state; buffered writes appear only after commit.
+- An exception inside the `with` discards everything (no append, no index mutation).
+- Validation (duplicate `_id`, `DocumentNotFoundError`) happens eagerly at buffer time.
+- Full write API is available inside a batch.
+- Crash mid-commit may persist a prefix — same guarantee as per-record writes.
+
+---
+
+## 6. SEARCH
+
+**Vector** — brute-force cosine over a dense `[n × dim]` matrix; rows are normalised on insert and
+maintained incrementally (`add` appends, `remove` swap-removes). Scores in `[-1, 1]`, higher is
+closer. Wrong-dimension or non-numeric vectors are ignored, not errors. `.find(filter)` pre-filters.
+
+**Text** — BM25 with `k1=1.2`, `b=0.75`, Porter stemming (`rust-stemmers` / `snowballstemmer`),
+tokenised on word boundaries, punctuation dropped, non-string fields ignored. Scores are unbounded
+and can be negative when a term appears in >50% of docs. Searches one field per call.
+
+**Hybrid (RRF)** — fuses rank positions, not scores: `score(d) = Σ 1/(k + rank + 1)`, `k = 60`,
+`rank` 0-based per ranker. Candidate pool is `max(limit*5, 50)` from each leg, so docs appearing in
+both legs get two contributions and outrank single-leg hits. Rank fusion is used precisely because
+BM25 is unbounded while cosine is bounded — weighted score fusion would need fragile normalisation.
+Passing `query_vector=None` makes the vector leg auto-embed `query_text` (needs autoembed configured).
+
+**Semantic** — `.semantic(source_field, query_text, limit)` embeds the query with the model
+configured for `source_field` (prefixed with `query_prefix`) and runs a vector search on its target.
+Raises "no autoembed configured for source field '<f>'" otherwise. **Pure-Python backend raises
+`NotImplementedError`** — it cannot run GGUF models; the method exists only to keep the two API
+surfaces identical.
+
+All four return `list[tuple[dict, float]]` from `.to_list()`, not bare documents.
+
+---
+
+## 7. AUTOEMBEDDING (on-device GGUF)
+
+Config lives on the collection builder (Rust), the `auto_embed=` kwarg (Python, native backend
+only), or `config_json` at open (C ABI and every binding built on it). It is **not** stored in
+`.meta` — it must be supplied on every open.
+
+```jsonc
+"auto_embed": {
+  "content": {                                     // source text field
+    "model": "hf:user/repo:file.gguf",             // required
+    "target": "embedding",                         // target vector field
+    "dims": 1024,                                  // MRL truncation
+    "precision": "int8",                           // "f32"|"int8"|"uint8"|"binary"
+    "normalize": true,
+    "query_prefix": "Represent the query: ",
+    "doc_prefix": "Represent the document: "
+  }
+},
+"model_cache_dir": "/path"                         // default ~/.cache/moofile/models/
+```
+Model URIs: `hf:user/repo:file.gguf` (downloaded and cached on first use, ~355 MB for Q8_0),
+`./relative.gguf`, `/absolute.gguf`. Missing file → `ModelNotFound`. Unknown config keys and
+unknown `precision` values are rejected, not ignored. `model_cache_dir` is accepted everywhere but
+`ModelUri::resolve()` ignores it (`core/src/embed.rs`, param is `_cache_dir`) — downloads always go
+to llama-gguf's own `~/.cache/llama-rs/models/`, not the documented `~/.cache/moofile/models/`.
+
+On insert/update/replace, if the source field is present its text is embedded into the target field
+automatically. Precision at 1024 dims: `f32` 4.0 KB · `int8`/`uint8` 1.0 KB (~1.0000 cosine sim
+retained) · `binary` 128 B (~0.9999). Multiple source→target pairs per collection are allowed.
+
+The `embed` cargo feature is **on by default**. `--no-default-features` drops `llama-gguf` and
+~300 transitive crates (libmoofile ~8.3 MB → ~2.8 MB); `auto_embed` and `semantic` then return
+`MooFileError::EmbedDisabled` and everything else is unchanged.
+
+---
+
+## 8. BACKEND DIVERGENCES (Python: native vs pure)
+
+Both backends produce byte-identical files and identical query results. The API surface differs:
+
+| | pure Python | native (PyO3) |
+|---|---|---|
+| `db.reindex()` | present | **absent → `AttributeError`** |
+| `Query.to_df()` | present (needs pandas) | **absent** |
+| `.semantic()` | raises `NotImplementedError` | works when `auto_embed` is configured |
+| `auto_embed=` | raises `NotImplementedError` | supported |
+| `stats()` values | `int` (except `dead_ratio`) | **all `float`** |
+| Query builder | `.sort()/.limit()/…` return a **new** Query | **mutate and return `self`** |
+| Multi-process writes | blocking `flock(LOCK_EX)` | same lock, in Rust |
+
+Consequence of the mutable native builder: never fan out from a shared Query
+(`q = db.find({}); a = q.limit(1); b = q.limit(5)` gives two views of one object). Build and consume
+each chain in a single expression.
+
+Performance, 10K docs / 128d (native vs pure Python): cold open 24×, insert 21×, update 5.6×,
+full scan 3.7×, delete 3.5×, text 2.3×, vector 1.3×; `find_one` is ~0.5× (FFI overhead dominates a
+single indexed lookup). Re-run `bench_native.py` before quoting.
+
+---
+
+## 9. C ABI (`bindings/c/include/moofile.h`) — every non-Python binding sits on this
+
+Documents and config cross as **JSON strings**. 30 functions.
+
+```
+moofile_open(path, config_json, err_out) -> MooFileCollection*
+moofile_close / _sync / _compact / _reindex (handle, err_out) -> int
+moofile_insert(h, doc_json, e) -> char*        moofile_insert_many(h, docs_json, e) -> char*
+moofile_find(h, filter_json, e) -> MooFileCursor*
+moofile_find_ex(h, filter_json, options_json, e) -> MooFileCursor*
+moofile_find_one(h, filter_json, e) -> char*   moofile_count -> int64  moofile_exists -> int
+moofile_cursor_next(cur, e) -> char*           moofile_cursor_free(cur)
+moofile_update_one(h, where_json, update_json, e) -> int     (-1 when nothing matched)
+moofile_update_many(...) -> int64              moofile_replace_one(...) -> int
+moofile_delete_one -> int                      moofile_delete_many -> int64
+moofile_vector_search(h, filter, field, vec_json, limit, e)  -> MooFileSearchCursor*
+moofile_text_search(h, filter, field, query, limit, e)
+moofile_hybrid_search(h, filter, text_field, vec_field, query_text, vec_json|NULL, limit, e)
+moofile_semantic_search(h, filter, source_field, query_text, limit, e)
+moofile_search_cursor_next(cur, e) -> char*    // "[doc_json, score]"
+moofile_search_cursor_free(cur)
+moofile_batch_begin / _commit / _rollback(h, e) -> int
+moofile_stats(h, e) -> char*                   moofile_free_string(char*)
+```
+
+`config_json` for `moofile_open`:
+`{"indexes":[…], "vector_indexes":{"f":384}, "text_indexes":[…], "readonly":false,
+"durability":"os", "auto_embed":{…}, "model_cache_dir":"…"}` (or `NULL` for defaults).
+
+`options_json` for `moofile_find_ex`:
+`{"sort":"age" | {"field":"age","desc":true}, "skip":10, "limit":5, "group":"dept",
+"agg":[{"func":"count"},{"func":"sum","field":"pay"}]}`.
+An unrecognised key or function name is an **error**, never ignored — a typo like `limt` cannot
+silently return the whole collection.
+
+### ABI contract — three rules that fail silently if broken
+
+1. **Errors.** Every function takes a trailing `char** err_out`. Failure returns `NULL` (pointer)
+   or `-1` (int/int64) *and* sets `*err_out`. A `NULL` return with `*err_out == NULL` is **not** an
+   error — it means "no result" (exhausted cursor, `find_one` miss). Check the slot even when the
+   return value looks fine.
+2. **The `err_out` slot must be real and passed by reference.** The C layer skips writing the
+   message when `err_out` is NULL, so passing NULL disables error reporting for that call — a
+   binding that infers "no message ⇒ no error" then reports success on every failure. This shipped
+   here for months.
+3. **Never let the FFI layer marshal a returned `char*` into a native string** (ctypes `c_char_p`,
+   koffi `'string'`, P/Invoke `string` return, JNA `String`). They copy the bytes and drop the
+   pointer, which is the only thing `moofile_free_string()` can take — you either leak every
+   document read or hand the host runtime's buffer to `free()` (`free(): invalid size`, abort).
+   Declare the return as an opaque pointer, read through it, free that same pointer. Every binding
+   here has a `take_string`-style helper.
+
+Ownership: every returned `char*` is the caller's, freed with `moofile_free_string()`; cursors with
+`moofile_cursor_free()`/`moofile_search_cursor_free()`; handles with `moofile_close()`. Strings
+passed *in* are borrowed for the call and never retained.
+
+Missing-document semantics: `update_one`/`replace_one` **fail** (-1, `"no document matches filter"`);
+`update_many`/`delete_one`/`delete_many` return 0.
+
+Build: `cargo build -p moofile-c --release` → `target/release/libmoofile.{so,dylib,dll}`.
+Every binding finds it by walking up from its own directory; override with `MOOFILE_LIB`
+(Java: `-Dmoofile.library.path=…`). Prebuilt archives are on the GitHub releases page.
+
+---
+
+## 10. BINDING QUICKSTARTS
+
+```js  // Node 18+, koffi. Cursors are iterable and self-freeing.
+const { Collection } = require('./moofile');
+const db = new Collection('data.bson', { indexes: ['email'], vector_indexes: { embedding: 384 } });
+db.insert({ name: 'Alice', age: 30 });
+for (const d of db.find({ age: { $gte: 30 } })) console.log(d);
+db.find({}, { sort: 'age', desc: true, limit: 10 }).toArray();
+db.find({}, { group: 'dept', agg: ['count', { func: 'sum', field: 'pay' }] }).toArray();
+db.batch(() => { db.insert({ _id: 'a' }); });
+db.close();
+```
+```go  // Go 1.21+, cgo. nil filter = everything, nil options = no builder.
+db, err := moofile.Open("data.bson", &moofile.Config{Indexes: []string{"email"}})
+defer db.Close()
+doc, _ := db.Insert(map[string]any{"name": "Alice", "age": 30})
+res, _ := db.Find(moofile.Filter{"age": map[string]any{"$gt": 25}}, nil)
+top, _ := db.Find(nil, &moofile.FindOptions{Sort: "age", Desc: true, Limit: 10,
+                  Agg: []moofile.Agg{moofile.Count(), moofile.Sum("pay")}, Group: "dept"})
+_, err = db.UpdateOneWith(moofile.Filter{"_id": "a"}, moofile.Update{Set: moofile.Document{"s": 1}})
+err = db.Batch(func() error { db.Insert(...); return nil })   // returning err rolls back
+```
+```java  // JDK 22+ (Panama FFM). No Maven/Gradle: ./build.sh is the toolchain.
+try (Collection db = Collection.open("data.bson", Config.create().index("email"))) {
+    db.insert(Document.of("name", "Alice", "age", 30));
+    for (Document d : db.find(Filters.and(Filters.gte("age", 30), Filters.eq("s", "active")))) {}
+    db.find(null, FindOptions.create().group("dept").count().sum("pay"));
+    db.batch(() -> { db.insert(Document.of("_id", "a")); });   // throws ⇒ rollback
+}
+// run with: --enable-native-access=ALL-UNNAMED -Dmoofile.library.path=/path/to/libmoofile
+```
+```csharp // .NET 8+ (project targets net10.0), P/Invoke. Documents hold plain CLR values.
+using var db = Collection.Open("data.bson", new Config { Indexes = new[] { "email" } });
+db.Insert(Document.Of("name", "Alice", "age", 30));
+foreach (var d in db.Find(Document.Of("age", Document.Of("$gt", 25)))) {}
+var f = Builders<Person>.Filter.Gte(p => p.age, 30);   // property names must match stored fields
+db.Find(null, FindOptions.Create().Sort("age", desc: true).Limit(10));
+```
+```cpp  // C++17 + nlohmann/json, header-only RAII; errors become moofile::error
+moofile::Collection db("data.bson", moofile::Config{}.index("email").vector_index("emb", 384));
+db.insert({{"name","Alice"},{"age",30}});
+for (const auto& d : db.find({{"age",{{"$gt",25}}}})) std::cout << d.dump() << "\n";
+db.find(json::object(), moofile::FindOptions().group("dept").count().sum("pay")).to_vector();
+{ moofile::Collection::Batch b(db); db.insert({{"_id","a"}}); b.commit(); }  // no commit ⇒ rollback
+```
+```rust // moofile-core
+let db = Collection::builder("data.bson").indexes(&["email"]).vector_index("emb", 384)
+          .text_index("content").durability(Durability::Os)
+          .auto_embed("content", AutoEmbedConfig { .. }).open()?;
+db.insert(doc)?; db.find(filter)?.sort("age", true).limit(10).to_list()?;
+db.batch_begin()?; …; db.batch_commit()?;   // or batch_rollback()
+```
+
+| Language | Mechanism | Requirement | Tests |
+|---|---|---|---|
+| Python | PyO3, pure-Python fallback | 3.10+ | 307 |
+| C | `extern "C"` | C11 | 73 |
+| C++ | header-only RAII (`moofile.hpp`) | C++17, nlohmann/json | 43 |
+| Node.js | koffi (no node-gyp) | Node 18+ | 22 |
+| Go | cgo | Go 1.21+, C toolchain | 23 |
+| Java | Foreign Function & Memory API | **JDK 22+** | 31 |
+| C# | P/Invoke | .NET 8+ | 32 |
+
+Adding a core feature that other languages should reach means adding a C entry point **and**
+surfacing it in C++, Node, Go, Java and C#.
+
+---
+
+## 11. BSON TYPES
+
+Any type BSON defines and pymongo encodes: `str int float bool None list dict bytes datetime
+Binary ObjectId Decimal128 Timestamp Regex Code Int64 SON`. Both implementations encode through
+pymongo's encoder, so their bytes match each other and `bson.encode()`.
+
+- **Stored values are BSON-normalised, not round-tripped Python objects.** A tz-aware `datetime`
+  reads back naive UTC; a subtype-0 `Binary` reads back as `bytes`. Filter values normalise the
+  same way, so a tz-aware datetime in a query does match the stored form.
+- Several BSON types subclass a builtin (`Code`⊂`str`, `Int64`⊂`int`, `Binary`⊂`bytes`, `SON`⊂`dict`),
+  so conversion fast paths test **exact** types and let everything else fall to the encoder —
+  an `isinstance` test would silently downgrade a `Code` to a plain string.
+- A type pymongo refuses (bare `uuid.UUID`) raises pymongo's own error from both backends.
+- Range operators work on `datetime`, `Timestamp`, `ObjectId`, `Binary` as well as numbers, strings
+  and booleans; `datetime` and `ObjectId` are indexable.
+
+---
+
+## 12. QUERY PLANNING
+
+- **Exact** — filter is a pure equality or pure range on one indexed field → served straight from the
+  BTreeMap/SortedDict, no `matches()` pass. O(log n + k).
+- **Candidates** — multiple fields or mixed operators → index pre-filter, then `matches()` per candidate.
+- **Full scan** — no applicable index.
+- `_id` is always indexed regardless of declaration.
+- Posting lists are **sets**, not lists: removal from a list is O(k) over every id sharing that value,
+  making writes to a low-cardinality indexed field O(n) and bulk operations quadratic. Python uses a
+  dict as an insertion-ordered set so result ordering is unaffected.
+- Unsorted result order is unspecified (index/dict order) — chain `.sort()` if you need determinism.
+- `sort()` on a missing field: pure Python places missing/None last ascending; the Rust core compares
+  against `Null` and treats incomparable pairs as equal. Do not depend on the placement of missing
+  values or on cross-type ordering.
+
+---
+
+## 13. CLI (installed with the Python package)
+
+```bash
+moosh users.bson [--indexes email,age] [--readonly]     # REPL, `db` + agg helpers pre-bound
+moo2json users.bson users.json            # '-' for stdout
+moo2json --import users.json users.bson --indexes email,age   # accepts JSON array or NDJSON, '-' = stdin
+moo2mongo users.bson --uri mongodb://localhost/mydb --collection users [--drop]
+moo2mongo --import users.bson --uri … --collection users [--indexes …]
+moo2sqlite users.bson users.db [--table people] [--drop]      # all columns TEXT, _id = TEXT PRIMARY KEY
+moo2sqlite --import users.db users.bson --table people        # nested docs/arrays round-trip as JSON
+```
+All import/export tools take `--quiet`; `--uri` must include the database name.
+
+---
+
+## 14. BUILD & TEST
+
+```bash
+pip install moofile                  # abi3 wheel (Rust core) on linux x86_64/aarch64,
+                                     # macOS arm64, windows x86_64; pure-Python elsewhere
+pip install "moofile[pandas]"        # adds .to_df()
+# deps: pymongo, sortedcontainers, numpy, snowballstemmer
+
+export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1     # required for any cargo command here
+cargo build --release -p moofile-py              # cargo WORKSPACE: artifact lands in ROOT target/
+maturin build --release                          # wheels: run from the REPO ROOT — inside
+                                                 # bindings/python/ the wheel has no moofile/ pkg
+cp target/release/lib_native.so moofile/_native.cpython-*.so
+# or: maturin develop --release   (from the repo root, in a venv)
+cargo build --release -p moofile-c               # -> target/release/libmoofile.so
+
+PYTHONPATH=. pytest tests/ -v                    # 181 — PYTHONPATH=. or you test site-packages
+PYTHONPATH=. pytest tests-cross/ -v              # 126, both backends; --backend=python for one
+cd core && cargo test                            # 79
+./scripts/test-all.sh                            # every language, skips absent toolchains
+```
+
+Traps: `bindings/python/target/` may hold a stale artifact — the workspace builds into the **root**
+`target/`. If `moofile/_native` is a symlink to `bindings/python/_native/`, that package shadows
+`moofile/_native.cpython-*.so`; refresh the `.so` inside the symlink target too.
+`tests-cross/conftest.py` must import `moofile.collection` **directly** for the `python` backend —
+`from moofile import Collection` resolves to the Rust adapter whenever the extension is loaded, which
+once made the whole suite run one backend under both labels.
+
+---
+
+## 15. NON-GOALS
+
+No server or network interface. No replication or clustering. No `$lookup`/joins. No nested-field
+indexes. No async API. No projections or aggregation pipelines. No WAL. No automatic compaction.
+No cross-process transactions. No ANN index — vector search is brute force.

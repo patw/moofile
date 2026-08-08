@@ -5,22 +5,33 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# One abi3 wheel per platform covers every CPython from 3.10 up. Before abi3
+# each wheel was pinned to a single minor version and only the versions this
+# matrix happened to build could install; on everything else `pip install
+# moofile` silently resolved backwards to 0.2.1 — the last release from before
+# the Rust core existed — instead of failing. Keep the abi3 floor, the
+# `requires-python` in pyproject.toml, and the `abi3-py310` feature in
+# bindings/python/Cargo.toml in step with each other.
+
 jobs:
-  # ── Native wheels (Rust core) ─────────────────────────────────
+  # ── Native wheels (Rust core), one abi3 wheel per platform ────
   native:
+    name: wheel ${{ matrix.target }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            maturin-interpreter: python3.10
-          - os: ubuntu-latest
-            maturin-interpreter: python3.12
-          - os: ubuntu-latest
-            maturin-interpreter: python3.14
+            target: linux-x86_64
+          # Native ARM runner rather than cross-compilation: the embedding
+          # engine pulls a C/C++ toolchain through llama-gguf, which is what
+          # made cross-builds fail here before.
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
           - os: macos-latest
-            maturin-interpreter: python3
+            target: macos-arm64
           - os: windows-latest
-            maturin-interpreter: python3
+            target: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -28,26 +39,83 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build wheels
+      # Pin the build interpreter so the wheel tag is deterministic
+      # (cp310-abi3) instead of tracking whatever the runner image ships.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
-          args: --release --out dist -i ${{ matrix.maturin-interpreter }}
+          args: --release --out dist
           manylinux: "2_17"
           before-script-linux: |
-            yum install -y openssl-devel || true
+            yum install -y openssl-devel || apt-get update && apt-get install -y libssl-dev || true
 
-      - name: Remove native linux wheels (PyPI doesn't accept linux_x86_64)
-        if: runner.os == 'Linux'
-        run: rm -f dist/*linux_x86_64*.whl
+      - name: Check the wheel is abi3 and installable
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          # PyPI rejects bare linux_* tags; a repaired manylinux wheel should
+          # be the only linux artifact here.
+          rm -f dist/*-linux_x86_64.whl dist/*-linux_aarch64.whl
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          if [ ${#wheels[@]} -ne 1 ]; then
+            echo "expected exactly one wheel, got: ${wheels[*]}" >&2
+            exit 1
+          fi
+          case "${wheels[0]}" in
+            *cp310-abi3-*) echo "OK: ${wheels[0]}" ;;
+            *) echo "not an abi3 wheel: ${wheels[0]} — is abi3-py310 still enabled?" >&2; exit 1 ;;
+          esac
+          python -m pip install --upgrade pip
+          pip install "${wheels[0]}"
+          python -c "
+          import moofile
+          assert moofile._NATIVE_LOADED, 'native extension did not load from the wheel'
+          db = moofile.Collection('smoke.bson', indexes=['k'])
+          db.insert({'k': 'a', 'n': 1})
+          assert db.find({'n': {'\$gte': 1}}).count() == 1
+          db.close()
+          print('smoke test OK on', moofile.__version__)
+          "
+
+      # The point of abi3 is that a wheel built against 3.10 runs on later
+      # interpreters. Assert it rather than assume it — this is the property
+      # the whole platform matrix now rests on.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Check the abi3 wheel runs on a newer Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -VV
+          python -m pip install --upgrade pip
+          pip install dist/*.whl
+          python -c "
+          import moofile, sys
+          assert moofile._NATIVE_LOADED, 'abi3 wheel failed to load on ' + sys.version
+          print('abi3 forward-compat OK on', sys.version.split()[0])
+          "
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.maturin-interpreter }}
+          name: wheels-${{ matrix.target }}
           path: dist/
 
-  # ── Pure-Python wheel (fallback for unsupported platforms) ──
+  # ── Pure-Python wheel: the floor under everything above ───────
+  # Covers musl/Alpine, Intel macOS, and any platform not built above. This
+  # job used to write its setuptools config to pyproject.toml.bak and never
+  # move it into place, so it built through maturin and produced a native
+  # wheel that the publish job then deleted — no pure-Python wheel has
+  # reached PyPI since 0.3.1.
   pure-python:
     runs-on: ubuntu-latest
     steps:
@@ -60,13 +128,28 @@ jobs:
       - name: Build pure-Python wheel
         run: |
           pip install build
-          # Temporarily swap to setuptools build
-          cat > pyproject.toml.bak << 'PYEOF'
-          [build-system]
-          requires = ["setuptools>=61"]
-          build-backend = "setuptools.build_meta"
-          PYEOF
-          python -m build --wheel --outdir dist/
+          python scripts/build_pure_wheel.py --outdir dist
+
+      - name: Check it is genuinely pure Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          test -f dist/*-py3-none-any.whl
+          if python -m zipfile -l dist/*-py3-none-any.whl | grep -qE '\.(so|pyd|dylib)'; then
+            echo "pure-Python wheel contains a compiled extension" >&2
+            exit 1
+          fi
+          pip install dist/*-py3-none-any.whl
+          python -c "
+          import moofile
+          assert not moofile._NATIVE_LOADED, 'pure wheel should not load a native extension'
+          db = moofile.Collection('smoke.bson', indexes=['k'])
+          db.insert({'k': 'a'})
+          assert db.count({}) == 1
+          db.close()
+          print('pure-Python smoke test OK on', moofile.__version__)
+          "
 
       - uses: actions/upload-artifact@v4
         with:
@@ -91,13 +174,30 @@ jobs:
           path: dist/
           merge-multiple: true
 
-      - name: Strip unsupported platform wheels
+      # A missing artifact is the failure mode this whole file exists to
+      # prevent: it does not break the release, it quietly narrows platform
+      # coverage, and pip then serves an old version instead of erroring.
+      - name: Verify the full artifact set is present
+        shell: bash
         run: |
-          echo "Wheels before cleanup:"
+          set -euo pipefail
           ls -la dist/
-          rm -f dist/*linux_x86_64*.whl
-          echo "Wheels after cleanup:"
-          ls -la dist/
+          missing=0
+          for pattern in \
+            "*-cp310-abi3-manylinux*x86_64.whl" \
+            "*-cp310-abi3-manylinux*aarch64.whl" \
+            "*-cp310-abi3-macosx*arm64.whl" \
+            "*-cp310-abi3-win_amd64.whl" \
+            "*-py3-none-any.whl"
+          do
+            # shellcheck disable=SC2086
+            if ! compgen -G "dist/$pattern" > /dev/null; then
+              echo "MISSING: $pattern" >&2
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || { echo "refusing to publish an incomplete set" >&2; exit 1; }
+          echo "all expected artifacts present"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
