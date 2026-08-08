@@ -1,8 +1,10 @@
 # Changelog
 
-## v1.0.3 (2026-08-08)
+## v1.0.4 (2026-08-08)
 
-### Autoembedding reaches Python
+### Build fixes
+
+- Fixed `CString` pointer type mismatch in the C binding (`*mut i8` → `*mut u8` cast)
 
 - **`Collection(..., auto_embed={...})` now works from Python.** The PyO3 constructor
   never grew the parameter, so on-device embedding was reachable from every binding

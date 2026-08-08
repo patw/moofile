@@ -27,7 +27,7 @@ use moofile::Collection as RustCollection;
 unsafe fn set_error(err_out: *mut *mut i8, msg: &str) {
     if !err_out.is_null() {
         let c_msg = CString::new(msg).unwrap_or(CString::new("unknown error").unwrap());
-        unsafe { *err_out = c_msg.into_raw(); }
+        unsafe { *err_out = c_msg.into_raw().cast(); }
     }
 }
 
@@ -103,7 +103,7 @@ unsafe fn c_str_to_str<'a>(s: *const i8) -> Result<&'a str, String> {
 
 /// Return a C-string allocated via CString (caller frees via moofile_free_string).
 fn to_c_string(s: String) -> *mut i8 {
-    CString::new(s).unwrap_or_default().into_raw()
+    CString::new(s).unwrap_or_default().into_raw().cast()
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,5 +1090,5 @@ pub extern "C" fn moofile_reindex(handle: *mut MooFileCollection, err_out: *mut 
 
 #[no_mangle]
 pub extern "C" fn moofile_free_string(s: *mut i8) {
-    if !s.is_null() { unsafe { drop(CString::from_raw(s)); } }
+    if !s.is_null() { unsafe { drop(CString::from_raw(s.cast())); } }
 }
