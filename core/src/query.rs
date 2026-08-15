@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use bson::{Bson, Document};
 
-use crate::embed::{self, ModelUri};
+use crate::embed;
 use crate::CollectionInner;
 use crate::MooFileError;
 
@@ -349,21 +349,26 @@ impl Query {
         let source_field = source_field.into();
         let query_text = query_text.into();
 
-        // Read the autoembed config to know which model and field to use
-        let (target_field, query_vector) = {
+        // Read the autoembed config to know which model and field to use.
+        // Clone what we need and drop the lock before embedding — holding a
+        // read lock across a model forward pass would block writers for the
+        // duration.
+        let (config, engine) = {
             let inner = self.inner.read().expect("lock poisoned");
 
             let config = inner.auto_embeds.get(&source_field)
-                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?
+                .clone();
 
-            // Resolve model path
-            let model_uri = ModelUri::parse(&config.model);
-            let cache_dir = crate::default_model_cache_dir();
-            let local_path = model_uri.resolve(&cache_dir)?;
-            let model_key = local_path.to_string_lossy().into_owned();
+            let engine = inner.embedding_engines.get(&config.model)
+                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?
+                .clone();
 
-            let engine = inner.embedding_engines.get(&model_key)
-                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+            (config, engine)
+        };
+
+        let (target_field, query_vector) = {
+            let config = &config;
 
             // Prefix and embed
             let prefixed = format!("{}{}", config.query_prefix, query_text);
@@ -542,6 +547,7 @@ impl VectorQuery {
             let mut inner = self.inner.write().expect("lock poisoned");
             inner.require_open()?;
             inner.catch_up()?;
+            inner.require_vector_field_enabled(&self.field)?;
             inner.index_manager.ensure_vectors_fresh();
         }
 
@@ -673,12 +679,7 @@ impl HybridQuery {
                     ))?;
 
                 // Find the engine
-                let model_uri = ModelUri::parse(&config.model);
-                let cache_dir = crate::default_model_cache_dir();
-                let local_path = model_uri.resolve(&cache_dir)?;
-                let model_key = local_path.to_string_lossy().into_owned();
-
-                let engine = inner.embedding_engines.get(&model_key)
+                let engine = inner.embedding_engines.get(&config.model)
                     .ok_or_else(|| MooFileError::EmbeddingError(
                         format!("embedding engine not loaded for model '{}'", config.model)
                     ))?

@@ -156,16 +156,16 @@ console.log('=== MooFile Node.js Examples ===\n');
 }
 
 // -----------------------------------------------------------------------
-// 6. Autoembedding (requires a GGUF model)
+// 6. Autoembedding (requires downloading an ONNX model)
 // -----------------------------------------------------------------------
 {
-    console.log('\n10. Autoembedding (skipped — requires GGUF model file)');
+    console.log('\n10. Autoembedding (skipped — requires downloading an ONNX model)');
     console.log('   To run: configure auto_embed with a model URI');
     console.log('   const db = new Collection("semantic.bson", {');
     console.log('     vector_indexes: { embedding: 1024 },');
     console.log('     auto_embed: {');
     console.log('       content: {');
-    console.log('         model: "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",');
+    console.log('         model: "BAAI/bge-small-en-v1.5",');
     console.log('         target: "embedding",');
     console.log('         dims: 1024,');
     console.log('         precision: "int8",');

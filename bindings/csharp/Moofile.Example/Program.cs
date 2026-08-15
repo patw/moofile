@@ -210,12 +210,12 @@ public static class Program
     // -----------------------------------------------------------------
     private static void AutoEmbedding()
     {
-        Console.WriteLine("\n10. Autoembedding (skipped — requires a GGUF model file)");
+        Console.WriteLine("\n10. Autoembedding (skipped — requires downloading an ONNX model)");
         Console.WriteLine("   var db = Collection.Open(\"semantic.bson\", new Config {");
         Console.WriteLine("       VectorIndexes = new() { [\"embedding\"] = 1024 },");
         Console.WriteLine("       AutoEmbed = new() {");
         Console.WriteLine("           [\"content\"] = new AutoEmbedConfig {");
-        Console.WriteLine("               Model = \"hf:user/repo:model.gguf\",");
+        Console.WriteLine("               Model = \"BAAI/bge-small-en-v1.5\",");
         Console.WriteLine("               Target = \"embedding\", Dims = 1024,");
         Console.WriteLine("           },");
         Console.WriteLine("       },");

@@ -250,6 +250,28 @@ class Collection:
         except RuntimeError as e:
             _map_errors(e)
 
+    def reembed(self, source_field):
+        """
+        Re-embed every document carrying `source_field`, rewriting its
+        configured vector field at the embedding model's current width.
+
+        The recovery path after changing the embedding model: vectors of
+        different widths cannot be compared, so a collection whose stored
+        vectors no longer match its vector index has that index disabled, and
+        searching it raises.  This rewrites the vectors, retargets the index
+        and clears the flag.  It is never implicit -- it rewrites the whole
+        collection, and a typo'd model id would otherwise destroy the old
+        vectors silently.
+
+        `source_field` is the *text* field configured under `auto_embed`, not
+        the vector field it writes to.  Returns the number of documents
+        rewritten.
+        """
+        try:
+            return self._native.reembed(source_field)
+        except RuntimeError as e:
+            _map_errors(e)
+
     def compact(self):
         try:
             self._native.compact()

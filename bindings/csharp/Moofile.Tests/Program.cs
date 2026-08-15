@@ -564,6 +564,31 @@ public static class Program
         CheckEquals(after.GetLong("documents"), 1L, "documents after compact");
     }
 
+    /// <summary>
+    /// Reembed must reach the core and surface its error, rather than quietly
+    /// returning 0, when the named field has no auto_embed config. Exercises the
+    /// FFI round trip -- including error marshalling -- without a model download.
+    /// </summary>
+    private static void TestReembedWithoutConfig()
+    {
+        Test("reembed surfaces the core error for an unconfigured field");
+        using var db = Collection.Open(Path("reembed.bson"));
+        db.Insert(Document.Of("summary", "hello"));
+
+        var threw = false;
+        try
+        {
+            db.Reembed("summary");
+        }
+        catch (MooFileException e)
+        {
+            threw = true;
+            Check(e.Message.Contains("autoembed", StringComparison.OrdinalIgnoreCase),
+                $"error should name the missing autoembed config: {e.Message}");
+        }
+        Check(threw, "Reembed on an unconfigured field must throw, not return 0");
+    }
+
     private static void TestSyncAndReindex()
     {
         Test("sync and reindex");
@@ -635,6 +660,7 @@ public static class Program
             TestBatchCommit,
             TestBatchRollback,
             TestStatsAndCompact,
+            TestReembedWithoutConfig,
             TestSyncAndReindex,
             TestReadonlyRejectsWrites,
         };

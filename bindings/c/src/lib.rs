@@ -1084,6 +1084,27 @@ pub extern "C" fn moofile_reindex(handle: *mut MooFileCollection, err_out: *mut 
     })
 }
 
+/// Re-embed every document carrying `source_field`, rewriting its configured
+/// vector field at the current model's width.
+///
+/// Returns the number of documents rewritten, or -1 on error.
+#[no_mangle]
+pub extern "C" fn moofile_reembed(
+    handle: *mut MooFileCollection,
+    source_field: *const i8,
+    err_out: *mut *mut i8,
+) -> i64 {
+    let result = catch_panic(err_out, || -> Result<i32, String> {
+        if handle.is_null() { return Err("handle is null".into()); }
+        if source_field.is_null() { return Err("source_field is null".into()); }
+        let coll = unsafe { &*handle };
+        let field = unsafe { c_str_to_str(source_field)? };
+        let n = coll.inner.reembed(field).map_err(|e| e.to_string())?;
+        Ok(n as i32)
+    });
+    if result < 0 { -1 } else { result as i64 }
+}
+
 // ---------------------------------------------------------------------------
 // Memory management
 // ---------------------------------------------------------------------------

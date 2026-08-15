@@ -11,8 +11,8 @@ So the contract asserted here is the one that was missing: **every backend
 accepts the parameter**, and a backend that cannot honour it says so in a way
 the caller can catch, rather than looking like a bad keyword argument.
 
-Nothing here loads a model — that would mean a ~355 MB download.  These cover
-the config path up to the point where the model file is opened.
+Nothing here loads a model — that would mean a ~130 MB download.  These cover
+the config path up to the point where the model is resolved.
 """
 
 import inspect
@@ -21,7 +21,9 @@ import pytest
 
 from moofile.errors import MooFileError
 
-MODEL = "./definitely-not-a-real-model.gguf"
+# An unresolvable registry id: far enough through the config path to prove
+# every key was accepted, without downloading anything.
+MODEL = "definitely-not-a-real-model"
 
 
 def _config(**overrides):
@@ -103,10 +105,31 @@ def test_config_errors_are_specific(rust_collection, config, expected_error, mat
         rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
 
 
-def test_missing_model_file_is_moofile_error(rust_collection):
-    """A bad model path surfaces as MooFileError, not a bare RuntimeError."""
-    with pytest.raises(MooFileError, match="autoembed model not found"):
+def test_unknown_model_is_moofile_error(rust_collection):
+    """An unresolvable model surfaces as MooFileError, not a bare RuntimeError."""
+    with pytest.raises(MooFileError, match="unknown embedding model"):
         rust_collection(vector_indexes={"embedding": 1024}, auto_embed=_config())
+
+
+def test_gguf_uri_reports_the_migration(rust_collection):
+    """Pre-1.1 configs are the ones most likely to hit this path.
+
+    A bare "unknown model" would be actively misleading for a `hf:` URI that
+    used to work, so the error has to name the replacement.
+    """
+    config = _config(model="hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf")
+    with pytest.raises(MooFileError, match="fastembed") as exc:
+        rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
+    assert "bge-small" in str(exc.value), (
+        "the migration error must suggest a replacement model, got: %s" % exc.value
+    )
+
+
+def test_local_model_path_is_rejected_clearly(rust_collection):
+    """Local ONNX models are not wired up yet; say so rather than 'unknown'."""
+    config = _config(model="./models/my-model.onnx")
+    with pytest.raises(MooFileError, match="local model paths"):
+        rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
 
 
 def test_all_documented_keys_are_accepted(rust_collection):
@@ -122,6 +145,6 @@ def test_all_documented_keys_are_accepted(rust_collection):
         precision="binary",
         dims=256,
     )
-    # Fails at model load, i.e. after every key has been accepted.
-    with pytest.raises(MooFileError, match="autoembed model not found"):
+    # Fails at model resolution, i.e. after every key has been accepted.
+    with pytest.raises(MooFileError, match="unknown embedding model"):
         rust_collection(vector_indexes={"embedding": 256}, auto_embed=config)

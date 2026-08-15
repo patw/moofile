@@ -186,11 +186,11 @@ public class Example {
     // 6. Autoembedding
     // -----------------------------------------------------------------
     private static void autoEmbedding() {
-        System.out.println("\n10. Autoembedding (skipped — requires a GGUF model file)");
+        System.out.println("\n10. Autoembedding (skipped — requires downloading an ONNX model)");
         System.out.println("   Config cfg = Config.create()");
         System.out.println("       .vectorIndex(\"embedding\", 1024)");
         System.out.println("       .autoEmbed(\"content\", Config.AutoEmbedConfig");
-        System.out.println("           .of(\"hf:user/repo:model.gguf\", \"embedding\")");
+        System.out.println("           .of(\"BAAI/bge-small-en-v1.5\", \"embedding\")");
         System.out.println("           .dims(1024).precision(\"int8\"));");
         System.out.println("   db.insert(Document.of(\"content\", \"Machine learning\"));");
         System.out.println("   // embedding is generated on insert");

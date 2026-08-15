@@ -35,7 +35,7 @@ cargo build -p moofile-c --release
 # → target/release/libmoofile.so
 ```
 
-Autoembedding is on by default. To build without it (dropping `llama-gguf`
+Autoembedding is on by default. To build without it (dropping `fastembed`
 and ~300 transitive crates, ~8.3 MB → ~2.8 MB), add `--no-default-features`;
 `auto_embed` and `semantic()` then fail with a clear error while everything
 else works normally.
@@ -507,16 +507,16 @@ The config shape is identical everywhere:
 
 ```json
 {
-  "vector_indexes": {"embedding": 1024},
+  "vector_indexes": {"embedding": 384},
   "auto_embed": {
     "content": {
-      "model": "hf:user/repo:filename.gguf",
+      "model": "BAAI/bge-small-en-v1.5",
       "target": "embedding",
-      "dims": 1024,
+      "dims": 384,
       "precision": "int8",
       "normalize": true,
-      "query_prefix": "Represent the query: ",
-      "doc_prefix": "Represent the document: "
+      "query_prefix": "Represent this sentence for searching relevant passages: ",
+      "doc_prefix": ""
     }
   }
 }
@@ -528,12 +528,12 @@ and `semantic()` embeds the query text for you:
 ```js
 // Node.js
 const db = new Collection('semantic.bson', {
-    vector_indexes: { embedding: 1024 },
+    vector_indexes: { embedding: 384 },
     auto_embed: {
         content: {
-            model: 'hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf',
+            model: 'BAAI/bge-small-en-v1.5',
             target: 'embedding',
-            dims: 1024,
+            dims: 384,
             precision: 'int8',
         },
     },
@@ -546,6 +546,39 @@ const hits = db.semantic('content', 'deep learning', 5).toArray();
 embedding models and raises `NotImplementedError` explaining as much; use
 `vector_search()` with a pre-computed embedding there.
 
+### Changing the embedding model: `reembed`
+
+Vectors of different widths cannot be compared, so switching models
+invalidates every stored vector. At open, MooFile compares the model's output
+width and the stored widths against the vector index; a mismatch logs a
+warning and **disables** that index, so searching it fails with an error
+naming both widths rather than silently ranking against a subset.
+
+`reembed(source_field)` is the recovery path: it rewrites every stored vector
+at the new width, retargets the index and its `.meta` entry, and clears the
+flag. It returns the number of documents rewritten, and embeds in batches, so
+it is several times faster per document than re-inserting.
+
+It is never implicit on open — re-embedding is a whole-collection write that
+can take minutes, and a typo in a model id would otherwise destroy the old
+vectors before anyone noticed.
+
+Note that the argument is the **text** field configured under `auto_embed`,
+not the vector field it writes to.
+
+| Language | Signature |
+|---|---|
+| C | `int64_t moofile_reembed(MooFileCollection*, const char* source_field, char** err_out)` |
+| C++ | `int64_t reembed(const std::string& source_field)` |
+| Python | `db.reembed(source_field) -> int` |
+| Node.js | `db.reembed(sourceField) -> number` |
+| Go | `db.Reembed(sourceField string) (int64, error)` |
+| Java | `long reembed(String sourceField)` |
+| C# | `long Reembed(string sourceField)` |
+
+The C entry point returns `-1` on error, following the same convention as
+`moofile_count`.
+
 ---
 
 ## Test matrix
@@ -554,15 +587,15 @@ Every suite below runs against a freshly built `libmoofile`.
 
 | Language | Tests | Command |
 |----------|:-----:|---------|
-| Python (both backends) | 307 | `PYTHONPATH=. pytest tests/ tests-cross/` |
-| Rust core | 79 | `cargo test` |
+| Python (both backends) | 320 | `PYTHONPATH=. pytest tests/ tests-cross/` |
+| Rust core | 92 | `cargo test` |
 | C | 73 | `cd bindings/c/tests && ./run_tests.sh --release` |
 | C++ | 43 | (same command) |
 | Cross-backend parity | 8 | (same command) |
-| Node.js | 22 | `cd bindings/node && node test.js` |
-| Go | 23 | `cd bindings/go && go test ./moofile/` |
-| Java | 31 | `cd bindings/java && ./build.sh test` |
-| C# | 32 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
+| Node.js | 23 | `cd bindings/node && node test.js` |
+| Go | 24 | `cd bindings/go && go test ./moofile/` |
+| Java | 32 | `cd bindings/java && ./build.sh test` |
+| C# | 33 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
 
 `run_tests.sh` now runs `test_parity.py` as its third stage. That script
 cross-checks the pure-Python, PyO3 and C backends against each other over the

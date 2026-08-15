@@ -155,16 +155,16 @@ when done, or use `using`.
 ## Semantic search
 
 With an `AutoEmbed` source field configured, documents are embedded on insert
-using a local GGUF model, and query text is embedded for you:
+using a local ONNX model, and query text is embedded for you:
 
 ```csharp
 using var db = Collection.Open("semantic.bson", new Config {
-    VectorIndexes = new Dictionary<string, int> { ["embedding"] = 1024 },
+    VectorIndexes = new Dictionary<string, int> { ["embedding"] = 384 },
     AutoEmbed = new Dictionary<string, AutoEmbedConfig> {
         ["content"] = new AutoEmbedConfig {
-            Model = "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            Model = "BAAI/bge-small-en-v1.5",
             Target = "embedding",
-            Dims = 1024,
+            Dims = 384,
             Precision = "int8",
         },
     },

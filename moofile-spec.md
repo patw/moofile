@@ -21,7 +21,7 @@ MooFile sits in the gap:
 - **Document-oriented** like MongoDB — JSON-shaped data, flexible schema
 - **Vector search** like modern vector databases — cosine similarity, semantic search
 - **Text search** like Elasticsearch — BM25 ranking, full-text indexing
-- **On-device autoembedding** — run local GGUF embedding models, no external APIs needed
+- **On-device autoembedding** — run local ONNX embedding models, no external APIs needed
 - **Developer-friendly API** — method chains, not operator dicts
 - **Single-file portability** — your database is a file you can copy, version control, or email
 - **Rust core** (v0.3.0) — 18-24× faster cold open, 10× faster insert, transparent fallback to pure Python
@@ -167,7 +167,7 @@ moofile/
 │       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval, .semantic()
 │       ├── text.rs          # BM25 + Porter stemming (rust-stemmers)
 │       ├── cache.rs         # Disposable index snapshot cache (bincode)
-│       ├── embed.rs         # Autoembedding engine (llama-gguf wrapper, quantization)
+│       ├── embed.rs         # Autoembedding engine (fastembed wrapper, quantization)
 │       └── errors.rs        # MooFileError enum
 │
 ├── bindings/
@@ -217,7 +217,7 @@ moofile/
 | `rayon` | — | rayon 1.x | Parallel index rebuild (Rust) |
 | `log` | — | log 0.4 | Structured logging (Rust) |
 | `pandas` (opt) | pandas≥1.0 | — | `.to_df()` method |
-| **`llama-gguf`** | — | **llama-gguf 0.14** | **On-device embedding model inference (Rust)** |
+| **`fastembed`** | — | **fastembed 5.17** | **On-device ONNX embedding inference (Rust)** |
 | **`dirs`** | — | **dirs 6.x** | **Model cache directory detection (Rust)** |
 
 ### Performance (10K docs, 128d vectors)
@@ -272,7 +272,7 @@ All bindings support the complete API surface:
 - **Search**: vector_search, text_search, hybrid_search (RRF), semantic
 - **Batch**: atomic batch commit with rollback on error
 - **Utility**: stats, compact, sync, reindex
-- **Autoembedding**: on-device GGUF models, transparent to all languages
+- **Autoembedding**: on-device ONNX models, transparent to all languages
 
 ### Test coverage
 
@@ -500,7 +500,7 @@ No other embedded single-file document store offers BM25 + cosine + RRF fusion b
 
 ### Semantic Search (Autoembedding, v0.5.0)
 
-MooFile v0.5.0 introduces **on-device autoembedding** — run local embedding models (GGUF format) directly from the Rust core, with no external API calls. Models are auto-downloaded from HuggingFace on first use and cached in `~/.cache/moofile/models/`.
+MooFile v0.5.0 introduced **on-device autoembedding** — run local embedding models directly from the Rust core, with no external API calls. Since v1.1 these are **ONNX** models run through [`fastembed`](https://crates.io/crates/fastembed) (ONNX Runtime + HuggingFace tokenizers); before that they were GGUF models run through `llama-gguf`, whose embedding path was a placeholder and ~1700× slower. Models are auto-downloaded from HuggingFace on first use and cached in `~/.cache/moofile/models/`.
 
 **Configuration:**
 
@@ -508,22 +508,27 @@ MooFile v0.5.0 introduces **on-device autoembedding** — run local embedding mo
 from moofile import Collection
 
 db = Collection("docs.bson",
-    vector_indexes={"embedding": 1024},
+    vector_indexes={"embedding": 384},
     auto_embed={
         "content": {                              # source text field
-            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
-            #         ^^ HuggingFace URI scheme: hf:<repo>:<filename>
+            "model": "BAAI/bge-small-en-v1.5",    # fastembed registry id (default)
             "target": "embedding",                # target vector field
-            "dims": 1024,                         # embedding dimensions
+            "dims": 384,                          # embedding dimensions
             "precision": "int8",                  # f32 | int8 | uint8 | binary
             "normalize": True,
-            "query_prefix": "Represent the query for retrieving supporting documents: ",
-            "doc_prefix": "Represent the document for retrieval: ",
+            # BGE is asymmetric: queries get an instruction, documents do not.
+            "query_prefix": "Represent this sentence for searching relevant passages: ",
+            "doc_prefix": "",
+            "batch_size": 32,
         },
     })
 ```
 
 **On insert/update:** if the document has a `"content"` field, MooFile automatically prefixes it with the `doc_prefix`, runs the embedding model, quantizes the result to `int8`, dequantizes to f32 for BSON storage, and populates the `"embedding"` field. This happens transparently — the caller just inserts their data.
+
+> Note that quantization currently affects **fidelity only, not storage**: the
+> value written to BSON is the dequantized f32 array, so a vector always
+> occupies `dims × 8` bytes on disk regardless of `precision`.
 
 **On query — `.semantic()`:** the query text is prefixed with `query_prefix`, embedded with the same model, and used for vector search:
 
@@ -544,49 +549,58 @@ results = db.find({}).hybrid_search("content", "content", "quantum", None, 10).t
 ```python
 auto_embed={
     "abstract": {
-        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+        "model": "BAAI/bge-small-en-v1.5",
         "target": "embedding",
-        "dims": 1024,
+        "dims": 384,
         "precision": "int8",
     },
     "title": {
-        "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+        "model": "BAAI/bge-small-en-v1.5",
         "target": "title_vec",
-        "dims": 256,                         # MRL truncation
-        "precision": "binary",               # 128 bytes per embedding
+        "dims": 384,
+        "precision": "binary",
     },
 }
 ```
 
-**Precision comparison:**
+Engines are keyed on the model id, so two sources naming the same model share one loaded session.
 
-| Precision | Bytes per 1024-dim | Quality vs f32 |
-|-----------|-------------------|----------------|
-| `f32`     | 4,096 (4.0 KB)    | Baseline       |
-| `int8`    | 1,024 (1.0 KB)    | ~1.0000 cosine |
-| `uint8`   | 1,024 (1.0 KB)    | ~1.0000 cosine |
-| `binary`  | 128 (128 B)       | ~0.9999 cosine |
+**Precision comparison** (fidelity of the round-trip, per 384-dim vector):
 
-All precisions use **Quantization-Aware Training (QAT)** — the model was trained to produce good results even after quantization. int8 and uint8 retain essentially perfect quality at 75% storage reduction. Binary retains usable quality at 96.9% storage reduction.
+| Precision | Quantized width | Quality vs f32 |
+|-----------|-----------------|----------------|
+| `f32`     | 1,536 B         | Baseline       |
+| `int8`    | 384 B           | ~1.0000 cosine |
+| `uint8`   | 384 B           | ~1.0000 cosine |
+| `binary`  | 48 B            | ~0.99 cosine   |
 
-**Model URI scheme:**
+Earlier versions of this document credited the near-lossless int8 figures to the model being quantization-aware. That was specific to voyage-4-nano; the numbers above hold for bge-small simply because 8 bits is ample for a normalized 384-dim vector. Binary is lossier on models not trained for it — measure before relying on it.
+
+**Model identifiers:**
+
+`model` names an entry in fastembed's registry. Three spellings resolve, all case-insensitive:
 
 ```
-hf:user/repo:filename.gguf  → HuggingFace Hub (auto-download + cache)
-./local/model.gguf          → local file path
-/absolute/path/model.gguf   → absolute path
+BAAI/bge-small-en-v1.5        → canonical HuggingFace id
+Xenova/bge-small-en-v1.5      → the exact registry model_code
+bge-small-en-v1.5             → bare name
 ```
 
-Models are downloaded on first use via `llama-gguf`'s HuggingFace client, cached in `~/.cache/huggingface/hub/` (the standard HF cache), and loaded once per collection open. Subsequent opens are instant.
+Where a bare name is ambiguous — `nomic-embed-text-v1.5` is served for both the plain and `-Q` variants — the unquantized model wins deterministically; name the `model_code` explicitly to select the other. The old `hf:repo:file.gguf` syntax is rejected with a migration error. Local model paths are not currently supported.
+
+Models are downloaded on first use, cached, and loaded once per collection open (~190 ms warm).
+
+**Dimension guard:** vectors of different widths cannot be compared, so at open MooFile checks each autoembedded vector field against both the model's output width and the widths actually stored. A mismatch logs a warning and **disables** that vector index; searching it raises `VectorIndexDisabled` rather than silently ranking against a subset. `reembed(source_field)` rewrites the stored vectors at the new width, retargets the index and its `.meta` entry, and clears the flag. It is never implicit — re-embedding is a whole-collection write, and a typo'd model id would otherwise destroy the old vectors silently.
 
 **Rust implementation:**
 
 The autoembedding engine lives in `core/src/embed.rs`:
 
-- `EmbeddingEngine` — wraps `llama_gguf::Engine` for text → vector
-- `AutoEmbedConfig` — per-source-field configuration (model, target, precision, prefixes)
+- `EmbeddingEngine` — wraps `Arc<Mutex<fastembed::TextEmbedding>>` for text → vector. The mutex is required because `TextEmbedding::embed` takes `&mut self`; it costs nothing on the write path, which already holds the write lock, and ONNX Runtime parallelizes within a single embed anyway.
+- `embed()` / `embed_batch()` — single and batched inference; batching is several times faster per text
+- `AutoEmbedConfig` — per-source-field configuration (model, target, precision, prefixes, batch size)
 - `EmbeddingPrecision` — `F32 | Int8 | Uint8 | Binary`
-- `ModelUri` — parses `hf:...` URIs and resolves to local paths via `HfClient`
+- `resolve_model()` — maps a configured model string to a fastembed registry entry
 - `quantize()` / `dequantize()` — conversion between f32 and quantized formats
 - `cosine_similarity_quantized()` — compute cosine directly on quantized bytes (XOR + popcount for binary)
 
@@ -703,11 +717,12 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents |
 | 0.4.0 | **Hybrid search (RRF)**. **Atomic batch writes**. **Disposable index snapshot cache** |
-| 0.5.0 | **On-device autoembedding** — local GGUF models via `llama-gguf`. `.semantic()` method |
+| 0.5.0 | **On-device autoembedding** — local GGUF models via `llama-gguf`. `.semantic()` method (engine replaced by fastembed/ONNX in 1.1) |
 | 0.5.1 | `hybrid_search` type fix, dead code removal, API guard tests |
 | 0.5.2 | **Concurrent multi-process access** — brief exclusive lock per write, not lifetime hold |
 | 0.5.3 | Multi-process safety, full BSON type support, `_id` enforcement, performance fixes |
-| **0.6.0** | **Language bindings** — C, C++, Node.js, Go, Java, C# all consuming the same C shared library. **BSON normalisation** — all documents round-tripped through BSON encode/decode on write. **`InvalidIdError`/`InvalidFilterError`** — structured errors for non-string `_id` and malformed filters. **Cross-backend parity tests** — 8 automated scenarios validated across Python (pure), Python (Rust native), and C (shared library) |
+| 0.6.0 | **Language bindings** — C, C++, Node.js, Go, Java, C# all consuming the same C shared library. **BSON normalisation** — all documents round-tripped through BSON encode/decode on write. **`InvalidIdError`/`InvalidFilterError`** — structured errors for non-string `_id` and malformed filters. **Cross-backend parity tests** — 8 automated scenarios validated across Python (pure), Python (Rust native), and C (shared library) |
+| **1.1.0** | **Autoembedding moved from GGUF/`llama-gguf` to ONNX/`fastembed`** — ~7 s → ~4 ms per embed, default model `BAAI/bge-small-en-v1.5` (384 dims). **Dimension guard** — a vector index whose width no longer matches the model is disabled rather than silently returning nothing, with `reembed()` as the recovery path. **Batched `insert_many` embedding** (4.8×). `reembed()` added to all seven bindings |
 
 ---
 

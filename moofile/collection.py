@@ -108,8 +108,8 @@ class Collection:
     ) -> None:
         # Accepted so that both backends have the same constructor signature —
         # a TypeError here would make a portable `auto_embed` block look like a
-        # typo rather than a missing capability.  Running a GGUF model is the
-        # one thing this implementation cannot do; see semantic() below.
+        # typo rather than a missing capability.  Running an embedding model is
+        # the one thing this implementation cannot do; see semantic() below.
         if auto_embed:
             raise NotImplementedError(
                 "auto_embed requires the Rust backend — the pure-Python "
@@ -495,6 +495,20 @@ class Collection:
         """
         self._require_write()
         return BatchContext(self)
+
+    def reembed(self, source_field: str) -> int:
+        """
+        Not available on the pure-Python backend.
+
+        Present so that both backends expose the same surface: `auto_embed` is
+        already refused in the constructor, so there is nothing here to
+        re-embed, and a missing attribute would look like a version mismatch
+        rather than a missing capability.
+        """
+        raise NotImplementedError(
+            "reembed requires the Rust backend — the pure-Python "
+            "implementation cannot run embedding models."
+        )
 
     def reindex(self) -> None:
         """Rebuild all in-memory indexes by re-scanning the data file."""

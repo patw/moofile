@@ -32,7 +32,7 @@ itself, once, for every platform. Everything else layers on top.
 | windows-x86_64 | windows-latest | `moofile-windows-x86_64.zip` |
 
 ARM Linux builds on a native ARM runner rather than cross-compiling: autoembedding
-pulls a C/C++ toolchain in through `llama-gguf`, and cross-builds of that are what
+pulls a statically linked ONNX Runtime in through `fastembed`, and cross-builds of that are what
 failed when the target was first attempted.
 
 Each archive holds `include/` (both headers), `lib/` (the shared library, plus
@@ -101,7 +101,7 @@ Two shapes are available:
 1. **One package carrying all four platform libraries.** Simplest possible
    thing; never breaks. Measured at 3.3 MB compressed per platform, so about
    13 MB for the published package (8.3 MB unpacked each, because
-   autoembedding pulls `llama-gguf` into every binary).
+   autoembedding pulls `fastembed` into every binary).
 2. **Per-platform optional dependencies** (`@moofile/linux-x64` and friends,
    selected by npm through the `os`/`cpu` fields). This is what esbuild and
    swc do and it is the modern best practice — each user downloads ~8 MB. It

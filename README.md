@@ -39,8 +39,8 @@ with Collection("mydata.bson",
 ```
 
 > Prefer not to manage embeddings yourself? [Autoembedding](#autoembedding) runs a local
-> GGUF model on-device, filling in the vector on insert and embedding your query text at
-> search time. It needs the Rust core (`pip install moofile` ships it for most platforms).
+> ONNX model on-device (~4 ms/embed), filling in the vector on insert and embedding your
+> query text at search time. It needs the Rust core (`pip install moofile` ships it for most platforms).
 
 ---
 
@@ -141,25 +141,30 @@ db.delete_many({"status": "expired"})
 
 ### Autoembedding
 
-MooFile can run a local GGUF embedding model on-device, so text is embedded on
+MooFile can run a local ONNX embedding model on-device, so text is embedded on
 insert and query text is embedded at search time — no external embedding API.
+Models run through [fastembed](https://crates.io/crates/fastembed) (ONNX Runtime
++ HuggingFace tokenizers); a short sentence embeds in **~4 ms**.
 
 ```python
 from moofile import Collection
 
 db = Collection("papers.bson",
     indexes=["year", "category"],
-    vector_indexes={"embedding": 1024},
+    vector_indexes={"embedding": 384},
     auto_embed={
         "abstract": {                             # source text field
-            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            "model": "BAAI/bge-small-en-v1.5",    # the default
             "target": "embedding",                # target vector field
-            "dims": 1024,
+            "dims": 384,
             "precision": "int8",                  # f32 | int8 | uint8 | binary
+            # BGE is asymmetric: queries get an instruction, documents do not.
+            "query_prefix": "Represent this sentence for searching relevant passages: ",
+            "doc_prefix": "",
         },
     })
 
-# Insert — auto-embeds abstract → embedding (1 KB/doc at int8)
+# Insert — auto-embeds abstract → embedding
 db.insert({"title": "Quantum ML", "abstract": "Quantum computing for ML...", "year": 2025})
 
 # Semantic search — the query text is embedded with the same model
@@ -170,7 +175,7 @@ for doc, score in db.find({"year": 2025}).semantic("abstract", "quantum algorith
 db.find({}).hybrid_search("abstract", "embedding", "quantum", None, 10).to_list()
 ```
 
-**Requires the Rust core.** The pure-Python fallback cannot run a GGUF model — it
+**Requires the Rust core.** The pure-Python fallback cannot run a model — it
 raises `NotImplementedError` from both `auto_embed` and `semantic()`. Everything else
 works there unchanged.
 
@@ -178,18 +183,64 @@ The same config block is accepted verbatim by every other binding, as JSON:
 
 ```jsonc
 {
-  "vector_indexes": {"embedding": 1024},
+  "vector_indexes": {"embedding": 384},
   "auto_embed": {
-    "abstract": {"model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
-                 "target": "embedding", "dims": 1024, "precision": "int8"}
+    "abstract": {"model": "BAAI/bge-small-en-v1.5",
+                 "target": "embedding", "dims": 384, "precision": "int8"}
   }
 }
 ```
 
-The model is downloaded from HuggingFace on first use (~355 MB for Q8_0) and cached.
-Autoembedding is on by default; building with `--no-default-features` drops it and
-~300 transitive crates (~8.3 MB → ~2.8 MB), after which `auto_embed` and semantic
-search return a clear "not available" error and everything else works unchanged.
+#### Choosing a model
+
+`model` names an entry in fastembed's registry. Three spellings work, all
+case-insensitive: the canonical HuggingFace id (`BAAI/bge-small-en-v1.5`), the
+exact registry `model_code` (`Xenova/bge-small-en-v1.5`), or the bare name
+(`bge-small-en-v1.5`). Where a name is ambiguous the unquantized model wins —
+name the `model_code` explicitly to select a `...-Q` variant.
+
+| Model | Params | Dims | MTEB | Prefixes |
+|---|---|---|---|---|
+| **`BAAI/bge-small-en-v1.5`** (default) | 33M | 384 | ~61 | query only |
+| `nomic-ai/nomic-embed-text-v1.5` | 137M | 768 | ~69 | `search_query: ` / `search_document: ` |
+| `sentence-transformers/all-MiniLM-L6-v2` | 22M | 384 | ~56 | none (symmetric) |
+
+`dims` must match the model, except on models trained for Matryoshka
+truncation (nomic), where a smaller `dims` truncates. Getting it wrong is
+caught at open — see below.
+
+The model is downloaded from HuggingFace on first use (~130 MB for bge-small)
+and cached; later opens are local and take ~190 ms. Autoembedding is on by
+default; building with `--no-default-features` drops it and ~129 transitive
+crates along with a statically linked ONNX Runtime (~38 MB → ~2.8 MB), after
+which `auto_embed` and semantic search return a clear "not available" error and
+everything else works unchanged.
+
+#### Changing the embedding model
+
+Vectors of different widths cannot be compared, so switching models invalidates
+every stored vector. MooFile detects this at open, logs a warning, and
+**disables** the affected vector index — searching it raises
+`VectorIndexDisabled` rather than silently ranking against whichever documents
+happen to match:
+
+```
+vector index 'embedding' is disabled: it expects 1024-dim vectors, but the
+configured model and/or the 4213 stored document(s) are 384-dim. Call
+reembed() to rewrite them at 384, or restore the 1024-dim model.
+```
+
+Recover by re-embedding the collection, which rewrites the stored vectors,
+retargets the index and clears the flag:
+
+```python
+n = db.reembed("abstract")     # source field, not the vector field
+```
+
+This is never done implicitly on open: it is a whole-collection write that can
+take minutes, and if the model change was a typo, doing it automatically would
+destroy the old vectors before anyone noticed. Embedding is batched, so it runs
+several times faster per document than re-inserting.
 
 ---
 
@@ -275,7 +326,7 @@ MooFile is implemented in **Rust** with a **Python** binding (via PyO3). A **C s
 
 Plus 8 cross-backend parity scenarios comparing pure-Python, PyO3 and C.
 
-Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local GGUF embedding models) works in every binding — model loading and inference happen entirely inside the Rust core, so the `auto_embed` config block is identical in all of them. The one exception is the pure-Python fallback, which cannot run a model at all.
+Every binding passes documents as **JSON strings** across the FFI boundary. The autoembedding feature (local ONNX embedding models) works in every binding — model loading and inference happen entirely inside the Rust core, so the `auto_embed` config block is identical in all of them. The one exception is the pure-Python fallback, which cannot run a model at all.
 
 See [`bindings/README.md`](bindings/README.md) for build instructions, usage examples, and test results for each language.
 

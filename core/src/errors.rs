@@ -81,6 +81,22 @@ pub enum MooFileError {
     #[error("no autoembed configured for source field '{0}'")]
     NoAutoEmbed(String),
 
+    /// Stored vectors do not have the configured width, so the vector index
+    /// for the field was disabled at open.  Vectors of different widths cannot
+    /// be compared, so searching would silently rank against a subset of the
+    /// collection; failing loudly is the lesser evil.  Recover with
+    /// `reembed(source_field)`.
+    #[error("vector index '{field}' is disabled: it expects {expected}-dim \
+             vectors, but the configured model and/or the {count} stored \
+             document(s) are {found}-dim. Call reembed() to rewrite them at \
+             {found}, or restore the {expected}-dim model.")]
+    VectorIndexDisabled {
+        field: String,
+        expected: usize,
+        found: usize,
+        count: usize,
+    },
+
     /// Network/download error.
     #[error("download error: {0}")]
     DownloadError(String),

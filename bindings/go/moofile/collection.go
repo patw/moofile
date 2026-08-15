@@ -131,9 +131,9 @@ func (a *cstrings) free() {
 // The JSON tags matter: the C layer reads lower-case snake_case keys, so a
 // field without a tag would be serialised as "Model" and silently ignored.
 type AutoEmbedConfig struct {
-	Model       string `json:"model"`               // GGUF model URI, e.g. "hf:user/repo:file.gguf"
+	Model       string `json:"model"`               // fastembed model id, e.g. "BAAI/bge-small-en-v1.5"
 	Target      string `json:"target"`              // Target vector field name
-	Dims        int    `json:"dims,omitempty"`      // Embedding dimensions (default 1024)
+	Dims        int    `json:"dims,omitempty"`      // Embedding dimensions (default 384)
 	Precision   string `json:"precision,omitempty"` // "f32", "int8", "uint8", "binary"
 	Normalize   *bool  `json:"normalize,omitempty"` // L2-normalize (default true)
 	QueryPrefix string `json:"query_prefix,omitempty"`
@@ -1028,4 +1028,36 @@ func (c *Collection) Reindex() error {
 	var errPtr *C.char
 	C.moofile_reindex(c.handle, &errPtr)
 	return newError(errPtr)
+}
+
+// Reembed re-embeds every document carrying sourceField, rewriting its
+// configured vector field at the embedding model's current width, and returns
+// the number of documents rewritten.
+//
+// This is the recovery path after changing the embedding model: vectors of
+// different widths cannot be compared, so a collection whose stored vectors no
+// longer match its vector index has that index disabled, and searching it
+// returns an error naming both widths. Reembed rewrites the vectors, retargets
+// the index and clears the flag. It is never implicit — it rewrites the whole
+// collection.
+//
+// sourceField is the text field configured under auto_embed, not the vector
+// field it writes to.
+func (c *Collection) Reembed(sourceField string) (int64, error) {
+	var arena cstrings
+	defer arena.free()
+	cField := arena.new(sourceField)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.handle == nil {
+		return 0, ErrClosed
+	}
+
+	var errPtr *C.char
+	n := int64(C.moofile_reembed(c.handle, cField, &errPtr))
+	if err := newError(errPtr); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

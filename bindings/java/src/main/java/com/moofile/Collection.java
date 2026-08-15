@@ -615,6 +615,32 @@ public class Collection implements AutoCloseable {
     /** Rebuild every in-memory index from the data file. */
     public synchronized void reindex() { callVoid(Native.REINDEX); }
 
+    /**
+     * Re-embed every document carrying {@code sourceField}, rewriting its configured
+     * vector field at the embedding model's current width.
+     *
+     * <p>The recovery path after changing the embedding model: vectors of different
+     * widths cannot be compared, so a collection whose stored vectors no longer match
+     * its vector index has that index disabled, and searching it throws. This rewrites
+     * the vectors, retargets the index and clears the flag. It is never implicit — it
+     * rewrites the whole collection.
+     *
+     * @param sourceField the <em>text</em> field configured under {@code auto_embed},
+     *                    not the vector field it writes to
+     * @return the number of documents rewritten
+     */
+    public synchronized long reembed(String sourceField) {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment err = Native.errOut(arena);
+            long n = (long) Native.REEMBED.invokeExact(
+                handle(), Native.cString(arena, sourceField), err);
+            Native.checkError(err);
+            return n;
+        } catch (Throwable t) {
+            throw Native.rethrow(t);
+        }
+    }
+
     /** Invoke a {@code int f(handle, char**)} function, checking the error slot. */
     private void callVoid(java.lang.invoke.MethodHandle fn) {
         try (Arena arena = Arena.ofConfined()) {

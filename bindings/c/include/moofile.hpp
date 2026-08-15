@@ -35,13 +35,13 @@
  *         std::cout << score << ": " << doc.dump() << std::endl;
  *     }
  *
- *     // Autoembedding (local GGUF model, no external API)
+ *     // Autoembedding (local ONNX model, no external API)
  *     moofile::Config auto_cfg;
- *     auto_cfg.vector_index("embedding", 1024)
+ *     auto_cfg.vector_index("embedding", 384)
  *             .auto_embed("content", {
- *                 .model = "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+ *                 .model = "BAAI/bge-small-en-v1.5",
  *                 .target = "embedding",
- *                 .dims = 1024,
+ *                 .dims = 384,
  *                 .precision = "int8",
  *             });
  *     moofile::Collection auto_db("semantic.bson", auto_cfg);
@@ -102,9 +102,9 @@ inline json parse_json(const char* s) {
 
 /** Auto-embedding configuration for a single source text field. */
 struct AutoEmbedConfig {
-    std::string model;           // GGUF model URI (e.g. "hf:user/repo:file.gguf")
+    std::string model;           // fastembed model id (e.g. "BAAI/bge-small-en-v1.5")
     std::string target;          // Target vector field name
-    int dims = 1024;             // Embedding dimensions
+    int dims = 384;              // Embedding dimensions (bge-small default)
     std::string precision = "int8";  // "f32", "int8", "uint8", "binary"
     bool normalize = true;       // L2-normalize the output
     std::string query_prefix = "Represent the query for retrieving supporting documents: ";
@@ -935,6 +935,25 @@ public:
         return json::parse(exec([&](char** err) {
             return moofile_stats(handle_, err);
         }));
+    }
+
+    /**
+     * Re-embed every document carrying `source_field`, rewriting its vector
+     * field at the model's current width.  Returns the number rewritten.
+     *
+     * The recovery path after changing the embedding model; see
+     * moofile_reembed() in moofile.h.  `source_field` is the text field
+     * configured under `auto_embed`, not the vector field.
+     */
+    int64_t reembed(const std::string& source_field) {
+        char* err = nullptr;
+        int64_t n = moofile_reembed(handle_, source_field.c_str(), &err);
+        if (n < 0) {
+            std::string msg(err ? err : "reembed failed");
+            moofile_free_string(err);
+            throw error(msg);
+        }
+        return n;
     }
 
     /** Compact the data file. */

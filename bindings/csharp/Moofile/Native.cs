@@ -209,6 +209,10 @@ internal static class Native
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int moofile_reindex(IntPtr handle, out IntPtr errOut);
 
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern long moofile_reembed(IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string sourceField, out IntPtr errOut);
+
     // Memory
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void moofile_free_string(IntPtr s);

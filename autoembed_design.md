@@ -1,5 +1,43 @@
 # Moofile Autoembedding Design (v3 — Packaging)
 
+> ## Superseded in part: the engine changed in v1.1
+>
+> This document describes the original design, which ran **GGUF** models through
+> the `llama-gguf` crate. The *design* held up — auto-embed a source field on
+> insert, embed the query on `semantic()`, one config block across every
+> binding — but the engine did not, and was replaced by
+> [`fastembed`](https://crates.io/crates/fastembed) (ONNX Runtime + HuggingFace
+> tokenizers).
+>
+> **Why.** `llama-gguf` 0.14's `EmbeddingExtractor` was a placeholder: it ran a
+> full forward pass *per token*, and used the vocabulary **logits** as a stand-in
+> for the hidden state, slicing the first `hidden_dim` values off a ~152k-wide
+> distribution. Those were not sentence embeddings, and they cost ~7 s each —
+> latency linear in token count. It is a generative inference crate with a
+> half-finished embedding path, not a subtle misconfiguration.
+>
+> **Why not another GGUF path.** GGUF is fine — llama.cpp embeds correctly with
+> `--embeddings --pooling mean`. But the Rust GGUF ecosystem is weak for
+> embeddings specifically, while the embedding world's de-facto format is ONNX
+> (sentence-transformers → ONNX export), which is what `fastembed` runs.
+>
+> | | before | after |
+> |---|---|---|
+> | embed, short sentence | ~7 000 ms | **~4 ms** |
+> | model load (warm) | ~500 ms | **~190 ms** |
+> | default model | voyage-4-nano (1024d, 372 MB) | **bge-small-en-v1.5** (384d, ~130 MB) |
+> | `libmoofile.so` | 8.3 MB | 38.5 MB (static ONNX Runtime) |
+>
+> **What this changes below.** The "Model URI Scheme" section no longer applies:
+> `model` now names a fastembed registry entry (`BAAI/bge-small-en-v1.5`), and
+> download, caching and tokenization are fastembed's job rather than moofile's.
+> The `hf:` syntax is rejected with a migration error. Local model paths are not
+> currently wired up. Everything else — the config block, the hybrid resolution
+> logic, the per-binding surface — is unchanged.
+>
+> See the README's *Autoembedding* section for current behaviour, including the
+> dimension guard and `reembed()`.
+
 ## Hybrid Search + Autoembed Integration
 
 ### Current Signature
@@ -87,7 +125,12 @@ Instead, use **auto-download on first use**, cached in a well-known location.
 
 ---
 
-### Model URI Scheme
+### Model URI Scheme  — **superseded, historical**
+
+> Everything from here to *Complete Example* describes the GGUF-era URI
+> parsing and download implementation, all of which fastembed now owns.
+> `model` is a registry id today; see the banner at the top. Kept because
+> it records why auto-download-and-cache was chosen, which still holds.
 
 Users specify a model URI in the `auto_embed` config. Three forms:
 
@@ -110,8 +153,8 @@ from moofile import Collection
 db = Collection("data.bson",
     auto_embed={
         "content": {
-            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
-            "dims": 1024,
+            "model": "BAAI/bge-small-en-v1.5",
+            "dims": 384,
             "precision": "int8",
         }
     })
@@ -244,15 +287,15 @@ from moofile import Collection
 # Subsequent runs: instant (cached)
 db = Collection("papers.bson",
     indexes=["year"],
-    vector_indexes={"embedding": 1024},
+    vector_indexes={"embedding": 384},
     auto_embed={
         "abstract": {
-            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
+            "model": "BAAI/bge-small-en-v1.5",
             "target": "embedding",
-            "dims": 1024,
+            "dims": 384,
             "precision": "int8",
-            "query_prefix": "Represent the query for retrieving supporting documents: ",
-            "doc_prefix": "Represent the document for retrieval: ",
+            "query_prefix": "Represent this sentence for searching relevant passages: ",
+            "doc_prefix": "",
         },
     },
 )
@@ -273,8 +316,8 @@ results = db.find({"year": 2025}).hybrid_search(
 
 | Question | Decision | Why |
 |----------|----------|-----|
-| Model in git repo? | **No** | 355 MB binary destroys git UX |
+| Model in git repo? | **No** | A multi-hundred-MB binary destroys git UX |
 | Model in wheel? | **No** | Exceeds 100 MB PyPI limit, punishes non-embedding users |
-| Auto-download? | **Yes**, to `~/.cache/moofile/models/` | Standard pattern (Ollama, HF, llama.cpp all do this) |
-| Local model path? | **Also supported** | Power users can manage models themselves |
-| HF Hub identifier? | **Yes**, via `hf:user/repo:file` URI | Clean, standard, CDN-backed |
+| Auto-download? | **Yes**, to `~/.cache/moofile/models/` (fastembed does the fetching) | Standard pattern (Ollama, HF, llama.cpp all do this) |
+| Local model path? | **Not currently wired up** (was: supported for GGUF) | fastembed needs ONNX + tokenizer files; a follow-up |
+| HF Hub identifier? | **Yes**, via a fastembed registry id such as `BAAI/bge-small-en-v1.5` | Clean, standard, CDN-backed |

@@ -80,16 +80,16 @@ plus a tombstone.
 ## Semantic search
 
 With an `auto_embed` source field configured, documents are embedded on insert
-using a local GGUF model, and query text is embedded for you:
+using a local ONNX model, and query text is embedded for you:
 
 ```js
 const db = new Collection('semantic.bson', {
-    vector_indexes: { embedding: 1024 },
+    vector_indexes: { embedding: 384 },
     auto_embed: {
         content: {
-            model: 'hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf',
+            model: 'BAAI/bge-small-en-v1.5',
             target: 'embedding',
-            dims: 1024,
+            dims: 384,
             precision: 'int8',
         },
     },

@@ -10,7 +10,7 @@ import java.util.*;
  *       .index("email")
  *       .vectorIndex("embedding", 384)
  *       .textIndex("content")
- *       .autoEmbed("content", AutoEmbedConfig.of("hf:user/repo:file.gguf", "embedding"));
+ *       .autoEmbed("content", AutoEmbedConfig.of("BAAI/bge-small-en-v1.5", "embedding"));
  */
 public class Config {
     final List<String> indexes = new ArrayList<>();
@@ -55,7 +55,7 @@ public class Config {
     /** Auto-embedding configuration for a single source text field. */
     public static class AutoEmbedConfig {
         public String model, target;
-        public int dims = 1024;
+        public int dims = 384;
         public String precision = "int8";
         public boolean normalize = true;
         public String queryPrefix = "Represent the query for retrieving supporting documents: ";

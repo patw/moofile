@@ -1,5 +1,154 @@
 # Changelog
 
+## v1.1.0 (2026-08-14)
+
+### Autoembedding now runs ONNX models via fastembed (breaking)
+
+The `llama-gguf` embedding backend is gone, replaced by
+[`fastembed`](https://crates.io/crates/fastembed) (ONNX Runtime + HuggingFace
+tokenizers). The default model is **`BAAI/bge-small-en-v1.5`** (33M params,
+384 dims).
+
+This was not a tuning problem. `llama-gguf` 0.14's `EmbeddingExtractor` ran a
+full forward pass **per token** and used the vocabulary *logits* as a stand-in
+for the hidden state — slicing the first `hidden_dim` values off a ~152k-wide
+distribution. The stored vectors were not sentence embeddings, and each one
+cost ~7 seconds.
+
+| | before | after |
+|---|---|---|
+| embed, short sentence | ~7 000 ms | **~4 ms** |
+| semantic search | ~6 500 ms | **~4 ms** |
+| model load (warm) | ~500 ms | **~186 ms** |
+| stored vector | 1024 dims | 384 dims |
+| `libmoofile.so` | 8.3 MB | **38.5 MB** |
+
+The size increase is the statically linked ONNX Runtime and is not avoidable
+while embedding is compiled in; `--no-default-features` still drops the whole
+feature (down to ~2.8 MB) and `auto_embed` then returns `EmbedDisabled`.
+Prebuilt ONNX Runtime binaries exist for all four supported targets
+(linux x86-64/aarch64, macOS arm64, Windows x86-64).
+
+**Migrating.** `model` now names a fastembed registry entry rather than a GGUF
+file. Three spellings resolve, case-insensitively: the canonical HuggingFace id
+(`BAAI/bge-small-en-v1.5`), the exact registry `model_code`
+(`Xenova/bge-small-en-v1.5`), or the bare name (`bge-small-en-v1.5`). The old
+`hf:repo:file.gguf` syntax is rejected with a message pointing at the
+replacement rather than a bare "unknown model". Local model paths are **not**
+currently supported — they only ever pointed at `.gguf` files, which no longer
+load at all, but the "bring your own model" escape hatch is a follow-up.
+
+Config defaults moved with the model: `dims` 1024 → 384, `query_prefix` to
+BGE's instruction, `doc_prefix` to empty (BGE is asymmetric), `batch_size`
+1 → 32.
+
+### Changing the embedding model no longer corrupts search silently
+
+Vectors of different widths cannot be compared, and the vector index quietly
+skips any vector whose length is not the declared dimension. That is right for
+one malformed document and badly wrong for "the embedding model changed":
+the entire collection dropped out of the index and every search returned
+nothing, with no signal anywhere.
+
+- At open, each autoembedded vector field is checked against both the model's
+  output width and the widths actually stored. A mismatch logs a warning and
+  **disables** that index; searching it raises `VectorIndexDisabled` naming the
+  expected width, the found width and the affected document count.
+- New `reembed(source_field)` rewrites every stored vector at the new width,
+  retargets the index and its `.meta` entry, and clears the flag. Embedding is
+  batched, so it is several times faster per document than re-inserting.
+- Re-embedding is never implicit on `open()`. It is a whole-collection write
+  that can take minutes, it would turn a read-only handle into a writer, and a
+  typo in the model id would destroy the old vectors before anyone noticed.
+
+Note that `merge_meta` keeps a vector index's existing width and ignores a
+re-declaration, so simply changing `vector_indexes={...}` on an existing
+database does not widen or narrow the index — `reembed()` is what updates it.
+
+### Bulk insert embeds in batches
+
+`insert_many` embedded one document per ONNX pass. It now collects the batch's
+texts, embeds them `batch_size` at a time, and inserts with the vectors already
+attached — **4.9× faster** per document (2.94 ms → 0.61 ms on a 64-document
+batch), with byte-identical output to the per-document path.
+
+A duplicate `_id` already present in the collection is now detected before any
+embedding work, so a bad id in a 10 000-document batch no longer costs 10 000
+forward passes before erroring. Duplicates *within* a batch are still caught
+per document, by the running index.
+
+Documents inserted inside a `batch()` still embed one at a time, since those
+are buffered individually.
+
+### `reembed()` in every binding
+
+New across all seven bindings, following the C ABI as usual:
+
+| Language | Signature |
+|---|---|
+| C | `int64_t moofile_reembed(MooFileCollection*, const char*, char**)` |
+| C++ | `int64_t reembed(const std::string&)` |
+| Python | `db.reembed(source_field) -> int` |
+| Node.js | `db.reembed(sourceField) -> number` |
+| Go | `db.Reembed(sourceField string) (int64, error)` |
+| Java | `long reembed(String sourceField)` |
+| C# | `long Reembed(string sourceField)` |
+
+The pure-Python backend raises `NotImplementedError`, matching how it already
+refuses `auto_embed` — a missing attribute would read as a version mismatch
+rather than a missing capability.
+
+Every binding's `auto_embed` example and default `dims` moved to bge-small/384.
+The documented `vector_indexes` widths moved with them: left at 1024 they would
+have tripped the new dimension guard.
+
+### The Python test suites were never running against the Rust backend
+
+`moofile/_native` was a **tracked symlink** to `bindings/python/_native/`, a
+directory package. Directories win over extension modules in Python's import
+order, so that package permanently shadowed `moofile/_native.cpython-*.so` and
+`import moofile` always fell through to the pure-Python implementation — in
+this checkout, on every machine, for anyone running from source.
+
+Both Python suites still reported PASS, because both backends pass most of the
+same tests. What they were not doing was exercising the Rust backend at all.
+With the shadow removed, two genuine failures surfaced immediately in
+`tests-cross/test_autoembed_parity.py` — assertions still expecting the GGUF
+error text.
+
+The symlink was added incidentally in an unrelated caching commit and was never
+the intended layout. The `__init__.py` inside its target explains the fallback
+it causes, which suggests someone hit this, documented the symptom, and left
+the cause in place. Refreshing the `.so` inside the symlink target — the
+previous advice in CLAUDE.md — cannot work, since that `__init__.py`
+deliberately imports nothing.
+
+Check which backend you have with
+`python -c "import moofile; print(moofile._NATIVE_LOADED)"`.
+
+### Repo hygiene
+
+- Deleted `core/Cargo.lock` and `bindings/python/Cargo.lock`. Cargo only reads
+  the workspace root lockfile, so these two sat tracked and untouched at
+  **0.4.1** since July — stale enough to predate autoembedding entirely, and
+  misleading to anyone who opened them. Subdirectory lockfiles are now
+  gitignored (`Cargo.lock` with `!/Cargo.lock`) so they cannot drift back.
+
+### Other
+
+- Embedding engines are keyed on the configured model id instead of a resolved
+  filesystem path. The old key meant re-resolving the model URI on **every
+  insert** — for `hf:` models, a filesystem cache probe per document. Invisible
+  behind a 7-second embed; not invisible at 4 ms.
+- `semantic()` no longer holds the collection's read lock across the embedding
+  forward pass; it clones the config and engine handle and releases the lock
+  first, as the hybrid path already did.
+- `EmbeddingEngine::dims()` reports the model's real output width from
+  fastembed's registry. It previously returned a hardcoded `1024` with a
+  "will be refined" comment.
+- Truncation, normalization and quantization were duplicated across the insert
+  and query paths; both now share one `finalize_embedding` helper.
+
 ## v1.0.4 (2026-08-08)
 
 ### Build fixes

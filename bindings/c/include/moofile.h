@@ -74,9 +74,9 @@ typedef struct MooFileSearchCursor MooFileSearchCursor;
  *     "durability": "os",   // "none", "os" (default), "fsync"
  *     "auto_embed": {        // on-device embedding (v0.5.0+)
  *       "content": {
- *         "model": "hf:user/repo:filename.gguf",  // required
+ *         "model": "BAAI/bge-small-en-v1.5",           // required
  *         "target": "embedding",                   // target vector field
- *         "dims": 1024,                            // embedding dimensions
+ *         "dims": 384,                             // embedding dimensions
  *         "precision": "int8",                     // "f32", "int8", "uint8", "binary"
  *         "normalize": true,
  *         "query_prefix": "Represent the query: ",
@@ -427,6 +427,25 @@ int moofile_sync(MooFileCollection* handle, char** err_out);
  * Rebuild all in-memory indexes from scratch.
  */
 int moofile_reindex(MooFileCollection* handle, char** err_out);
+
+/**
+ * Re-embed every document carrying `source_field`, rewriting its configured
+ * vector field at the embedding model's current width.
+ *
+ * This is the recovery path after changing the embedding model: vectors of
+ * different widths cannot be compared, so a collection opened with a model
+ * whose output width no longer matches its vector index has that index
+ * disabled, and searching it fails with an error naming both widths.
+ * Re-embedding rewrites the stored vectors, retargets the index and clears
+ * the flag.  It is never implicit — it rewrites the whole collection.
+ *
+ * `source_field` is the *text* field configured under `auto_embed`, not the
+ * vector field it writes to.
+ *
+ * Returns the number of documents rewritten, or -1 on error.
+ */
+int64_t moofile_reembed(MooFileCollection* handle, const char* source_field,
+                        char** err_out);
 
 /* ---------------------------------------------------------------------------
  * Memory management

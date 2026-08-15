@@ -25,16 +25,25 @@ rayon = "1"
 bincode = "1"
 fs4 = "0.12"
 hex = "0.4"
-llama-gguf = { version = "0.14", default-features = false, features = ["cpu", "huggingface"], optional = true }
+# Autoembedding runs ONNX models through fastembed (ort + HF tokenizers).
+# `default-features = false` drops fastembed's image-model support and swaps
+# native-tls for rustls: 129 transitive crates instead of 330, and no OpenSSL
+# to link against on manylinux.  It costs ~300KB of binary -- the bulk of the
+# ~25MB that `embed` adds is the statically linked ONNX Runtime itself.
+fastembed = { version = "5.17", default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+], optional = true }
 dirs = "6"
 
 [features]
-# Autoembedding: on-device GGUF inference plus HuggingFace model downloads.
-# On by default.  `--no-default-features` drops llama-gguf (~300 transitive
-# crates) and everything that runs a model; the config types stay available
-# and any attempt to embed returns MooFileError::EmbedDisabled.
+# Autoembedding: on-device ONNX inference plus HuggingFace model downloads.
+# On by default.  `--no-default-features` drops fastembed (~129 transitive
+# crates and a statically linked ONNX Runtime) and everything that runs a
+# model; the config types stay available and any attempt to embed returns
+# MooFileError::EmbedDisabled.
 default = ["embed"]
-embed = ["dep:llama-gguf"]
+embed = ["dep:fastembed"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -42,3 +51,11 @@ tempfile = "3"
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "embed_bench"
+path = "examples/embed_bench.rs"
+
+[[example]]
+name = "migrate_test"
+path = "examples/migrate_test.rs"

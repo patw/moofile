@@ -565,6 +565,14 @@ impl NativeCollection {
         Ok(map)
     }
 
+    /// Re-embed every document carrying `source_field`, rewriting its
+    /// configured vector field at the model's current width.
+    fn reembed(&self, source_field: &str) -> PyResult<usize> {
+        self.inner.reembed(source_field).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+        })
+    }
+
     fn compact(&self) -> PyResult<()> {
         self.inner.compact().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())

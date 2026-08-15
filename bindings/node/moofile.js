@@ -168,6 +168,7 @@ function loadLibrary(libPath) {
         compact: lib.func('int moofile_compact(MooFileCollection*, _Out_ void**)'),
         sync: lib.func('int moofile_sync(MooFileCollection*, _Out_ void**)'),
         reindex: lib.func('int moofile_reindex(MooFileCollection*, _Out_ void**)'),
+        reembed: lib.func('int64_t moofile_reembed(MooFileCollection*, const char*, _Out_ void**)'),
 
         // Memory
         freeString: lib.func('void moofile_free_string(void*)'),
@@ -621,6 +622,19 @@ class Collection {
 
     /** Rebuild all in-memory indexes. */
     reindex() { this._call(this.api.reindex); }
+
+    /**
+     * Re-embed every document carrying `sourceField`, rewriting its vector
+     * field at the model's current width.  Returns the number rewritten.
+     *
+     * The recovery path after changing the embedding model: a collection
+     * whose stored vectors no longer match its index has that index
+     * disabled, and searching it throws.  `sourceField` is the text field
+     * configured under `auto_embed`, not the vector field it writes to.
+     */
+    reembed(sourceField) {
+        return Number(this._call(this.api.reembed, sourceField));
+    }
 
     /** Close the collection.  Safe to call more than once. */
     close() {

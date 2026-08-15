@@ -651,4 +651,29 @@ public sealed class Collection : IDisposable
             Native.ThrowIfError(err);
         }
     }
+
+    /// <summary>
+    /// Re-embed every document carrying <paramref name="sourceField"/>, rewriting its
+    /// configured vector field at the embedding model's current width, and return the
+    /// number of documents rewritten.
+    /// </summary>
+    /// <remarks>
+    /// The recovery path after changing the embedding model. Vectors of different widths
+    /// cannot be compared, so a collection whose stored vectors no longer match its vector
+    /// index has that index disabled, and searching it throws. This rewrites the vectors,
+    /// retargets the index and clears the flag. It is never implicit — it rewrites the
+    /// whole collection.
+    /// <para><paramref name="sourceField"/> is the text field configured under
+    /// <c>auto_embed</c>, not the vector field it writes to.</para>
+    /// </remarks>
+    public long Reembed(string sourceField)
+    {
+        ArgumentNullException.ThrowIfNull(sourceField);
+        lock (_lock)
+        {
+            var n = Native.moofile_reembed(Handle, sourceField, out var err);
+            Native.ThrowIfError(err);
+            return n;
+        }
+    }
 }

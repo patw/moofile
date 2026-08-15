@@ -158,9 +158,9 @@ func main() {
 	}()
 
 	// -------------------------------------------------------------------
-	// 6. Autoembedding (requires GGUF model)
+	// 6. Autoembedding (requires downloading an ONNX model)
 	// -------------------------------------------------------------------
-	fmt.Println("\n10. Autoembedding requires a GGUF model file.")
+	fmt.Println("\n10. Autoembedding requires downloading an ONNX model.")
 	fmt.Println("   See moofile.h documentation for auto_embed config.")
 
 	fmt.Println("\n=== Done ===")

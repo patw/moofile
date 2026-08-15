@@ -505,6 +505,27 @@ public class CollectionTest {
         }
     }
 
+    /**
+     * reembed must reach the core and surface its error, rather than quietly
+     * returning 0, when the named field has no auto_embed config. Exercises the
+     * FFI round trip -- including error marshalling -- without a model download.
+     */
+    private static void testReembedWithoutConfig() {
+        test("reembed surfaces the core error for an unconfigured field");
+        try (Collection db = Collection.open(path("reembed.bson"))) {
+            db.insert(Document.of("summary", "hello"));
+            boolean threw = false;
+            try {
+                db.reembed("summary");
+            } catch (MooFileException e) {
+                threw = true;
+                check(e.getMessage().toLowerCase().contains("autoembed"),
+                    "error should name the missing autoembed config: " + e.getMessage());
+            }
+            check(threw, "reembed on an unconfigured field must throw, not return 0");
+        }
+    }
+
     private static void testSyncAndReindex() {
         test("sync and reindex");
         try (Collection db = Collection.open(path("sync.bson"),
@@ -573,6 +594,7 @@ public class CollectionTest {
             CollectionTest::testBatchCommit,
             CollectionTest::testBatchRollback,
             CollectionTest::testStatsAndCompact,
+            CollectionTest::testReembedWithoutConfig,
             CollectionTest::testSyncAndReindex,
             CollectionTest::testReadonlyRejectsWrites,
         };

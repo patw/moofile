@@ -46,7 +46,7 @@ mod index;
 mod query;
 mod text;
 
-pub use embed::{AutoEmbedConfig, EmbeddingPrecision, ModelUri};
+pub use embed::{AutoEmbedConfig, EmbeddingPrecision, DEFAULT_MODEL, DEFAULT_QUERY_PREFIX};
 pub use errors::MooFileError;
 pub use query::{AggFunc, HybridQuery, Query, TextQuery, VectorQuery};
 pub use storage::Durability;
@@ -226,8 +226,66 @@ struct CollectionInner {
     batch: Option<BatchBuffer>,
     /// Auto-embed configuration: source_field → config
     auto_embeds: BTreeMap<String, AutoEmbedConfig>,
-    /// Resolved embedding engines (loaded model for each unique model path)
+    /// Resolved embedding engines, keyed on the configured model id.
     embedding_engines: BTreeMap<String, EmbeddingEngine>,
+    /// Vector fields whose stored width disagrees with the configured width,
+    /// detected at open.  Searching them is refused rather than silently
+    /// ranking against whichever subset happens to match — see
+    /// [`MooFileError::VectorIndexDisabled`].  `reembed()` clears an entry.
+    disabled_vector_fields: BTreeMap<String, (usize, usize, usize)>,
+}
+
+/// Find vector fields whose stored documents disagree with the configured
+/// width.  Returns `field → (expected, found, count)`.
+///
+/// The index quietly skips any vector whose length is not the declared `dim`,
+/// which is the right behaviour for one malformed document and the wrong
+/// behaviour for "the embedding model changed" — there the whole collection
+/// drops out of the index and every search returns nothing, with no signal.
+/// This pass turns that into an explicit error at the point of use.
+fn detect_vector_dim_mismatches(
+    index_manager: &IndexManager,
+    effective_widths: &BTreeMap<String, usize>,
+) -> BTreeMap<String, (usize, usize, usize)> {
+    let mut out: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+
+    // Only fields that autoembed writes are checked: a hand-managed vector
+    // field with mixed widths is the caller's business, and reembed() has no
+    // way to repair it anyway.
+    for (field, declared) in &index_manager.vector_fields {
+        let Some(&produces) = effective_widths.get(field) else { continue };
+
+        let with_field = || {
+            index_manager
+                .documents
+                .values()
+                .filter(|d| matches!(d.get(field), Some(bson::Bson::Array(_))))
+                .count()
+        };
+
+        // Case 1: the model no longer produces what the index declares.  This
+        // is the "changed the embedding model" case, and it is broken even
+        // when every stored vector is self-consistent — queries come out at
+        // the new width and get compared against rows at the old one.
+        if produces != *declared {
+            out.insert(field.clone(), (*declared, produces, with_field()));
+            continue;
+        }
+
+        // Case 2: config and index agree, but documents on disk do not —
+        // a collection written before the config was corrected.
+        for doc in index_manager.documents.values() {
+            if let Some(bson::Bson::Array(arr)) = doc.get(field) {
+                if arr.len() != *declared {
+                    let e = out
+                        .entry(field.clone())
+                        .or_insert((*declared, arr.len(), 0));
+                    e.2 += 1;
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Collection {
@@ -339,15 +397,28 @@ impl Collection {
         let mut embedding_engines: BTreeMap<String, EmbeddingEngine> = BTreeMap::new();
 
         for (source_field, config) in &auto_embeds_map {
-            // Resolve model URI to local path (downloading if needed)
-            let model_uri = ModelUri::parse(&config.model);
-            let local_path = model_uri.resolve(&model_cache_dir)?;
+            // Engines are keyed on the configured model id.  Resolving to a
+            // filesystem path first would mean redoing that resolution on
+            // every insert just to look the engine back up.
+            if !embedding_engines.contains_key(&config.model) {
+                let engine = EmbeddingEngine::load(&config.model, &model_cache_dir)?;
+                embedding_engines.insert(config.model.clone(), engine);
+            }
 
-            // Only load each unique model path once
-            let model_key = local_path.to_string_lossy().into_owned();
-            if !embedding_engines.contains_key(&model_key) {
-                let engine = EmbeddingEngine::load(&local_path)?;
-                embedding_engines.insert(model_key, engine);
+            // `dims` below the model's width is deliberate (MRL truncation);
+            // above it is always a config error, and would otherwise surface
+            // as vectors silently missing from the index.
+            let model_dims = embedding_engines[&config.model].dims();
+            if config.dims > model_dims {
+                log::warn!(
+                    "moofile: autoembed '{}' requests {} dims but model '{}' \
+                     produces {} — vectors will be {} dims",
+                    source_field,
+                    config.dims,
+                    config.model,
+                    model_dims,
+                    model_dims,
+                );
             }
 
             // Validate dims match
@@ -382,6 +453,26 @@ impl Collection {
             })
             .unwrap_or((0, 0, 0));
 
+        // What each autoembedded field will actually be written at: the
+        // model's width, or narrower if `dims` asks for MRL truncation.
+        let effective_widths: BTreeMap<String, usize> = auto_embeds_map
+            .values()
+            .filter_map(|c| {
+                let engine = embedding_engines.get(&c.model)?;
+                Some((c.target_field.clone(), c.dims.min(engine.dims())))
+            })
+            .collect();
+
+        let disabled_vector_fields =
+            detect_vector_dim_mismatches(&index_manager, &effective_widths);
+        for (field, (expected, found, count)) in &disabled_vector_fields {
+            log::warn!(
+                "moofile: vector index '{field}' disabled — {count} document(s) \
+                 store {found}-dim vectors, index expects {expected}. \
+                 Call reembed() to rewrite them."
+            );
+        }
+
         Ok(Self {
             inner: Arc::new(RwLock::new(CollectionInner {
                 path: path.to_path_buf(),
@@ -399,6 +490,7 @@ impl Collection {
                 batch: None,
                 auto_embeds: auto_embeds_map,
                 embedding_engines,
+                disabled_vector_fields,
             })),
         })
     }
@@ -501,9 +593,22 @@ impl Collection {
             .collect::<Result<_, _>>()?;
 
         let out = inner.with_write_lock(|inner| {
-            let mut out = Vec::with_capacity(prepared.len());
-            for (doc, id) in prepared {
-                out.push(insert_locked(inner, doc, &id)?);
+            // Fail on an already-present _id before doing any embedding work,
+            // so a bad id in a 10k batch does not cost 10k forward passes
+            // before erroring.  Duplicates *within* the batch are still caught
+            // per document, by the running index.
+            for (_, id) in &prepared {
+                if inner.index_manager.get(id).is_some() {
+                    return Err(MooFileError::DuplicateKey(id.clone()));
+                }
+            }
+
+            let (docs, ids): (Vec<Document>, Vec<String>) = prepared.into_iter().unzip();
+            let docs = inner.apply_auto_embed_batch(docs)?;
+
+            let mut out = Vec::with_capacity(docs.len());
+            for (doc, id) in docs.into_iter().zip(ids) {
+                out.push(insert_locked_embedded(inner, doc, &id)?);
             }
             Ok(out)
         })?;
@@ -883,6 +988,110 @@ impl Collection {
         Ok(())
     }
 
+    /// Re-embed every document that has `source_field`, rewriting the
+    /// configured target vector field.
+    ///
+    /// This is the recovery path for a changed embedding model: it rewrites
+    /// the stored vectors at the new width, retargets the vector index and
+    /// its `.meta` entry, and clears the disabled flag set at open.
+    ///
+    /// It is deliberately explicit rather than automatic on `open()` —
+    /// re-embedding is a whole-collection write that can take minutes, and if
+    /// the model change was a typo, doing it implicitly would destroy the old
+    /// vectors before anyone noticed.
+    ///
+    /// Returns the number of documents rewritten.  Embedding is batched at
+    /// `AutoEmbedConfig::batch_size`, which is several times faster per
+    /// document than the one-at-a-time insert path.
+    pub fn reembed(&self, source_field: &str) -> Result<usize, MooFileError> {
+        let mut inner = self.inner.write().expect("lock poisoned");
+        inner.require_write()?;
+        if inner.batch.is_some() {
+            return Err(MooFileError::BatchAlreadyActive);
+        }
+
+        let config = inner
+            .auto_embeds
+            .get(source_field)
+            .cloned()
+            .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.to_string()))?;
+        let engine = inner
+            .embedding_engines
+            .get(&config.model)
+            .cloned()
+            .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.to_string()))?;
+
+        // The model's true width wins over `config.dims`, except where dims
+        // asks for a narrower MRL truncation.
+        let width = config.dims.min(engine.dims());
+        let batch_size = config.batch_size.max(1);
+
+        let count = inner.with_write_lock(|inner| {
+            let targets: Vec<(String, String)> = inner
+                .index_manager
+                .documents
+                .values()
+                .filter_map(|d| match (d.get_str("_id"), d.get(source_field)) {
+                    (Ok(id), Some(Bson::String(text))) => {
+                        Some((id.to_string(), text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let mut done = 0usize;
+            for chunk in targets.chunks(batch_size) {
+                let texts: Vec<String> = chunk
+                    .iter()
+                    .map(|(_, t)| format!("{}{}", config.doc_prefix, t))
+                    .collect();
+                let embeddings = engine.embed_batch(texts)?;
+
+                for ((id, _), raw) in chunk.iter().zip(embeddings) {
+                    // The document may have changed under us between the scan
+                    // and here only if another writer held the lock, which
+                    // with_write_lock rules out — but it may simply be gone.
+                    let Some(old) = inner.index_manager.get(id) else { continue };
+                    let mut new_doc = old.as_ref().clone();
+
+                    let emb = finalize_embedding(raw, width, &config);
+                    new_doc.insert(&config.target_field, Bson::Array(emb));
+
+                    inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
+                    inner.index_manager.remove(id);
+                    inner.index_manager.add(new_doc);
+                    inner.total_records += 1;
+                    done += 1;
+                }
+            }
+            Ok(done)
+        })?;
+
+        // Retarget the index to the new width, in memory and on disk, or the
+        // freshly written vectors are the wrong shape all over again.
+        for (field, dim) in inner.index_manager.vector_fields.iter_mut() {
+            if *field == config.target_field {
+                *dim = width;
+            }
+        }
+        inner.index_manager.rebuild_vector_indexes();
+        inner.disabled_vector_fields.remove(&config.target_field);
+        inner.dirty = true;
+
+        let meta_path = inner.path.with_extension("bson.meta");
+        let indexes = inner.index_manager.regular_fields.clone();
+        let vector = inner.index_manager.vector_fields.clone();
+        let text = inner.index_manager.text_fields.clone();
+        save_meta(&meta_path, &indexes, &vector, &text)?;
+
+        log::info!(
+            "moofile: reembedded {count} document(s) for '{source_field}' \
+             into '{}' at {width} dims",
+            config.target_field
+        );
+        Ok(count)
+    }
+
     pub fn compact(&self) -> Result<(), MooFileError> {
         let mut inner = self.inner.write().expect("lock poisoned");
         inner.require_write()?;
@@ -996,49 +1205,104 @@ inner.lock_file = None; // drop lock file handle
 // Auto-embed helper on CollectionInner
 // ---------------------------------------------------------------------------
 
+/// Turn a raw model output into the BSON array that gets stored.
+///
+/// Truncates to `width` (MRL), optionally L2-normalises, then round-trips
+/// through the configured precision so that what is stored is exactly what a
+/// search will compare against — a query embedding goes through the same
+/// quantisation, and skipping it here would bias every score.
+fn finalize_embedding(
+    raw: Vec<f32>,
+    width: usize,
+    config: &AutoEmbedConfig,
+) -> Vec<Bson> {
+    let emb: Vec<f32> = if raw.len() > width {
+        raw[..width].to_vec()
+    } else {
+        raw
+    };
+
+    let emb = if config.normalize {
+        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            emb.iter().map(|x| x / norm).collect()
+        } else {
+            emb
+        }
+    } else {
+        emb
+    };
+
+    let quantized = crate::embed::quantize(&emb, config.precision);
+    let dequantized = crate::embed::dequantize(&quantized, config.precision, emb.len());
+    dequantized.iter().map(|&v| Bson::Double(v as f64)).collect()
+}
+
 impl CollectionInner {
+    /// Auto-embed a whole slice of documents, one ONNX pass per batch rather
+    /// than one per document.
+    ///
+    /// Same result as calling [`Self::apply_auto_embed`] on each document, but
+    /// several times faster: for short texts the per-call overhead dominates,
+    /// so 32 documents in one pass cost far less than 32 passes.
+    fn apply_auto_embed_batch(
+        &self,
+        mut docs: Vec<Document>,
+    ) -> Result<Vec<Document>, MooFileError> {
+        if self.auto_embeds.is_empty() || docs.is_empty() {
+            return Ok(docs);
+        }
+
+        for (source_field, config) in &self.auto_embeds {
+            let engine = self
+                .embedding_engines
+                .get(&config.model)
+                .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
+            let width = config.dims.min(engine.dims());
+
+            // Only documents that actually carry the source field participate,
+            // so positions have to be tracked to write the results back.
+            let positions: Vec<usize> = docs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| matches!(d.get(source_field), Some(Bson::String(_))))
+                .map(|(i, _)| i)
+                .collect();
+
+            for chunk in positions.chunks(config.batch_size.max(1)) {
+                let texts: Vec<String> = chunk
+                    .iter()
+                    .map(|&i| match docs[i].get(source_field) {
+                        Some(Bson::String(t)) => format!("{}{}", config.doc_prefix, t),
+                        _ => unreachable!("positions only holds string fields"),
+                    })
+                    .collect();
+
+                let embeddings = engine.embed_batch(texts)?;
+                for (&i, raw) in chunk.iter().zip(embeddings) {
+                    let arr = finalize_embedding(raw, width, config);
+                    docs[i].insert(&config.target_field, Bson::Array(arr));
+                }
+            }
+        }
+        Ok(docs)
+    }
+
     /// If the document has any auto-embedded source fields, embed them
     /// and populate the target fields.
     fn apply_auto_embed(&self, mut doc: Document) -> Result<Document, MooFileError> {
         for (source_field, config) in &self.auto_embeds {
             // Only embed if the source field actually exists in the document
             if let Some(bson::Bson::String(text)) = doc.get(source_field).cloned() {
-                // Look up the engine by model path
-                let model_uri = ModelUri::parse(&config.model);
-                let cache_dir = default_model_cache_dir();
-                let local_path = model_uri.resolve(&cache_dir)?;
-                let model_key = local_path.to_string_lossy().into_owned();
-
-                let engine = self.embedding_engines.get(&model_key)
+                let engine = self.embedding_engines.get(&config.model)
                     .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
 
                 // Prefix and embed
                 let prefixed = format!("{}{}", config.doc_prefix, text);
                 let raw_emb = engine.embed(&prefixed)?;
 
-                // Truncate to requested dims (MRL support)
-                let emb: Vec<f32> = if raw_emb.len() > config.dims {
-                    raw_emb[..config.dims].to_vec()
-                } else {
-                    raw_emb
-                };
-
-                // Normalize if requested
-                let emb = if config.normalize {
-                    let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    if norm > 0.0 {
-                        emb.iter().map(|x| x / norm).collect()
-                    } else {
-                        emb
-                    }
-                } else {
-                    emb
-                };
-
-                // Quantize and store as BSON array of f64 (matching existing format)
-                let quantized = crate::embed::quantize(&emb, config.precision);
-                let dequantized = crate::embed::dequantize(&quantized, config.precision, config.dims);
-                let bson_array: Vec<Bson> = dequantized.iter().map(|&v| Bson::Double(v as f64)).collect();
+                let width = config.dims.min(engine.dims());
+                let bson_array = finalize_embedding(raw_emb, width, config);
 
                 doc.insert(&config.target_field, Bson::Array(bson_array));
             }
@@ -1074,6 +1338,24 @@ impl CollectionInner {
     fn require_open(&self) -> Result<(), MooFileError> {
         if self.closed {
             return Err(MooFileError::ReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Refuse to search a vector field whose stored width does not match the
+    /// index.  Returning empty results instead would be indistinguishable
+    /// from "nothing is similar".
+    pub(crate) fn require_vector_field_enabled(
+        &self,
+        field: &str,
+    ) -> Result<(), MooFileError> {
+        if let Some(&(expected, found, count)) = self.disabled_vector_fields.get(field) {
+            return Err(MooFileError::VectorIndexDisabled {
+                field: field.to_string(),
+                expected,
+                found,
+                count,
+            });
         }
         Ok(())
     }
@@ -1337,6 +1619,22 @@ fn insert_locked(
         return Err(MooFileError::DuplicateKey(_id.to_string()));
     }
     let doc = inner.apply_auto_embed(doc)?;
+    insert_locked_embedded(inner, doc, _id)
+}
+
+/// As [`insert_locked`], but for documents whose vector fields are already
+/// populated — the bulk path embeds the whole batch up front.
+///
+/// The duplicate check is repeated here rather than hoisted: a batch can
+/// contain the same `_id` twice, and only the running index catches that.
+fn insert_locked_embedded(
+    inner: &mut CollectionInner,
+    doc: Document,
+    _id: &str,
+) -> Result<Document, MooFileError> {
+    if inner.index_manager.get(_id).is_some() {
+        return Err(MooFileError::DuplicateKey(_id.to_string()));
+    }
     inner.storage.append(RECORD_LIVE, &doc)?;
     inner.index_manager.add(doc.clone());
     inner.total_records += 1;
@@ -1700,5 +1998,76 @@ mod id_validation_tests {
 
         // Still usable afterwards.
         assert_eq!(db.count(doc! {}).unwrap(), 1);
+    }
+}
+
+#[cfg(test)]
+mod dim_guard_tests {
+    use super::*;
+    use bson::doc;
+
+    /// Build an index holding `docs`, with one vector field declared at `dim`.
+    fn im(dim: usize, docs: Vec<Document>) -> IndexManager {
+        let mut im = IndexManager::new(&[], &[("emb".to_string(), dim)], &[]);
+        for d in docs {
+            im.add(d);
+        }
+        im
+    }
+
+    fn widths(w: usize) -> BTreeMap<String, usize> {
+        [("emb".to_string(), w)].into_iter().collect()
+    }
+
+    fn vec_doc(id: &str, n: usize) -> Document {
+        doc! { "_id": id, "emb": vec![0.1f64; n] }
+    }
+
+    #[test]
+    fn matching_widths_are_not_flagged() {
+        let m = im(384, vec![vec_doc("a", 384), vec_doc("b", 384)]);
+        assert!(detect_vector_dim_mismatches(&m, &widths(384)).is_empty());
+    }
+
+    /// The migration case: every stored vector agrees with the index, but the
+    /// model now emits a different width.  Self-consistent storage is exactly
+    /// why this needs its own check — queries would be compared against rows
+    /// of the wrong width and still produce plausible-looking scores.
+    #[test]
+    fn model_width_diverging_from_index_is_flagged() {
+        let m = im(1024, vec![vec_doc("a", 1024), vec_doc("b", 1024)]);
+        let found = detect_vector_dim_mismatches(&m, &widths(384));
+        assert_eq!(found.get("emb"), Some(&(1024, 384, 2)));
+    }
+
+    /// Config and index agree; the documents on disk are stale.
+    #[test]
+    fn stale_stored_vectors_are_flagged() {
+        let m = im(384, vec![vec_doc("a", 384), vec_doc("b", 1024)]);
+        let found = detect_vector_dim_mismatches(&m, &widths(384));
+        assert_eq!(found.get("emb"), Some(&(384, 1024, 1)));
+    }
+
+    /// A vector field nobody autoembeds is the caller's to manage — reembed()
+    /// could not repair it, so flagging it would only block search.
+    #[test]
+    fn unmanaged_vector_fields_are_left_alone() {
+        let m = im(1024, vec![vec_doc("a", 1024)]);
+        assert!(detect_vector_dim_mismatches(&m, &BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn empty_collection_is_not_flagged_on_matching_config() {
+        let m = im(384, vec![]);
+        assert!(detect_vector_dim_mismatches(&m, &widths(384)).is_empty());
+    }
+
+    /// Documents lacking the vector field entirely must not count as
+    /// mismatches — they are simply not in the vector index.
+    #[test]
+    fn documents_without_the_field_are_ignored() {
+        let mut m = im(384, vec![vec_doc("a", 384)]);
+        m.add(doc! { "_id": "b", "summary": "no vector here" });
+        assert!(detect_vector_dim_mismatches(&m, &widths(384)).is_empty());
     }
 }

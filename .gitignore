@@ -38,6 +38,14 @@ CLAUDE.md
 # Rust build artifacts
 target/
 
+# Cargo writes a lockfile beside whichever Cargo.toml it is invoked in, but in
+# a workspace only the root one is ever read.  The per-crate copies in core/
+# and bindings/*/ sat tracked and untouched at 0.4.1 for months because nothing
+# reads them -- ignore them so they cannot drift back in.  The root lockfile is
+# committed, as it should be for a crate that ships binaries.
+Cargo.lock
+!/Cargo.lock
+
 # Compiled native extensions
 *.so
 

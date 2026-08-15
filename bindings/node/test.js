@@ -419,6 +419,27 @@ function testStats() {
     cleanup(dir);
 }
 
+function testReembedWithoutConfig() {
+    test('reembed surfaces the core error for an unconfigured field');
+    const dir = tmpDir();
+    const db = new Collection(tmpPath(dir, 'reembed.bson'));
+    db.insert({ summary: 'hello' });
+
+    // Exercises the FFI round trip -- including error marshalling -- without
+    // needing a model download.
+    let threw = false;
+    try {
+        db.reembed('summary');
+    } catch (e) {
+        threw = true;
+        check(/autoembed/i.test(e.message), `error should name autoembed: ${e.message}`);
+    }
+    check(threw, 'reembed on an unconfigured field must throw, not return 0');
+
+    db.close();
+    cleanup(dir);
+}
+
 function testPersistence() {
     test('data persists across close/reopen');
     const dir = tmpDir();
@@ -500,6 +521,7 @@ const tests = [
     testHybridSearch,
     testBatch,
     testStats,
+    testReembedWithoutConfig,
     testPersistence,
     testReadonly,
     testExists,

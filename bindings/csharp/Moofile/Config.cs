@@ -6,13 +6,13 @@ namespace Moofile;
 /// <summary>Auto-embedding configuration for one source text field.</summary>
 public class AutoEmbedConfig
 {
-    /// <summary>GGUF model URI, e.g. "hf:user/repo:file.gguf". Required.</summary>
+    /// <summary>fastembed model id, e.g. "BAAI/bge-small-en-v1.5". Required.</summary>
     public string Model { get; set; } = "";
 
     /// <summary>Vector field the embedding is written to. Required.</summary>
     public string Target { get; set; } = "";
 
-    public int Dims { get; set; } = 1024;
+    public int Dims { get; set; } = 384;
 
     /// <summary>"f32", "int8", "uint8", or "binary".</summary>
     public string Precision { get; set; } = "int8";

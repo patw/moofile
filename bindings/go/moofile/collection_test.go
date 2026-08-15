@@ -272,6 +272,26 @@ func TestBatchRollback(t *testing.T) {
 	}
 }
 
+// Reembed must reach the core and surface its error, rather than silently
+// returning 0, when the named field has no auto_embed config. Exercises the
+// FFI round trip without needing a model download.
+func TestReembedWithoutConfig(t *testing.T) {
+	db, _ := moofile.Open(tmpPath(t), nil)
+	defer db.Close()
+	db.Insert(map[string]any{"summary": "hello"})
+
+	n, err := db.Reembed("summary")
+	if err == nil {
+		t.Fatalf("expected an error for an unconfigured field, got n=%d", n)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 documents on error, got %d", n)
+	}
+	if !strings.Contains(err.Error(), "autoembed") {
+		t.Errorf("error should name the missing autoembed config, got: %v", err)
+	}
+}
+
 func TestCompact(t *testing.T) {
 	db, _ := moofile.Open(tmpPath(t), nil)
 	defer db.Close()
@@ -489,7 +509,7 @@ func TestAutoEmbedConfigSerialisation(t *testing.T) {
 		VectorIndexes: map[string]int{"emb": 8},
 		AutoEmbed: map[string]moofile.AutoEmbedConfig{
 			"content": {
-				Model:  "hf:definitely/not-a-real-repo:missing.gguf",
+				Model:  "definitely-not-a-real-model",
 				Target: "emb",
 				Dims:   8,
 			},
