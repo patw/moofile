@@ -1,4 +1,18 @@
 # Changelog
+## v1.1.1 (2026-08-15)
+
+### Wheel build fix: manylinux 2_17 → 2_28 (std::regex ABI segfault)
+
+The Linux wheels were built in the 2014-era `manylinux_2_17` container (CentOS 7,
+GCC 4.9 headers → `GLIBCXX <= 3.4.19`). `std::regex` has no stable ABI in
+libstdc++, and ONNX Runtime's `DeviceDiscovery::GetPciBusId` uses it — so on hosts
+with a modern libstdc++ (e.g. Ubuntu 22.04+, libstdc++ 6.0.3x) opening a
+collection with `auto_embed` segfaulted inside `regex_traits::transform`.
+
+- Wheels are now built with `manylinux_2_28` (AlmaLinux 8, glibc 2.28, GCC 12,
+  `GLIBCXX 3.4.30`) — still covers every supported distro, but the compiled
+  `std::regex` code is compatible with current libstdc++ runtimes.
+- Docs updated (README, moofile-spec, workflow comments).
 
 ## v1.1.0 (2026-08-14)
 

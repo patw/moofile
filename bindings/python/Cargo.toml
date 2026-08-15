@@ -21,4 +21,4 @@ serde_json = "1"
 
 [features]
 default = ["embed"]
-embed = ["moofile-core/embed"]  # Autoembedding: on-device GGUF inference
+embed = ["moofile-core/embed"]  # Autoembedding: on-device ONNX inference via fastembed

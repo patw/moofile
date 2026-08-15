@@ -51,7 +51,16 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         with:
           args: --release --out dist
-          manylinux: "2_17"
+          # manylinux_2_28 (AlmaLinux 8, glibc 2.28, GCC 12) — NOT 2_17.
+          # Building against the 2014-era 2_17 toolchain compiles std::regex
+          # (used by ONNX Runtime's PCI device discovery) against GCC 4.9
+          # libstdc++ headers (GLIBCXX <= 3.4.19). On hosts with a modern
+          # libstdc++ (e.g. Ubuntu 22.04+ / 6.0.3x) that ABI-mismatched regex
+          # code null-derefs inside regex_traits::transform -> segfault on
+          # auto_embed model load. Compiled against GCC 12 (GLIBCXX 3.4.30)
+          # the regex code is compatible with current libstdc++ runtimes.
+          # 2_28 still covers every supported distro (glibc >= 2.28).
+          manylinux: "2_28"
           before-script-linux: |
             yum install -y openssl-devel || apt-get update && apt-get install -y libssl-dev || true
 

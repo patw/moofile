@@ -700,8 +700,8 @@ maturin develop --release   # from the repo root, not bindings/python
 
 One **abi3** wheel per platform, built via GitHub Actions CI. Because they target the
 stable ABI, a single wheel covers every CPython from 3.10 up:
-- Linux x86_64 (manylinux 2_17)
-- Linux aarch64 (manylinux 2_17)
+- Linux x86_64 (manylinux 2_28)
+- Linux aarch64 (manylinux 2_28)
 - macOS ARM64 (Apple Silicon)
 - Windows x86_64
 
@@ -723,6 +723,7 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.5.3 | Multi-process safety, full BSON type support, `_id` enforcement, performance fixes |
 | 0.6.0 | **Language bindings** — C, C++, Node.js, Go, Java, C# all consuming the same C shared library. **BSON normalisation** — all documents round-tripped through BSON encode/decode on write. **`InvalidIdError`/`InvalidFilterError`** — structured errors for non-string `_id` and malformed filters. **Cross-backend parity tests** — 8 automated scenarios validated across Python (pure), Python (Rust native), and C (shared library) |
 | **1.1.0** | **Autoembedding moved from GGUF/`llama-gguf` to ONNX/`fastembed`** — ~7 s → ~4 ms per embed, default model `BAAI/bge-small-en-v1.5` (384 dims). **Dimension guard** — a vector index whose width no longer matches the model is disabled rather than silently returning nothing, with `reembed()` as the recovery path. **Batched `insert_many` embedding** (4.8×). `reembed()` added to all seven bindings |
+| **1.1.1** | **Wheel build fix** — Linux wheels now built with `manylinux_2_28` (GCC 12) instead of `2_17` (GCC 4.9-era). Fixes a segfault on hosts with a modern libstdc++: old-compiled `std::regex` (used by ONNX Runtime's device discovery) null-deref'd inside `regex_traits::transform` when loading an `auto_embed` model |
 
 ---
 

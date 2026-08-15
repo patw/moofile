@@ -269,8 +269,8 @@ that works on every CPython from 3.10 up, rather than one per minor version:
 
 | Platform | Architecture | Python |
 |---|---|---|
-| Linux (manylinux 2_17) | x86_64 | 3.10+ |
-| Linux (manylinux 2_17) | aarch64 / ARM64 | 3.10+ |
+| Linux (manylinux 2_28) | x86_64 | 3.10+ |
+| Linux (manylinux 2_28) | aarch64 / ARM64 | 3.10+ |
 | macOS | ARM64 (Apple Silicon) | 3.10+ |
 | Windows | x86_64 | 3.10+ |
 
