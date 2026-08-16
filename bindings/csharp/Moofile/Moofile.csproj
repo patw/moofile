@@ -17,7 +17,7 @@
   <!-- ── NuGet package metadata ─────────────────────────────────────── -->
   <PropertyGroup>
     <PackageId>MooFile</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <Authors>Pat Wendorf</Authors>
     <Description>Lightweight embedded document store — MongoDB-style queries, vector search and BM25 text search over a single file. No server, no infrastructure. Native libraries for linux, macOS and Windows are included.</Description>
     <PackageTags>database;embedded;document-store;nosql;bson;vector-search;semantic-search;text-search;bm25</PackageTags>

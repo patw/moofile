@@ -393,9 +393,6 @@ name = "esaxx-rs"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "fastrand"
@@ -870,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-c"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bson",
  "moofile-core",
@@ -880,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bincode",
  "bson",
@@ -902,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-py"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "bson",
  "moofile-core",
@@ -1648,7 +1645,6 @@ dependencies = [
  "derive_builder",
  "esaxx-rs",
  "getrandom 0.3.4",
- "indicatif",
  "itertools",
  "log",
  "macro_rules_attribute",
@@ -1810,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "v4nano-embed"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "ort",
  "thiserror",

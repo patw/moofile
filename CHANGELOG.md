@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.2.1 (2026-08-16)
+
+### Windows CI/CD fix: drop tokenizers default features (esaxx-rs CRT mismatch)
+
+The v1.2.0 release workflows both failed on `windows-x86_64` at link time:
+`link.exe` aborted with LNK2038 / exit code 1169 because `esaxx-rs` (pulled in
+by `tokenizers`'s default `esaxx_fast` feature) hardcodes `static_crt(true)`
+(/MT) while ONNX Runtime's prebuilt binaries are /MD. `v4nano-embed` now
+depends on `tokenizers` with `default-features = false, features = ["onig"]` —
+the same configuration `fastembed` used — so the static-CRT C++ build is never
+compiled. No other platform or runtime behavior changed.
+
 ## v1.2.0 (2026-08-15)
 
 ### Autoembedding now runs voyage-4-nano via a dedicated crate (breaking)

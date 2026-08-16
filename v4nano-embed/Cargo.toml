@@ -13,5 +13,9 @@ license = "Apache-2.0"
 # `default-features = false` mirrors fastembed's own ort config (no openssl,
 # no tracing, no copy-dylibs); `api-24` matches fastembed's ORT API level.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-24", "download-binaries", "tls-rustls"] }
-tokenizers = "0.22"
+# `default-features = false` mirrors fastembed 5.17.4: tokenizers' default
+# `esaxx_fast` feature enables esaxx-rs's C++ build, which hardcodes
+# `static_crt(true)` (/MT). Mixing that with ONNX Runtime's prebuilt /MD
+# binaries makes MSVC's link.exe fail with LNK2038 (exit 1169) on Windows.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 thiserror = "2"
