@@ -1,5 +1,13 @@
 # Moofile Autoembedding Design (v3 — Packaging)
 
+> ## Superseded again: the engine is now `v4nano-embed`
+>
+> As of v1.x (post-1.1.1), fastembed has also been replaced by
+> [`v4nano-embed`](../v4nano-embed/) — a single-purpose ONNX runner for
+> voyage-4-nano, extracted from fastembed's glue. See the README's
+> *Autoembedding* section for current behaviour. The design below is kept as the
+> historical record of why auto-download-and-cache was chosen, which still holds.
+
 > ## Superseded in part: the engine changed in v1.1
 >
 > This document describes the original design, which ran **GGUF** models through

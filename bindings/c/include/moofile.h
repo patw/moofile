@@ -68,19 +68,21 @@ typedef struct MooFileSearchCursor MooFileSearchCursor;
  * @param config_json JSON configuration string (or NULL for defaults):
  *   {
  *     "indexes": ["field1", "field2"],
- *     "vector_indexes": {"embedding": 384},
+ *     "vector_indexes": {"embedding": 2048},
  *     "text_indexes": ["content"],
  *     "readonly": false,
  *     "durability": "os",   // "none", "os" (default), "fsync"
  *     "auto_embed": {        // on-device embedding (v0.5.0+)
  *       "content": {
- *         "model": "BAAI/bge-small-en-v1.5",           // required
  *         "target": "embedding",                   // target vector field
- *         "dims": 384,                             // embedding dimensions
+ *         "dims": 2048,                            // embedding dimensions (2048/1024/512/256)
+ *         "max_length": 1024,                       // tokenizer truncation cap (default 1024, max 32768)
  *         "precision": "int8",                     // "f32", "int8", "uint8", "binary"
  *         "normalize": true,
- *         "query_prefix": "Represent the query: ",
- *         "doc_prefix": "Represent the document: "
+ *         "query_prefix": "Represent the query for retrieving supporting documents: ",
+ *         "doc_prefix": ""
+ *         // "model" is optional: omit it to use the built-in voyage-4-nano,
+ *         // or set it to a local model directory (model_quantized.onnx + tokenizer.json).
  *       }
  *     },
  *     "model_cache_dir": "/path/to/cache"  // default: ~/.cache/moofile/models/

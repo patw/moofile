@@ -1,0 +1,17 @@
+[package]
+name = "v4nano-embed"
+version.workspace = true
+edition.workspace = true
+description = "Single-purpose ONNX runner for voyageai/voyage-4-nano (int8 export). Glue adapted from fastembed (Apache-2.0)."
+# Deliberately NOT `license.workspace`: this crate carries Apache-2.0 code
+# adapted from fastembed, so it stays Apache-2.0 while moofile stays MIT.
+license = "Apache-2.0"
+
+[dependencies]
+# Pinned to exactly what fastembed 5.17.4 selects, so moofile can swap its
+# fastembed dependency for this crate and reuse the already-built ONNX Runtime.
+# `default-features = false` mirrors fastembed's own ort config (no openssl,
+# no tracing, no copy-dylibs); `api-24` matches fastembed's ORT API level.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "api-24", "download-binaries", "tls-rustls"] }
+tokenizers = "0.22"
+thiserror = "2"

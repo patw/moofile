@@ -35,8 +35,9 @@ cargo build -p moofile-c --release
 # → target/release/libmoofile.so
 ```
 
-Autoembedding is on by default. To build without it (dropping `fastembed`
-and ~300 transitive crates, ~8.3 MB → ~2.8 MB), add `--no-default-features`;
+Autoembedding is on by default. To build without it (dropping
+`v4nano-embed` and the statically linked ONNX Runtime, ~38 MB → ~2.8 MB),
+add `--no-default-features`;
 `auto_embed` and `semantic()` then fail with a clear error while everything
 else works normally.
 
@@ -507,15 +508,14 @@ The config shape is identical everywhere:
 
 ```json
 {
-  "vector_indexes": {"embedding": 384},
+  "vector_indexes": {"embedding": 2048},
   "auto_embed": {
     "content": {
-      "model": "BAAI/bge-small-en-v1.5",
       "target": "embedding",
-      "dims": 384,
+      "dims": 2048,
       "precision": "int8",
       "normalize": true,
-      "query_prefix": "Represent this sentence for searching relevant passages: ",
+      "query_prefix": "Represent the query for retrieving supporting documents: ",
       "doc_prefix": ""
     }
   }
@@ -528,12 +528,11 @@ and `semantic()` embeds the query text for you:
 ```js
 // Node.js
 const db = new Collection('semantic.bson', {
-    vector_indexes: { embedding: 384 },
+    vector_indexes: { embedding: 2048 },
     auto_embed: {
         content: {
-            model: 'BAAI/bge-small-en-v1.5',
             target: 'embedding',
-            dims: 384,
+            dims: 2048,
             precision: 'int8',
         },
     },

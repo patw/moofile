@@ -53,7 +53,7 @@ public class App {
 Compile it against the downloaded binding JAR:
 
 ```bash
-javac -cp moofile-java-1.1.1.jar App.java
+javac -cp moofile-java-1.2.0.jar App.java
 ```
 
 Run it with both required JVM options:
@@ -63,7 +63,7 @@ Run it with both required JVM options:
 java \
   --enable-native-access=ALL-UNNAMED \
   -Dmoofile.library.path=moofile-macos-aarch64/lib/libmoofile.dylib \
-  -cp moofile-java-1.1.1.jar:. \
+  -cp moofile-java-1.2.0.jar:. \
   App
 
 # Linux x64: replace the property value with
@@ -87,7 +87,7 @@ Place the binding JAR in `libs/`:
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation(files("libs/moofile-java-1.1.1.jar"))
+    implementation(files("libs/moofile-java-1.2.0.jar"))
 }
 ```
 
@@ -98,10 +98,10 @@ CI setup:
 
 ```bash
 mvn install:install-file \
-  -Dfile=libs/moofile-java-1.1.1.jar \
+  -Dfile=libs/moofile-java-1.2.0.jar \
   -DgroupId=com.moofile \
   -DartifactId=moofile \
-  -Dversion=1.1.1 \
+  -Dversion=1.2.0 \
   -Dpackaging=jar
 ```
 
@@ -111,7 +111,7 @@ Then use a normal dependency:
 <dependency>
   <groupId>com.moofile</groupId>
   <artifactId>moofile</artifactId>
-  <version>1.1.1</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 

@@ -1,8 +1,8 @@
 [workspace]
-members = ["core", "bindings/python", "bindings/c"]
+members = ["core", "bindings/python", "bindings/c", "v4nano-embed"]
 resolver = "2"
 
 [workspace.package]
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 license = "MIT"

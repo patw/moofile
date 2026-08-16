@@ -84,12 +84,11 @@ using a local ONNX model, and query text is embedded for you:
 
 ```js
 const db = new Collection('semantic.bson', {
-    vector_indexes: { embedding: 384 },
+    vector_indexes: { embedding: 2048 },
     auto_embed: {
         content: {
-            model: 'BAAI/bge-small-en-v1.5',
             target: 'embedding',
-            dims: 384,
+            dims: 2048,
             precision: 'int8',
         },
     },

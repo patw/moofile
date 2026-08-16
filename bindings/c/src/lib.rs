@@ -325,17 +325,18 @@ pub extern "C" fn moofile_open(
             use moofile::AutoEmbedConfig;
             let mut ae_config = AutoEmbedConfig::default();
             if let Some(obj) = cfg_val.as_object() {
+                // `model` is optional and defaults to voyage-4-nano.
                 if let Some(model) = obj.get("model").and_then(|v| v.as_str()) {
                     ae_config.model = model.to_string();
-                } else {
-                    unsafe { set_error(err_out, &format!("auto_embed[{}]: 'model' is required", source_field)); }
-                    return ptr::null_mut();
                 }
                 if let Some(target) = obj.get("target").and_then(|v| v.as_str()) {
                     ae_config.target_field = target.to_string();
                 }
                 if let Some(dims) = obj.get("dims").and_then(|v| v.as_u64()) {
                     ae_config.dims = dims as usize;
+                }
+                if let Some(ml) = obj.get("max_length").and_then(|v| v.as_u64()) {
+                    ae_config.max_length = ml as usize;
                 }
                 if let Some(prec) = obj.get("precision").and_then(|v| v.as_str()) {
                     ae_config.precision = match prec {

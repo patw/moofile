@@ -159,12 +159,11 @@ using a local ONNX model, and query text is embedded for you:
 
 ```csharp
 using var db = Collection.Open("semantic.bson", new Config {
-    VectorIndexes = new Dictionary<string, int> { ["embedding"] = 384 },
+    VectorIndexes = new Dictionary<string, int> { ["embedding"] = 2048 },
     AutoEmbed = new Dictionary<string, AutoEmbedConfig> {
         ["content"] = new AutoEmbedConfig {
-            Model = "BAAI/bge-small-en-v1.5",
             Target = "embedding",
-            Dims = 384,
+            Dims = 2048,
             Precision = "int8",
         },
     },

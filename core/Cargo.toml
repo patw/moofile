@@ -25,25 +25,24 @@ rayon = "1"
 bincode = "1"
 fs4 = "0.12"
 hex = "0.4"
-# Autoembedding runs ONNX models through fastembed (ort + HF tokenizers).
-# `default-features = false` drops fastembed's image-model support and swaps
-# native-tls for rustls: 129 transitive crates instead of 330, and no OpenSSL
-# to link against on manylinux.  It costs ~300KB of binary -- the bulk of the
-# ~25MB that `embed` adds is the statically linked ONNX Runtime itself.
-fastembed = { version = "5.17", default-features = false, features = [
-    "hf-hub-rustls-tls",
-    "ort-download-binaries-rustls-tls",
-], optional = true }
+# Autoembedding runs voyage-4-nano through our single-model ONNX runner
+# (v4nano-embed) plus ONNX Runtime and HF tokenizers. `default-features =
+# false` on ort is handled inside v4nano-embed; hf-hub is only used to fetch
+# the model files on first use and uses rustls, no OpenSSL.
+# `--no-default-features` drops both plus the statically linked ONNX Runtime,
+# taking the autoembedding surface out of the binary entirely.
+v4nano-embed = { path = "../v4nano-embed", optional = true }
+# `ureq` (not `tokio`/`reqwest`) + ureq's default rustls keeps this OpenSSL-free.
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
 dirs = "6"
 
 [features]
-# Autoembedding: on-device ONNX inference plus HuggingFace model downloads.
-# On by default.  `--no-default-features` drops fastembed (~129 transitive
-# crates and a statically linked ONNX Runtime) and everything that runs a
-# model; the config types stay available and any attempt to embed returns
-# MooFileError::EmbedDisabled.
+# Autoembedding: on-device ONNX inference (voyage-4-nano) plus HuggingFace
+# model downloads. On by default. `--no-default-features` drops the embedding
+# runner and everything that runs a model; the config types stay available and
+# any attempt to embed returns MooFileError::EmbedDisabled.
 default = ["embed"]
-embed = ["dep:fastembed"]
+embed = ["dep:v4nano-embed", "dep:hf-hub"]
 
 [dev-dependencies]
 tempfile = "3"

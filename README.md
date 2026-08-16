@@ -141,25 +141,24 @@ db.delete_many({"status": "expired"})
 
 ### Autoembedding
 
-MooFile can run a local ONNX embedding model on-device, so text is embedded on
+MooFile runs **voyage-4-nano** on-device through ONNX Runtime, so text is embedded on
 insert and query text is embedded at search time — no external embedding API.
-Models run through [fastembed](https://crates.io/crates/fastembed) (ONNX Runtime
-+ HuggingFace tokenizers); a short sentence embeds in **~4 ms**.
+A short sentence embeds in **~35 ms** (or ~6 ms each when batched).
 
 ```python
 from moofile import Collection
 
 db = Collection("papers.bson",
     indexes=["year", "category"],
-    vector_indexes={"embedding": 384},
+    vector_indexes={"embedding": 2048},
     auto_embed={
         "abstract": {                             # source text field
-            "model": "BAAI/bge-small-en-v1.5",    # the default
             "target": "embedding",                # target vector field
-            "dims": 384,
+            "dims": 2048,
+            "max_length": 1024,                   # tokenizer cap (default; raise only for long docs)
             "precision": "int8",                  # f32 | int8 | uint8 | binary
-            # BGE is asymmetric: queries get an instruction, documents do not.
-            "query_prefix": "Represent this sentence for searching relevant passages: ",
+            # voyage is asymmetric: queries get an instruction, documents do not.
+            "query_prefix": "Represent the query for retrieving supporting documents: ",
             "doc_prefix": "",
         },
     })
@@ -183,36 +182,33 @@ The same config block is accepted verbatim by every other binding, as JSON:
 
 ```jsonc
 {
-  "vector_indexes": {"embedding": 384},
+  "vector_indexes": {"embedding": 2048},
   "auto_embed": {
-    "abstract": {"model": "BAAI/bge-small-en-v1.5",
-                 "target": "embedding", "dims": 384, "precision": "int8"}
+    "abstract": {"target": "embedding", "dims": 2048, "max_length": 1024, "precision": "int8"}
   }
 }
 ```
 
-#### Choosing a model
+#### Model selection
 
-`model` names an entry in fastembed's registry. Three spellings work, all
-case-insensitive: the canonical HuggingFace id (`BAAI/bge-small-en-v1.5`), the
-exact registry `model_code` (`Xenova/bge-small-en-v1.5`), or the bare name
-(`bge-small-en-v1.5`). Where a name is ambiguous the unquantized model wins —
-name the `model_code` explicitly to select a `...-Q` variant.
+The model is **voyage-4-nano** — a 180M+160M-param, 2048-dim, 32k-context
+model trained for Matryoshka truncation, so `dims` may be set to 2048, 1024,
+512 or 256 (smaller is fine, larger is rejected at open). There is no `model`
+key to set: it is omitted in modern configs and defaults to voyage-4-nano.
+For offline/deployment use you may set `"model"` to a path to a local directory
+containing `model_quantized.onnx` (+ its `.onnx_data`) and `tokenizer.json`;
+any other value is rejected at open with a clear message.
 
-| Model | Params | Dims | MTEB | Prefixes |
-|---|---|---|---|---|
-| **`BAAI/bge-small-en-v1.5`** (default) | 33M | 384 | ~61 | query only |
-| `nomic-ai/nomic-embed-text-v1.5` | 137M | 768 | ~69 | `search_query: ` / `search_document: ` |
-| `sentence-transformers/all-MiniLM-L6-v2` | 22M | 384 | ~56 | none (symmetric) |
+`max_length` caps how many tokens of a document are embedded (default **1024**).
+That's deliberate: the ONNX export materializes a full `[1, 16, T, T]`
+attention mask, so memory grows as 16·T²·4 bytes — 1024 tokens is 67 MB and
+~0.7 s, but 32k would need ~64 GB. Raise it only for whole-document cases on a
+box that can afford it.
 
-`dims` must match the model, except on models trained for Matryoshka
-truncation (nomic), where a smaller `dims` truncates. Getting it wrong is
-caught at open — see below.
-
-The model is downloaded from HuggingFace on first use (~130 MB for bge-small)
-and cached; later opens are local and take ~190 ms. Autoembedding is on by
-default; building with `--no-default-features` drops it and ~129 transitive
-crates along with a statically linked ONNX Runtime (~38 MB → ~2.8 MB), after
+The model is downloaded from HuggingFace on first use (~422 MB int8 export) and
+cached in `~/.cache/moofile/models/`; later opens load from disk in ~250 ms.
+Autoembedding is on by default; building with `--no-default-features` drops the
+embedding runner and a statically linked ONNX Runtime (~38 MB → ~2.8 MB), after
 which `auto_embed` and semantic search return a clear "not available" error and
 everything else works unchanged.
 

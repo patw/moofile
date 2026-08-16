@@ -360,7 +360,7 @@ impl Query {
                 .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?
                 .clone();
 
-            let engine = inner.embedding_engines.get(&config.model)
+            let engine = inner.embedding_engines.get(&crate::engine_key(&config.model, config.max_length))
                 .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?
                 .clone();
 
@@ -679,7 +679,7 @@ impl HybridQuery {
                     ))?;
 
                 // Find the engine
-                let engine = inner.embedding_engines.get(&config.model)
+                let engine = inner.embedding_engines.get(&crate::engine_key(&config.model, config.max_length))
                     .ok_or_else(|| MooFileError::EmbeddingError(
                         format!("embedding engine not loaded for model '{}'", config.model)
                     ))?

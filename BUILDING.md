@@ -135,8 +135,8 @@ with the `MOOFILE_LIB` environment variable, or for Java
 ### The `embed` feature
 
 Autoembedding — on-device ONNX inference plus HuggingFace model downloads — is
-**on by default** and pulls in `fastembed` (ONNX Runtime + HF tokenizers) and
-roughly 129 transitive crates.
+**on by default** and pulls in `v4nano-embed` (voyage-4-nano through ONNX
+Runtime + HF tokenizers).
 If you do not need it, turn it off for a much smaller, faster build:
 
 ```bash

@@ -212,11 +212,11 @@ public static class Program
     {
         Console.WriteLine("\n10. Autoembedding (skipped — requires downloading an ONNX model)");
         Console.WriteLine("   var db = Collection.Open(\"semantic.bson\", new Config {");
-        Console.WriteLine("       VectorIndexes = new() { [\"embedding\"] = 1024 },");
+        Console.WriteLine("       VectorIndexes = new() { [\"embedding\"] = 2048 },");
         Console.WriteLine("       AutoEmbed = new() {");
         Console.WriteLine("           [\"content\"] = new AutoEmbedConfig {");
-        Console.WriteLine("               Model = \"BAAI/bge-small-en-v1.5\",");
-        Console.WriteLine("               Target = \"embedding\", Dims = 1024,");
+        Console.WriteLine("               // Model omitted -> built-in voyage-4-nano");
+        Console.WriteLine("               Target = \"embedding\", Dims = 2048,");
         Console.WriteLine("           },");
         Console.WriteLine("       },");
         Console.WriteLine("   });");

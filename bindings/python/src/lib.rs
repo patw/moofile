@@ -62,30 +62,32 @@ fn py_auto_embed_config(
         let key: String = key.extract()?;
         if !matches!(
             key.as_str(),
-            "model" | "target" | "dims" | "precision" | "normalize" | "query_prefix" | "doc_prefix"
+            "model" | "target" | "dims" | "precision" | "normalize" | "query_prefix" | "doc_prefix" | "max_length"
         ) {
             return Err(err(format!(
                 "auto_embed['{source_field}']: unknown key '{key}' (expected one of: \
-                 model, target, dims, precision, normalize, query_prefix, doc_prefix)"
+                 model, target, dims, precision, normalize, query_prefix, doc_prefix, max_length)"
             )));
         }
     }
 
     let mut out = moofile_core::AutoEmbedConfig::default();
 
-    match cfg.get_item("model")? {
-        Some(v) => out.model = v.extract()?,
-        None => {
-            return Err(err(format!(
-                "auto_embed['{source_field}']: 'model' is required"
-            )))
-        }
+    // `model` is optional and defaults to voyage-4-nano — modern configs omit
+    // it entirely.  It is only honoured when it names the built-in model (or a
+    // local directory); anything else is rejected at model-resolution time so
+    // an old config can't silently swap models.
+    if let Some(v) = cfg.get_item("model")? {
+        out.model = v.extract()?;
     }
     if let Some(v) = cfg.get_item("target")? {
         out.target_field = v.extract()?;
     }
     if let Some(v) = cfg.get_item("dims")? {
         out.dims = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("max_length")? {
+        out.max_length = v.extract()?;
     }
     if let Some(v) = cfg.get_item("precision")? {
         let p: String = v.extract()?;

@@ -131,7 +131,7 @@ func (a *cstrings) free() {
 // The JSON tags matter: the C layer reads lower-case snake_case keys, so a
 // field without a tag would be serialised as "Model" and silently ignored.
 type AutoEmbedConfig struct {
-	Model       string `json:"model"`               // fastembed model id, e.g. "BAAI/bge-small-en-v1.5"
+	Model       string `json:"model"`               // optional; empty -> built-in voyage-4-nano
 	Target      string `json:"target"`              // Target vector field name
 	Dims        int    `json:"dims,omitempty"`      // Embedding dimensions (default 384)
 	Precision   string `json:"precision,omitempty"` // "f32", "int8", "uint8", "binary"

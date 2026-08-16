@@ -165,7 +165,7 @@ console.log('=== MooFile Node.js Examples ===\n');
     console.log('     vector_indexes: { embedding: 1024 },');
     console.log('     auto_embed: {');
     console.log('       content: {');
-    console.log('         model: "BAAI/bge-small-en-v1.5",');
+    console.log('         // model omitted -> built-in voyage-4-nano');
     console.log('         target: "embedding",');
     console.log('         dims: 1024,');
     console.log('         precision: "int8",');

@@ -167,7 +167,7 @@ moofile/
 │       ├── query.rs         # Query/VectorQuery/TextQuery, filter eval, .semantic()
 │       ├── text.rs          # BM25 + Porter stemming (rust-stemmers)
 │       ├── cache.rs         # Disposable index snapshot cache (bincode)
-│       ├── embed.rs         # Autoembedding engine (fastembed wrapper, quantization)
+│       ├── embed.rs         # Autoembedding engine (voyage-4-nano via v4nano-embed, quantization)
 │       └── errors.rs        # MooFileError enum
 │
 ├── bindings/
@@ -217,7 +217,7 @@ moofile/
 | `rayon` | — | rayon 1.x | Parallel index rebuild (Rust) |
 | `log` | — | log 0.4 | Structured logging (Rust) |
 | `pandas` (opt) | pandas≥1.0 | — | `.to_df()` method |
-| **`fastembed`** | — | **fastembed 5.17** | **On-device ONNX embedding inference (Rust)** |
+| **`v4nano-embed`** | — | **workspace crate** | **Single-model ONNX embedding inference (voyage-4-nano)** |
 | **`dirs`** | — | **dirs 6.x** | **Model cache directory detection (Rust)** |
 
 ### Performance (10K docs, 128d vectors)
@@ -500,7 +500,7 @@ No other embedded single-file document store offers BM25 + cosine + RRF fusion b
 
 ### Semantic Search (Autoembedding, v0.5.0)
 
-MooFile v0.5.0 introduced **on-device autoembedding** — run local embedding models directly from the Rust core, with no external API calls. Since v1.1 these are **ONNX** models run through [`fastembed`](https://crates.io/crates/fastembed) (ONNX Runtime + HuggingFace tokenizers); before that they were GGUF models run through `llama-gguf`, whose embedding path was a placeholder and ~1700× slower. Models are auto-downloaded from HuggingFace on first use and cached in `~/.cache/moofile/models/`.
+MooFile v0.5.0 introduced **on-device autoembedding** — run local embedding models directly from the Rust core, with no external API calls. Since v1.1 these are **ONNX** models run through the Rust core (ONNX Runtime + HuggingFace tokenizers); before that they were GGUF models run through `llama-gguf`, whose embedding path was a placeholder and ~1700× slower. The one model shipped today is **voyage-4-nano** (via the `onnx-community/voyage-4-nano-ONNX` int8 export), loaded by the `v4nano-embed` crate. Models are auto-downloaded from HuggingFace on first use and cached in `~/.cache/moofile/models/`.
 
 **Configuration:**
 
@@ -508,16 +508,17 @@ MooFile v0.5.0 introduced **on-device autoembedding** — run local embedding mo
 from moofile import Collection
 
 db = Collection("docs.bson",
-    vector_indexes={"embedding": 384},
+    vector_indexes={"embedding": 2048},
     auto_embed={
         "content": {                              # source text field
-            "model": "BAAI/bge-small-en-v1.5",    # fastembed registry id (default)
+            # no "model" key: voyage-4-nano is the built-in default
             "target": "embedding",                # target vector field
-            "dims": 384,                          # embedding dimensions
+            "dims": 2048,                         # embedding dimensions (2048/1024/512/256)
+            "max_length": 1024,                   # tokenizer cap (default; 32k needs ~64 GB mask)
             "precision": "int8",                  # f32 | int8 | uint8 | binary
             "normalize": True,
-            # BGE is asymmetric: queries get an instruction, documents do not.
-            "query_prefix": "Represent this sentence for searching relevant passages: ",
+            # voyage is asymmetric: queries get an instruction, documents do not.
+            "query_prefix": "Represent the query for retrieving supporting documents: ",
             "doc_prefix": "",
             "batch_size": 32,
         },
@@ -549,15 +550,13 @@ results = db.find({}).hybrid_search("content", "content", "quantum", None, 10).t
 ```python
 auto_embed={
     "abstract": {
-        "model": "BAAI/bge-small-en-v1.5",
         "target": "embedding",
-        "dims": 384,
+        "dims": 2048,
         "precision": "int8",
     },
     "title": {
-        "model": "BAAI/bge-small-en-v1.5",
         "target": "title_vec",
-        "dims": 384,
+        "dims": 256,           # MRL truncation
         "precision": "binary",
     },
 }
@@ -565,30 +564,32 @@ auto_embed={
 
 Engines are keyed on the model id, so two sources naming the same model share one loaded session.
 
-**Precision comparison** (fidelity of the round-trip, per 384-dim vector):
+**Precision comparison** (fidelity of the round-trip):
 
 | Precision | Quantized width | Quality vs f32 |
 |-----------|-----------------|----------------|
-| `f32`     | 1,536 B         | Baseline       |
-| `int8`    | 384 B           | ~1.0000 cosine |
-| `uint8`   | 384 B           | ~1.0000 cosine |
-| `binary`  | 48 B            | ~0.99 cosine   |
+| `f32`     | 32-bit float    | Baseline       |
+| `int8`    | 8-bit           | ~1.0000 cosine |
+| `uint8`   | 8-bit           | ~1.0000 cosine |
+| `binary`  | 1-bit           | ~0.99 cosine   |
 
-Earlier versions of this document credited the near-lossless int8 figures to the model being quantization-aware. That was specific to voyage-4-nano; the numbers above hold for bge-small simply because 8 bits is ample for a normalized 384-dim vector. Binary is lossier on models not trained for it — measure before relying on it.
+voyage-4-nano is quantization-aware trained (QAT), so 8-bit and binary precisions lose very little retrieval quality. Quantization affects **fidelity only, not storage** — see the note above.
 
-**Model identifiers:**
+**Model selection:**
 
-`model` names an entry in fastembed's registry. Three spellings resolve, all case-insensitive:
+`model` is optional and defaults to **voyage-4-nano** — modern configs omit it
+entirely. When present, it may be:
 
 ```
-BAAI/bge-small-en-v1.5        → canonical HuggingFace id
-Xenova/bge-small-en-v1.5      → the exact registry model_code
-bge-small-en-v1.5             → bare name
+voyage-4-nano            → the built-in model (also accepts voyageai/voyage-4-nano)
+/path/to/model-dir       → a local directory with model_quantized.onnx + tokenizer.json
+./relative/model-dir     → same, relative
 ```
 
-Where a bare name is ambiguous — `nomic-embed-text-v1.5` is served for both the plain and `-Q` variants — the unquantized model wins deterministically; name the `model_code` explicitly to select the other. The old `hf:repo:file.gguf` syntax is rejected with a migration error. Local model paths are not currently supported.
-
-Models are downloaded on first use, cached, and loaded once per collection open (~190 ms warm).
+Any other value is rejected at open with a clear message (the old
+`hf:repo:file.gguf` syntax gets migration guidance). Models are downloaded on
+first use (~422 MB int8 export), cached under `~/.cache/moofile/models/`, and
+loaded once per collection open (~250 ms warm).
 
 **Dimension guard:** vectors of different widths cannot be compared, so at open MooFile checks each autoembedded vector field against both the model's output width and the widths actually stored. A mismatch logs a warning and **disables** that vector index; searching it raises `VectorIndexDisabled` rather than silently ranking against a subset. `reembed(source_field)` rewrites the stored vectors at the new width, retargets the index and its `.meta` entry, and clears the flag. It is never implicit — re-embedding is a whole-collection write, and a typo'd model id would otherwise destroy the old vectors silently.
 
@@ -596,11 +597,11 @@ Models are downloaded on first use, cached, and loaded once per collection open 
 
 The autoembedding engine lives in `core/src/embed.rs`:
 
-- `EmbeddingEngine` — wraps `Arc<Mutex<fastembed::TextEmbedding>>` for text → vector. The mutex is required because `TextEmbedding::embed` takes `&mut self`; it costs nothing on the write path, which already holds the write lock, and ONNX Runtime parallelizes within a single embed anyway.
+- `EmbeddingEngine` — wraps `Arc<Mutex<v4nano_embed::V4Nano>>` for text → vector. The mutex is required because `V4Nano::embed` takes `&mut self`; it costs nothing on the write path, which already holds the write lock, and ONNX Runtime parallelizes within a single embed anyway.
 - `embed()` / `embed_batch()` — single and batched inference; batching is several times faster per text
-- `AutoEmbedConfig` — per-source-field configuration (model, target, precision, prefixes, batch size)
+- `AutoEmbedConfig` — per-source-field configuration (model, target, dims, precision, prefixes, max_length, batch size)
 - `EmbeddingPrecision` — `F32 | Int8 | Uint8 | Binary`
-- `resolve_model()` — maps a configured model string to a fastembed registry entry
+- `resolve_model()` — maps a configured model string to the built-in voyage-4-nano or a local model directory
 - `quantize()` / `dequantize()` — conversion between f32 and quantized formats
 - `cosine_similarity_quantized()` — compute cosine directly on quantized bytes (XOR + popcount for binary)
 

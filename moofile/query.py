@@ -228,7 +228,7 @@ class Query:
         """
         Semantic search — auto-embeds *query_text* and runs a vector search.
 
-        Only available on the Rust backend: autoembedding runs a GGUF model
+        Only available on the Rust backend: autoembedding runs voyage-4-nano
         through the Rust core, which the pure-Python implementation has no
         counterpart for.  Raising here rather than omitting the method keeps
         the two backends' API surfaces identical and makes the reason for the

@@ -553,9 +553,9 @@ No other embedded single-file document store offers BM25 + cosine + RRF fusion b
 
 ### Autoembedding (Semantic Search, v0.5.0+)
 
-MooFile can run local GGUF embedding models on-device, eliminating the need for external embedding APIs.
+MooFile runs **voyage-4-nano** on-device through ONNX Runtime — no external embedding APIs.
 
-> **Requires the Rust core.** The pure-Python fallback cannot run a GGUF model, so
+> **Requires the Rust core.** The pure-Python fallback cannot run an embedding model, so
 > `auto_embed` and `.semantic()` both raise `NotImplementedError` there. Check which
 > backend you are on with `moofile._NATIVE_LOADED`; the fallback also warns at import.
 
@@ -563,35 +563,48 @@ MooFile can run local GGUF embedding models on-device, eliminating the need for 
 
 ```python
 db = Collection("docs.bson",
-    vector_indexes={"embedding": 1024},
+    vector_indexes={"embedding": 2048},
     auto_embed={
         "content": {                              # source text field
-            "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
             "target": "embedding",                # target vector field
-            "dims": 1024,                         # embedding dimensions
+            "dims": 2048,                         # embedding dimensions (2048/1024/512/256)
+            "max_length": 1024,                   # tokenizer cap (default 1024, max 32768)
             "precision": "int8",                  # "f32" | "int8" | "uint8" | "binary"
             "normalize": True,
             "query_prefix": "Represent the query for retrieving supporting documents: ",
-            "doc_prefix": "Represent the document for retrieval: ",
+            "doc_prefix": "",
         },
     })
 ```
 
 Unknown keys and unknown `precision` values are rejected with a `ValueError` naming the
 offender, rather than being ignored — silently dropping a misspelled `precision` would
-leave the vectors at `f32` and quadruple their stored size.
+leave the vectors at full `f32` fidelity instead of the requested quantization.
 
 The same block is accepted verbatim as JSON by every other binding.
 
-**Model URIs:**
+**Model selection:**
 
 ```
-hf:user/repo:filename.gguf  → HuggingFace Hub, auto-downloaded and cached
-./local/model.gguf          → local file path
-/absolute/path/model.gguf   → absolute path
+(omit model)            → voyage-4-nano, the default — auto-downloaded from HuggingFace
+./models/voyage-4-nano  → a local directory holding model_quantized.onnx + tokenizer.json
+/abs/path/to/model      → absolute path to the same
 ```
 
-On first open with an `hf:` URI, the model is downloaded from HuggingFace (~355 MB for Q8_0) and cached. Subsequent opens are instant.
+`model` is optional and defaults to voyage-4-nano; modern configs omit it. Setting it to
+anything other than a local directory is rejected at open (see the error table below).
+On first open the model is downloaded from HuggingFace
+(`onnx-community/voyage-4-nano-ONNX`, ~422 MB int8 export) into
+`~/.cache/moofile/models/`. Subsequent opens load it from disk in well under a second.
+
+`dims` below the model's 2048 is deliberate MRL truncation (the model is trained for
+2048/1024/512/256); `dims` above 2048 is a config error.
+
+`max_length` caps how many tokens of a document are embedded (default **1024**, clamped
+to 1–32768). It is a memory guard as much as a knob: the export materializes a full
+`[1, 16, T, T]` attention mask, so memory is 16·T²·4 bytes — 1024 tokens is 67 MB and
+~0.7 s, but 32k needs ~64 GB and fails with a clean embedding error. Raise it only for
+whole-document embedding on hardware that can afford it.
 
 **On insert/update/replace:** if a document has a source text field, MooFile automatically generates the embedding and stores it in the target field:
 
@@ -620,49 +633,50 @@ results = db.find({}).hybrid_search("content", "embedding", "deep learning", Non
 
 ```python
 db = Collection("docs.bson",
-    vector_indexes={"embedding": 1024, "title_vec": 256},
+    vector_indexes={"embedding": 2048, "title_vec": 256},
     auto_embed={
         "abstract": {
-            "model": "hf:...",
             "target": "embedding",
             "precision": "int8",
         },
         "title": {
-            "model": "hf:...",
             "target": "title_vec",
             "dims": 256,           # MRL truncation
-            "precision": "binary", # 128 bytes per embedding
+            "precision": "binary", # 256 bytes per embedding
         },
     })
 ```
 
-**Precision comparison:**
+**Precision (`f32` | `int8` | `uint8` | `binary`):**
 
-| Precision | Size (1024-dim) | Quality |
-|-----------|----------------|---------|
-| `f32`     | 4.0 KB         | Baseline |
-| `int8`    | 1.0 KB (25%)   | ~1.0000 cosine sim |
-| `uint8`   | 1.0 KB (25%)   | ~1.0000 cosine sim |
-| `binary`  | 128 B (3.1%)   | ~0.9999 cosine sim |
+`precision` quantizes each stored value to the given width and stores the
+dequantized result, so what is persisted is bit-for-bit what a query is later
+compared against (the query embedding goes through the same round-trip). It
+trades a little fidelity for exact search consistency — it does **not** change
+the on-disk representation, which is always 8-byte doubles.
 
-All precisions benefit from the model's Quantization-Aware Training (QAT), which minimizes quality loss after quantization.
+voyage-4-nano is quantization-aware trained (QAT), so 8-bit and binary
+precisions lose very little retrieval quality.
 
 **Error handling:**
 
 | Situation | Exception | Message |
 |---|---|---|
 | Semantic search on a field with no `auto_embed` entry | `MooFileError` | `no autoembed configured for source field '<field>'` |
-| `"model"` path does not exist | `MooFileError` | `autoembed model not found: <path>` |
+| Local model dir missing files | `MooFileError` | `local model directory '<dir>' has no 'model_quantized.onnx'` |
+| Unknown `model` id | `MooFileError` | `unknown embedding model '<id>'. Only 'voyage-4-nano' is supported...` |
 | Unknown config key, or unknown `precision` | `ValueError` | names the offending key or value |
 | Config value is not a dict | `TypeError` | `auto_embed['<field>']: config must be a dict` |
 | Running on the pure-Python fallback | `NotImplementedError` | points at installing a native wheel |
 | Library built with `--no-default-features` | `MooFileError` | `autoembedding is not available: this build of moofile was compiled without the 'embed' feature` |
 
-> **`model_cache_dir` is currently ignored.** It is accepted by every binding, but
-> `ModelUri::resolve()` in `core/src/embed.rs` never passes it to the HuggingFace client,
-> so downloads always land in llama-gguf's own cache (`~/.cache/llama-rs/models/`).
+> `model_cache_dir` is honoured: it is passed to the HuggingFace downloader, so models
+> land under that directory (default `~/.cache/moofile/models/`).
 
-Autoembedding is on by default. Building without it (`--no-default-features`) drops `llama-gguf` and ~300 transitive crates, taking `libmoofile` from ~8.3 MB to ~2.8 MB; `auto_embed` and semantic search then fail with the error above and everything else works unchanged.
+Autoembedding is on by default. Building without it (`--no-default-features`) drops
+`v4nano-embed` and the statically linked ONNX Runtime, taking `libmoofile` from ~38 MB
+to ~2.8 MB; `auto_embed` and semantic search then fail with the error above and
+everything else works unchanged.
 
 ---
 
@@ -992,19 +1006,18 @@ across the boundary.
 
 ### Autoembedding across languages
 
-The autoembedding feature (local GGUF models for semantic search) works
+The autoembedding feature (local voyage-4-nano via ONNX Runtime) works
 **in every binding**, Python included. Model loading and inference happen entirely
 inside the Rust core, so the `auto_embed` config is identical across all of them
 (the pure-Python fallback is the one exception — it cannot run a model):
 
 ```json
 {
-  "vector_indexes": {"embedding": 1024},
+  "vector_indexes": {"embedding": 2048},
   "auto_embed": {
     "content": {
-      "model": "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf",
       "target": "embedding",
-      "dims": 1024,
+      "dims": 2048,
       "precision": "int8"
     }
   }

@@ -11,7 +11,7 @@ So the contract asserted here is the one that was missing: **every backend
 accepts the parameter**, and a backend that cannot honour it says so in a way
 the caller can catch, rather than looking like a bad keyword argument.
 
-Nothing here loads a model — that would mean a ~130 MB download.  These cover
+Nothing here loads a model — that would mean a ~420 MB download.  These cover
 the config path up to the point where the model is resolved.
 """
 
@@ -91,7 +91,6 @@ def rust_collection(make_collection, backend):
     [
         (_config(precision="fp16"), ValueError, "unknown precision"),
         ({"content": {"model": MODEL, "precison": "int8"}}, ValueError, "unknown key"),
-        ({"content": {"target": "embedding"}}, ValueError, "'model' is required"),
         ({"content": MODEL}, TypeError, "must be a dict"),
     ],
 )
@@ -100,6 +99,9 @@ def test_config_errors_are_specific(rust_collection, config, expected_error, mat
 
     Unknown keys are rejected rather than ignored: silently dropping
     ``precison`` would leave the vectors at f32 and quadruple stored size.
+
+    (``model`` is intentionally *optional* — it defaults to voyage-4-nano —
+    so there is no "model required" case here.)
     """
     with pytest.raises(expected_error, match=match):
         rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
@@ -118,17 +120,17 @@ def test_gguf_uri_reports_the_migration(rust_collection):
     used to work, so the error has to name the replacement.
     """
     config = _config(model="hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf")
-    with pytest.raises(MooFileError, match="fastembed") as exc:
+    with pytest.raises(MooFileError, match="Use 'voyage-4-nano'") as exc:
         rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
-    assert "bge-small" in str(exc.value), (
-        "the migration error must suggest a replacement model, got: %s" % exc.value
+    assert "ONNX" in str(exc.value), (
+        "the migration error must name the new engine, got: %s" % exc.value
     )
 
 
-def test_local_model_path_is_rejected_clearly(rust_collection):
-    """Local ONNX models are not wired up yet; say so rather than 'unknown'."""
-    config = _config(model="./models/my-model.onnx")
-    with pytest.raises(MooFileError, match="local model paths"):
+def test_local_model_dir_missing_files_is_clear(rust_collection):
+    """A local model directory that lacks the export names the missing file."""
+    config = _config(model="./models/my-model")
+    with pytest.raises(MooFileError, match="model_quantized.onnx"):
         rust_collection(vector_indexes={"embedding": 1024}, auto_embed=config)
 
 
@@ -144,6 +146,7 @@ def test_all_documented_keys_are_accepted(rust_collection):
         doc_prefix="doc: ",
         precision="binary",
         dims=256,
+        max_length=2048,
     )
     # Fails at model resolution, i.e. after every key has been accepted.
     with pytest.raises(MooFileError, match="unknown embedding model"):

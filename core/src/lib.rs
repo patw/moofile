@@ -7,12 +7,11 @@
 //! let db = Collection::builder("mydata.bson")
 //!     .index("email")
 //!     .index("age")
-//!     .vector_index("embedding", 384)
+//!     .vector_index("embedding", 2048)
 //!     .text_index("content")
 //!     .auto_embed("content", moofile::AutoEmbedConfig {
-//!         model: "hf:jsonMartin/voyage-4-nano-gguf:voyage-4-nano-q8_0.gguf".into(),
 //!         target_field: "embedding".into(),
-//!         dims: 1024,
+//!         dims: 2048,
 //!         precision: moofile::EmbeddingPrecision::Int8,
 //!         ..Default::default()
 //!     })
@@ -35,7 +34,7 @@
 //! - **Storage**: append-only BSON file, never modified in place.
 //! - **Indexes**: rebuilt in memory on every open (regular B-Tree, vector, text).
 //! - **Query**: lazy builder pattern — no work until a terminal method is called.
-//! - **Autoembed**: on-device embedding via `llama-gguf`, quantified storage.
+//! - **Autoembed**: on-device embedding via `voyage-4-nano` (ONNX Runtime), quantified storage.
 
 pub mod embed;
 pub mod errors;
@@ -68,6 +67,12 @@ pub(crate) fn default_model_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("moofile")
         .join("models")
+}
+
+/// Engine cache key: engines are per (model, max_length), because the tokenizer
+/// truncation cap is baked in at load time.
+pub(crate) fn engine_key(model: &str, max_length: usize) -> (String, usize) {
+    (model.to_string(), max_length)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,7 +232,7 @@ struct CollectionInner {
     /// Auto-embed configuration: source_field → config
     auto_embeds: BTreeMap<String, AutoEmbedConfig>,
     /// Resolved embedding engines, keyed on the configured model id.
-    embedding_engines: BTreeMap<String, EmbeddingEngine>,
+    embedding_engines: BTreeMap<(String, usize), EmbeddingEngine>,
     /// Vector fields whose stored width disagrees with the configured width,
     /// detected at open.  Searching them is refused rather than silently
     /// ranking against whichever subset happens to match — see
@@ -394,21 +399,22 @@ impl Collection {
 
         // --- Load embedding engines ---
         let auto_embeds_map: BTreeMap<String, AutoEmbedConfig> = auto_embeds.into_iter().collect();
-        let mut embedding_engines: BTreeMap<String, EmbeddingEngine> = BTreeMap::new();
+        let mut embedding_engines: BTreeMap<(String, usize), EmbeddingEngine> = BTreeMap::new();
 
         for (source_field, config) in &auto_embeds_map {
-            // Engines are keyed on the configured model id.  Resolving to a
-            // filesystem path first would mean redoing that resolution on
-            // every insert just to look the engine back up.
-            if !embedding_engines.contains_key(&config.model) {
-                let engine = EmbeddingEngine::load(&config.model, &model_cache_dir)?;
-                embedding_engines.insert(config.model.clone(), engine);
+            // Engines are keyed on (model, max_length): the tokenizer cap is
+            // baked in at load time, so two sources that share a model but
+            // want different caps each get their own session.
+            let key = engine_key(&config.model, config.max_length);
+            if !embedding_engines.contains_key(&key) {
+                let engine = EmbeddingEngine::load(&config.model, config.max_length, &model_cache_dir)?;
+                embedding_engines.insert(key.clone(), engine);
             }
 
             // `dims` below the model's width is deliberate (MRL truncation);
             // above it is always a config error, and would otherwise surface
             // as vectors silently missing from the index.
-            let model_dims = embedding_engines[&config.model].dims();
+            let model_dims = embedding_engines[&key].dims();
             if config.dims > model_dims {
                 log::warn!(
                     "moofile: autoembed '{}' requests {} dims but model '{}' \
@@ -458,7 +464,7 @@ impl Collection {
         let effective_widths: BTreeMap<String, usize> = auto_embeds_map
             .values()
             .filter_map(|c| {
-                let engine = embedding_engines.get(&c.model)?;
+                let engine = embedding_engines.get(&engine_key(&c.model, c.max_length))?;
                 Some((c.target_field.clone(), c.dims.min(engine.dims())))
             })
             .collect();
@@ -1017,7 +1023,7 @@ impl Collection {
             .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.to_string()))?;
         let engine = inner
             .embedding_engines
-            .get(&config.model)
+            .get(&engine_key(&config.model, config.max_length))
             .cloned()
             .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.to_string()))?;
 
@@ -1256,7 +1262,7 @@ impl CollectionInner {
         for (source_field, config) in &self.auto_embeds {
             let engine = self
                 .embedding_engines
-                .get(&config.model)
+                .get(&engine_key(&config.model, config.max_length))
                 .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
             let width = config.dims.min(engine.dims());
 
@@ -1294,7 +1300,7 @@ impl CollectionInner {
         for (source_field, config) in &self.auto_embeds {
             // Only embed if the source field actually exists in the document
             if let Some(bson::Bson::String(text)) = doc.get(source_field).cloned() {
-                let engine = self.embedding_engines.get(&config.model)
+                let engine = self.embedding_engines.get(&engine_key(&config.model, config.max_length))
                     .ok_or_else(|| MooFileError::NoAutoEmbed(source_field.clone()))?;
 
                 // Prefix and embed

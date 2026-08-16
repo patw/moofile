@@ -1,4 +1,35 @@
 # Changelog
+
+## v1.2.0 (2026-08-15)
+
+### Autoembedding now runs voyage-4-nano via a dedicated crate (breaking)
+
+fastembed is gone. It was pulled in to run *any* registry model, but the only
+model we ever wanted was voyage-4-nano — so the generic registry was replaced
+with [`v4nano-embed`](v4nano-embed/), a single-purpose ONNX runner extracted
+from fastembed's glue (~200 lines), depending on `ort` + `tokenizers` directly.
+
+- The default (and only built-in) model is now **`voyage-4-nano`**
+  (`onnx-community/voyage-4-nano-ONNX` int8 export): 180M+160M params, 2048
+  dims, 32k context, MRL-truncatable to 1024/512/256. `model` may also be a
+  path to a local directory holding `model_quantized.onnx` + `tokenizer.json`.
+- **`model` is now optional** — modern configs omit it and get voyage-4-nano.
+  An empty string (some bindings serialize unset fields as `""`) also means
+  the default. `hf:` GGUF URIs and fastembed registry ids are rejected with
+  guidance to use `voyage-4-nano`.
+- **`max_length`** (new config field, default **1024**) caps tokenizer
+  truncation per source field. The ONNX export materializes a full
+  `[1, 16, T, T]` attention mask (16·T²·4 bytes), so 1024 is cheap (67 MB,
+  ~0.7 s) while 32k needs ~64 GB and fails with a clean embedding error — raise
+  it only for whole-document embedding on hardware that can afford it.
+- The previous GGUF backend (~7 s/embed) is long gone; this replaces the
+  fastembed backend (~4 ms/embed, 384 dims) with voyage-4-nano
+  (~35 ms single, ~6 ms batched, 2048 dims).
+- `v4nano-embed` is a workspace member and carries the Apache-2.0 license for
+  the code adapted from fastembed; the rest of moofile stays MIT.
+- `--no-default-features` still drops embedding entirely (~38 MB → ~2.8 MB
+  `libmoofile`).
+
 ## v1.1.1 (2026-08-15)
 
 ### Wheel build fix: manylinux 2_17 → 2_28 (std::regex ABI segfault)
@@ -257,7 +288,7 @@ Check which backend you have with
 - **Node/TypeScript**: Removed the unsupported `$regex` filter operator from declarations.
 - **Release tooling and docs**: Native release re-runs now skip already-published npm versions; Java JARs are included in release checksums; stale test counts and examples were refreshed.
 
-## Unreleased
+## v1.2.0
 
 ## v1.0.0 (2026-08-07)
 

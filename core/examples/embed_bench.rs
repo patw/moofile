@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = AutoEmbedConfig {
         target_field: "summary_embedding".into(),
-        dims: 384,
+        dims: 2048,
         precision: EmbeddingPrecision::Int8,
         ..Default::default()
     };
@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t = Instant::now();
     let c = Collection::builder(&path)
-        .vector_index("summary_embedding", 384)
+        .vector_index("summary_embedding", 2048)
         .auto_embed("summary", cfg)
         .open()?;
     println!("open (model load): {:?}", t.elapsed());
@@ -51,10 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Same texts one at a time, for comparison and to check equality.
     let dir2 = tempfile::tempdir()?;
     let c2 = Collection::builder(dir2.path().join("b.moo"))
-        .vector_index("summary_embedding", 384)
+        .vector_index("summary_embedding", 2048)
         .auto_embed("summary", AutoEmbedConfig {
             target_field: "summary_embedding".into(),
-            dims: 384,
+            dims: 2048,
             precision: EmbeddingPrecision::Int8,
             ..Default::default()
         })
