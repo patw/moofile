@@ -156,6 +156,8 @@ db = Collection("papers.bson",
             "target": "embedding",                # target vector field
             "dims": 2048,
             "max_length": 1024,                   # tokenizer cap (default; raise only for long docs)
+            "batch_size": 32,                      # document-count cap per inference pass
+            "max_batch_tokens": 8192,              # padded-token budget; bounds peak RAM
             "precision": "int8",                  # f32 | int8 | uint8 | binary
             # voyage is asymmetric: queries get an instruction, documents do not.
             "query_prefix": "Represent the query for retrieving supporting documents: ",
@@ -184,7 +186,8 @@ The same config block is accepted verbatim by every other binding, as JSON:
 {
   "vector_indexes": {"embedding": 2048},
   "auto_embed": {
-    "abstract": {"target": "embedding", "dims": 2048, "max_length": 1024, "precision": "int8"}
+    "abstract": {"target": "embedding", "dims": 2048, "max_length": 1024,
+                 "batch_size": 32, "max_batch_tokens": 8192, "precision": "int8"}
   }
 }
 ```
@@ -205,6 +208,14 @@ attention mask, so memory grows as 16·T²·4 bytes — 1024 tokens is 67 MB and
 ~0.7 s, but 32k would need ~64 GB. Raise it only for whole-document cases on a
 box that can afford it.
 
+For bulk `insert_many()` and `reembed()`, `batch_size` is a document-count cap
+(default **32**) and `max_batch_tokens` is a padded-token budget (default
+**8192**). MooFile sorts texts longest-first and honors both limits, so short
+texts still batch efficiently while long texts cannot turn a nominal 32-document
+batch into an out-of-memory inference pass. The default budget holds
+voyage-4-nano inference to roughly 2.5 GiB; lower it on memory-constrained
+machines.
+
 The model is downloaded from HuggingFace on first use (~422 MB int8 export) and
 cached in `~/.cache/moofile/models/`; later opens load from disk in ~250 ms.
 Autoembedding is on by default; building with `--no-default-features` drops the
@@ -221,9 +232,9 @@ every stored vector. MooFile detects this at open, logs a warning, and
 happen to match:
 
 ```
-vector index 'embedding' is disabled: it expects 1024-dim vectors, but the
-configured model and/or the 4213 stored document(s) are 384-dim. Call
-reembed() to rewrite them at 384, or restore the 1024-dim model.
+vector index 'embedding' is disabled: it expects 2048-dim vectors, but the
+configured model and/or the 4213 stored document(s) are 1024-dim. Call
+reembed() to rewrite them at 2048, or restore the 1024-dim model.
 ```
 
 Recover by re-embedding the collection, which rewrites the stored vectors,

@@ -1,4 +1,4 @@
-# MooFile — Specification v1.0.0
+# MooFile — Specification v1.2.2
 
 > A lightweight, embedded, single-file document store with vector similarity search, BM25 text search, **on-device autoembedding**, and a developer-friendly query API.  
 > No server. No infrastructure. Just a file and a library.  
@@ -20,7 +20,7 @@ MooFile sits in the gap:
 - **Embedded** like SQLite — a library, no daemon, no network
 - **Document-oriented** like MongoDB — JSON-shaped data, flexible schema
 - **Vector search** like modern vector databases — cosine similarity, semantic search
-- **Text search** like Elasticsearch — BM25 ranking, full-text indexing
+- **Text search** like Elasticsearch — BM25 ranking, full-text indexing (including digits, compound identifiers, and array fields)
 - **On-device autoembedding** — run local ONNX embedding models, no external APIs needed
 - **Developer-friendly API** — method chains, not operator dicts
 - **Single-file portability** — your database is a file you can copy, version control, or email
@@ -53,10 +53,10 @@ A MooFile database is three files:
 ```
 mydata.bson       ← append-only document store, source of truth
 mydata.bson.meta  ← index configuration (regular, vector, and text indexes)
-mydata.bson.lock  ← advisory lock file (prevents concurrent multi-process access)
+mydata.bson.lock  ← advisory lock file (serializes cross-process writes)
 ```
 
-The `.lock` file is disposable — safe to delete, it will be re-created on next open. It exists only to detect and reject concurrent access from another process.
+The `.lock` file is disposable — safe to delete, it will be re-created on next open. It serializes cross-process writes; handles do not hold it for their lifetime.
 
 Indexes are **never persisted**. They are rebuilt in memory on every open by scanning the BSON file. This includes regular field indexes, vector indexes for similarity search, and inverted text indexes for BM25 ranking. The BSON file is always the source of truth. If the meta file is lost or corrupt, delete it and reopen — it will be rebuilt.
 
@@ -125,7 +125,7 @@ A small JSON file — human readable by design:
 {
   "version": 1,
   "indexes": ["email", "age", "status"],
-  "vector_indexes": {"embedding": 384, "profile_vec": 128},
+  "vector_indexes": {"embedding": 2048, "profile_vec": 128},
   "text_indexes": ["title", "content", "description"],
   "created_at": "2025-01-01T00:00:00Z"
 }
@@ -240,7 +240,7 @@ moofile/
 
 ---
 
-## Language Bindings (v1.0.0)
+## Language Bindings (v1.2.2)
 
 MooFile now ships with bindings for **C, C++, Node.js, Go, Java, and C#** — all
 consuming the same C shared library (`libmoofile.so` / `.dylib` / `.dll`).
@@ -455,7 +455,7 @@ from moofile import Collection
 
 db = Collection("mydata.bson", 
     indexes=["email", "age", "status"],
-    vector_indexes={"embedding": 384},
+    vector_indexes={"embedding": 2048},
     text_indexes=["title", "content"])
 ```
 
@@ -520,7 +520,8 @@ db = Collection("docs.bson",
             # voyage is asymmetric: queries get an instruction, documents do not.
             "query_prefix": "Represent the query for retrieving supporting documents: ",
             "doc_prefix": "",
-            "batch_size": 32,
+            "batch_size": 32,                    # count cap per inference pass
+            "max_batch_tokens": 8192,             # padded-token budget; bounds peak RAM
         },
     })
 ```
@@ -599,13 +600,21 @@ The autoembedding engine lives in `core/src/embed.rs`:
 
 - `EmbeddingEngine` — wraps `Arc<Mutex<v4nano_embed::V4Nano>>` for text → vector. The mutex is required because `V4Nano::embed` takes `&mut self`; it costs nothing on the write path, which already holds the write lock, and ONNX Runtime parallelizes within a single embed anyway.
 - `embed()` / `embed_batch()` — single and batched inference; batching is several times faster per text
-- `AutoEmbedConfig` — per-source-field configuration (model, target, dims, precision, prefixes, max_length, batch size)
+- `AutoEmbedConfig` — per-source-field configuration (model, target, dims, precision, prefixes, max_length, `batch_size`, and `max_batch_tokens`)
 - `EmbeddingPrecision` — `F32 | Int8 | Uint8 | Binary`
 - `resolve_model()` — maps a configured model string to the built-in voyage-4-nano or a local model directory
 - `quantize()` / `dequantize()` — conversion between f32 and quantized formats
 - `cosine_similarity_quantized()` — compute cosine directly on quantized bytes (XOR + popcount for binary)
 
 The engine is integrated into `CollectionInner` and invoked during `insert()`, `update_one/many()`, and `replace_one()`. For queries, `.semantic()` on `Query` and the updated `.hybrid_search()` (with `None` query_vector) trigger auto-embedding.
+
+**Embedding batches are token-budgeted (v1.2.2).** `batch_size` is a cap on
+document count (default 32), but ONNX memory follows `batch × padded sequence
+length`, not count alone. `max_batch_tokens` (default **8192**) caps that
+product, holding voyage-4-nano inference to roughly 2.5 GiB even when a corpus
+contains long documents. MooFile plans batches longest-first so a single long
+text does not inflate padding for otherwise short texts. Both knobs are exposed
+in every binding and apply to bulk `insert_many()` and `reembed()`.
 
 ### Atomic Batch Writes
 
@@ -718,13 +727,16 @@ Fallback: pure-Python wheel (`moofile-x.y.z-py3-none-any.whl`) for platforms wit
 | 0.2.0 | Vector similarity search (cosine), BM25 text search (Porter stemming), CLI tools |
 | 0.3.0 | **Rust core** — PyO3 binding, 2-24× faster, Arc-backed documents |
 | 0.4.0 | **Hybrid search (RRF)**. **Atomic batch writes**. **Disposable index snapshot cache** |
-| 0.5.0 | **On-device autoembedding** — local GGUF models via `llama-gguf`. `.semantic()` method (engine replaced by fastembed/ONNX in 1.1) |
+| 0.5.0 | **On-device autoembedding** — local GGUF models via `llama-gguf`. `.semantic()` method (engine replaced by ONNX in 1.1) |
 | 0.5.1 | `hybrid_search` type fix, dead code removal, API guard tests |
 | 0.5.2 | **Concurrent multi-process access** — brief exclusive lock per write, not lifetime hold |
 | 0.5.3 | Multi-process safety, full BSON type support, `_id` enforcement, performance fixes |
 | 0.6.0 | **Language bindings** — C, C++, Node.js, Go, Java, C# all consuming the same C shared library. **BSON normalisation** — all documents round-tripped through BSON encode/decode on write. **`InvalidIdError`/`InvalidFilterError`** — structured errors for non-string `_id` and malformed filters. **Cross-backend parity tests** — 8 automated scenarios validated across Python (pure), Python (Rust native), and C (shared library) |
-| **1.1.0** | **Autoembedding moved from GGUF/`llama-gguf` to ONNX/`fastembed`** — ~7 s → ~4 ms per embed, default model `BAAI/bge-small-en-v1.5` (384 dims). **Dimension guard** — a vector index whose width no longer matches the model is disabled rather than silently returning nothing, with `reembed()` as the recovery path. **Batched `insert_many` embedding** (4.8×). `reembed()` added to all seven bindings |
+| **1.1.0** | **Autoembedding moved from GGUF/`llama-gguf` to ONNX** — ~7 s → ~4 ms per embed with the then-default `BAAI/bge-small-en-v1.5` (384 dims). **Dimension guard** — a vector index whose width no longer matches the model is disabled rather than silently returning nothing, with `reembed()` as the recovery path. **Batched `insert_many` embedding** (4.8×). `reembed()` added to all seven bindings |
 | **1.1.1** | **Wheel build fix** — Linux wheels now built with `manylinux_2_28` (GCC 12) instead of `2_17` (GCC 4.9-era). Fixes a segfault on hosts with a modern libstdc++: old-compiled `std::regex` (used by ONNX Runtime's device discovery) null-deref'd inside `regex_traits::transform` when loading an `auto_embed` model |
+| **1.2.0** | **Autoembedding now uses voyage-4-nano** through the dedicated `v4nano-embed` ONNX runner. The built-in model is 2048-dimensional with MRL truncation to 1024/512/256; `model` is optional and local ONNX model directories are supported. |
+| **1.2.1** | Windows build fix: disabled tokenizers' default `esaxx_fast` feature to avoid its `/MT` CRT conflicting with ONNX Runtime's `/MD` binaries. |
+| **1.2.2** | **Text search indexes digits, compound identifiers, and array fields.** Cache format bumped so affected indexes rebuild. **Embedding batches are bounded by `max_batch_tokens`** (default 8192) and planned longest-first to prevent long documents from exhausting memory. |
 
 ---
 

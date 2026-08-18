@@ -94,7 +94,7 @@ MooFile's API looks like MongoDB but has important differences that can trip up 
 - **update_one/replace_one are strict**: Raise `DocumentNotFoundError` if no match (MongoDB silently no-ops)
 - **delete_one returns bool**: Returns `True`/`False`, NOT a result object like MongoDB
 - **Vector/text search return tuples**: `[(doc, score), ...]` NOT plain document lists like `find()`
-- **Single-threaded writes**: Concurrent writes from multiple threads are not protected — serialise writes at the application layer. (Cross-process concurrent access: Python backend uses blocking `flock(LOCK_EX)` to wait; Rust backend raises `ConcurrentAccessError`.)
+- **Writes are serialized**: a brief advisory file lock covers each cross-process write. Handles reconcile appended records before reads, so the intended deployment is one writer with many readers; many writers queue rather than scale linearly.
 - **No nested field indexes**: Only top-level fields can be indexed (no `"user.name"` paths)
 - **No joins or $lookup**: No cross-document references or aggregation pipelines
 - **No async API**: All operations are synchronous
@@ -110,11 +110,11 @@ A MooFile database is three files (plus an optional cache):
 ```
 users.bson        ← append-only document store, source of truth
 users.bson.meta   ← index configuration (JSON, human-readable)
-users.bson.lock   ← advisory lock file (prevents concurrent multi-process access)
+users.bson.lock   ← advisory lock file (serializes cross-process writes)
 users.bson.cache  ← disposable index snapshot (optional, accelerates cold opens)
 ```
 
-The `.lock` file is disposable — safe to delete, re-created on next open. It serialises cross-process write access: the Python backend uses blocking `flock(LOCK_EX)` (waits for the other process), while the Rust backend raises `ConcurrentAccessError`.
+The `.lock` file is disposable — safe to delete, re-created on next open. An exclusive advisory lock is held only for each write; readers and other handles reconcile appended records before using their in-memory indexes. Multiple processes may keep a collection open, although many simultaneous writers queue.
 
 The `.meta` file is a small JSON file:
 
@@ -489,9 +489,10 @@ title_results = db.find({}).text_search("title", "introduction").to_list()
 **Text search features:**
 - BM25 scoring algorithm with stemming (higher scores = more relevant)
 - Porter stemming handles word variations ("running" matches "run", "runs")
-- Tokenizes on word boundaries, ignores punctuation
+- Tokenizes words, digits, and compound identifiers such as `llama.cpp`, `x86-64-v3`, and `595.71.05`; compounds are also searchable by their parts
+- Array fields are flattened (including nested arrays) and indexed as multi-valued text; scalar elements are stringified
 - Pre-filtering with `.find()` conditions is supported
-- Only processes string fields (non-strings are ignored)
+- Numeric and boolean scalar elements in arrays are stringified; other values are ignored
 
 ---
 
@@ -569,6 +570,8 @@ db = Collection("docs.bson",
             "target": "embedding",                # target vector field
             "dims": 2048,                         # embedding dimensions (2048/1024/512/256)
             "max_length": 1024,                   # tokenizer cap (default 1024, max 32768)
+            "batch_size": 32,                      # document-count cap per inference pass
+            "max_batch_tokens": 8192,              # padded-token budget; bounds peak RAM
             "precision": "int8",                  # "f32" | "int8" | "uint8" | "binary"
             "normalize": True,
             "query_prefix": "Represent the query for retrieving supporting documents: ",
@@ -605,6 +608,13 @@ to 1–32768). It is a memory guard as much as a knob: the export materializes a
 `[1, 16, T, T]` attention mask, so memory is 16·T²·4 bytes — 1024 tokens is 67 MB and
 ~0.7 s, but 32k needs ~64 GB and fails with a clean embedding error. Raise it only for
 whole-document embedding on hardware that can afford it.
+
+`batch_size` (default **32**) caps document count for bulk `insert_many()` and
+`reembed()`. `max_batch_tokens` (default **8192**) also caps
+`batch × padded sequence length`, which is what drives inference memory.
+MooFile plans longest-first batches and honors both limits: short texts retain
+wide batches, while long texts cannot make a batch exceed the memory budget.
+The default budget holds voyage-4-nano inference to roughly 2.5 GiB.
 
 **On insert/update/replace:** if a document has a source text field, MooFile automatically generates the embedding and stores it in the target field:
 
@@ -772,7 +782,7 @@ from moofile import (
     DuplicateKeyError,       # _id conflict on insert
     DocumentNotFoundError,   # update_one / replace_one with no match
     ReadOnlyError,           # write attempted on read-only collection
-    ConcurrentAccessError,   # Rust: raised on concurrent process access; Python: blocks via flock
+    ConcurrentAccessError,   # retained for compatibility; not raised by current multi-process access
     InvalidIdError,          # non-string _id provided
     InvalidFilterError,      # malformed query filter
 )
@@ -833,15 +843,13 @@ On open, MooFile first tries to load a disposable index snapshot from `mydata.bs
 
 If the file is truncated mid-write (crash during a write), MooFile detects and removes the incomplete trailing record on the next open. You lose at most the last in-flight write; all prior records are safe.
 
-On open, MooFile also acquires an advisory lock on `mydata.bson.lock` (exclusive for writers, shared for read-only opens) to detect and reject concurrent multi-process access.
+Each write briefly takes an exclusive advisory lock on `mydata.bson.lock`. Handles detect file growth and replay the appended suffix before operations; a shrink or inode replacement (for example after compaction) causes a full reload. This permits the SQLite-style one-writer/many-reader deployment shape, but does not provide cross-process transactions or a stable read snapshot.
 
 ---
 
 ## Thread Safety & Concurrency
 
-Within a single process, MooFile is single-threaded for writes — concurrent writes from multiple threads are not protected, so serialise writes at the application layer if needed. Concurrent reads from multiple threads are safe.
-
-Across processes, MooFile serialises write access via an advisory lock on `mydata.bson.lock`. The **Python backend** uses blocking `flock(LOCK_EX)` (a second writer waits until the first finishes). The **Rust backend** detects concurrent access and raises `ConcurrentAccessError`. Multiple read-only opens are allowed (shared lock); a writer takes an exclusive lock. One writer **or** multiple readers, never both.
+Within one process, the Rust core guards a collection handle; writes are serialized. Across processes, an exclusive advisory lock is taken only for a write, which covers matching, append, and index mutation. Readers reconcile the append-only suffix before operations, so long-lived handles converge on writes from other processes. The intended topology is one writer with many readers; multiple writers are safe but queue. There are no cross-process transactions, snapshot isolation, or stable read views within an operation.
 
 ---
 
@@ -849,7 +857,7 @@ Across processes, MooFile serialises write access via an advisory lock on `mydat
 
 - No server or network interface
 - No replication or clustering
-- No multi-process concurrent writes — Python backend blocks via `flock`; Rust backend raises `ConcurrentAccessError`
+- No multi-writer scaling — multi-process writes are safe but serialized by a file lock
 - No `$lookup` / joins
 - No nested field indexes
 - No async API
