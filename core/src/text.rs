@@ -206,13 +206,48 @@ impl TextIndex {
 fn tokenize_and_stem(stemmer: &Stemmer, text: &str) -> Vec<String> {
     // Compiled once: this runs for every document indexed and every query,
     // and recompiling the regex each call dominated tokenisation cost.
+    //
+    // The pattern keeps digits and holds compound identifiers together across
+    // internal `.`, `-` and `_`, so `v1.2.0`, `595.71.05`, `14900K`,
+    // `llama.cpp` and `x86-64-v3` survive as single terms.  An earlier
+    // `[a-zA-Z]+` dropped every digit, which made version strings, driver
+    // revisions and part numbers unsearchable -- and made two different
+    // versions of the same product tokenize identically.
     static TOKEN_RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
-    let re = TOKEN_RE.get_or_init(|| regex_lite::Regex::new(r"[a-zA-Z]+").unwrap());
-    re.find_iter(text)
-        .map(|m| m.as_str().to_lowercase())
-        .filter(|t| t.len() > 1)
-        .map(|t| stemmer.stem(&t).into_owned())
-        .collect()
+    let re = TOKEN_RE.get_or_init(|| {
+        regex_lite::Regex::new(r"[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*").unwrap()
+    });
+
+    let mut out = Vec::new();
+    for m in re.find_iter(text) {
+        let whole = m.as_str().to_lowercase();
+
+        // A compound also yields its parts, so `llama.cpp` is reachable by
+        // `llama`, and `x86-64-v3` by `x86` or `v3`.  This also preserves the
+        // pre-1.2.2 behaviour for alphabetic compounds, which the old regex
+        // split on punctuation.
+        let has_sep = whole.contains(['.', '-', '_']);
+        if has_sep {
+            for part in whole.split(['.', '-', '_']).filter(|p| p.len() > 1) {
+                out.push(stem_term(stemmer, part));
+            }
+        }
+
+        if whole.len() > 1 {
+            out.push(stem_term(stemmer, &whole));
+        }
+    }
+    out
+}
+
+/// Stem alphabetic terms only.  Porter is defined over words; running it on
+/// `14900k` or `1.2.0` mangles identifiers to no benefit.
+fn stem_term(stemmer: &Stemmer, term: &str) -> String {
+    if term.bytes().all(|b| b.is_ascii_alphabetic()) {
+        stemmer.stem(term).into_owned()
+    } else {
+        term.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +257,53 @@ fn tokenize_and_stem(stemmer: &Stemmer, text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digits_are_indexed_and_discriminate() {
+        let mut ti = TextIndex::new();
+        ti.add_document("a".into(), "moofile v1.2.0 released with voyage-4-nano as the default");
+        ti.add_document("b".into(), "moofile v0.3.0 rust core rewrite monorepo pyo3");
+        ti.add_document("c".into(), "behopc upgraded to the Intel 14900K arrow lake cpu");
+        ti.add_document("d".into(), "nvidia driver 595.71.05 suspend resume monitors stay black");
+
+        // Bare identifiers used to tokenize to nothing at all.
+        assert_eq!(ti.search("14900K", 5)[0].0, "c");
+        assert_eq!(ti.search("595.71.05", 5)[0].0, "d");
+
+        // Two versions of the same product must not rank identically.
+        assert_eq!(ti.search("moofile v1.2.0", 5)[0].0, "a");
+        assert_eq!(ti.search("moofile v0.3.0", 5)[0].0, "b");
+    }
+
+    #[test]
+    fn compounds_are_reachable_by_their_parts() {
+        let mut ti = TextIndex::new();
+        ti.add_document("a".into(), "built llama.cpp with CUDA on behoserver");
+        ti.add_document("b".into(), "behothinkpad is x86-64-v3 compatible, not v4");
+
+        // The whole compound, and each part of it.
+        assert_eq!(ti.search("llama.cpp", 5)[0].0, "a");
+        assert_eq!(ti.search("llama", 5)[0].0, "a");
+        assert_eq!(ti.search("x86-64-v3", 5)[0].0, "b");
+        assert_eq!(ti.search("x86", 5)[0].0, "b");
+    }
+
+    #[test]
+    fn digit_bearing_terms_are_not_stemmed() {
+        let stemmer = Stemmer::create(Algorithm::English);
+        // Porter is defined over words; identifiers must pass through intact.
+        assert_eq!(stem_term(&stemmer, "14900k"), "14900k");
+        assert_eq!(stem_term(&stemmer, "1.2.0"), "1.2.0");
+        // ...while ordinary words still stem.
+        assert_eq!(stem_term(&stemmer, "running"), "run");
+    }
+
+    #[test]
+    fn single_characters_are_still_dropped() {
+        let stemmer = Stemmer::create(Algorithm::English);
+        let toks = tokenize_and_stem(&stemmer, "a b 5 of it");
+        assert!(toks.iter().all(|t| t.len() > 1), "got {toks:?}");
+    }
 
     #[test]
     fn stemming_english() {

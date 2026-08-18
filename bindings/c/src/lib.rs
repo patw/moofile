@@ -335,6 +335,12 @@ pub extern "C" fn moofile_open(
                 if let Some(dims) = obj.get("dims").and_then(|v| v.as_u64()) {
                     ae_config.dims = dims as usize;
                 }
+                if let Some(bs) = obj.get("batch_size").and_then(|v| v.as_u64()) {
+                    ae_config.batch_size = bs as usize;
+                }
+                if let Some(mbt) = obj.get("max_batch_tokens").and_then(|v| v.as_u64()) {
+                    ae_config.max_batch_tokens = mbt as usize;
+                }
                 if let Some(ml) = obj.get("max_length").and_then(|v| v.as_u64()) {
                     ae_config.max_length = ml as usize;
                 }

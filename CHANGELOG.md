@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.2.2 (2026-08-18)
+
+### Text analyzer: digits are indexed, arrays are no longer skipped (re-index)
+
+Two silent defects in the inverted index, both found by an accuracy audit of a
+439-document corpus.
+
+- **Digits were discarded.** The tokenizer matched `[a-zA-Z]+` and dropped
+  single characters, so no numeric token ever reached the index or a query.
+  `14900K` and `595.71.05` returned *zero* results against a corpus that
+  contained both; `moofile v1.2.0` and `moofile v0.3.0` produced byte-identical
+  queries and therefore identical rankings. The pattern is now
+  `[a-zA-Z0-9]+(?:[._-][a-zA-Z0-9]+)*`, which also holds compound identifiers
+  (`llama.cpp`, `x86-64-v3`) together; a compound additionally emits its parts,
+  so `llama` still finds `llama.cpp`. Porter stemming is now applied only to
+  purely alphabetic terms — it mangled identifiers to no benefit.
+- **Array fields were never indexed.** The add path matched `Bson::String`
+  only, so declaring a text index on an array field built an empty index in
+  silence and every search against it returned nothing. Arrays are now squashed
+  into one space-joined string and indexed like any other field (as Lucene does
+  for multi-valued fields); nested arrays flatten, and numeric elements are
+  stringified so they stay searchable.
+
+Measured on the audit corpus, the previously-broken query classes go from no
+results to the correct document at rank 1, while ordinary prose queries are
+unchanged (Recall@5 0.880 → 0.900, NDCG@5 0.871 → 0.875 on a 25-query set).
+
+**This changes index contents, not the cache layout**, so `CACHE_VERSION` is
+bumped 2 → 3: a stale cache would otherwise load happily and keep serving the
+old token set. Existing collections rebuild their index on next open. No
+document data is touched and no migration is required.
+
+### Embedding memory is now bounded by a token budget, not a document count
+
+Re-embedding a few hundred ordinary documents could OOM a 16 GB machine.
+`batch_size` defaulted to 32 documents, and peak inference memory tracks
+`batch x padded_sequence_length` — so the peak depended entirely on how long
+the caller's documents happened to be. Measured on voyage-4-nano, the model
+weights are ~170 MiB while a batch of 32 x 1024 tokens peaks at **~9.2 GiB**
+(scaling close to linearly: ~285 MiB per document at full sequence length).
+
+- New `max_batch_tokens` (default **8192**) caps `batch x padded_len`, holding
+  inference to roughly 2.5 GiB regardless of document length. `batch_size`
+  remains as a count cap and still applies, so short documents keep batching
+  widely and lose no throughput.
+- Batches are now assembled **longest-first**. The tokenizer pads to the
+  longest member, so one long document in an otherwise short batch previously
+  inflated every row to its width.
+- **`batch_size` and `max_batch_tokens` are now settable from the bindings.**
+  Both were reachable only from Rust, which left Python and C callers with no
+  way to cap a re-embed at all.
+
+
 ## v1.2.1 (2026-08-16)
 
 ### Windows CI/CD fix: drop tokenizers default features (esaxx-rs CRT mismatch)

@@ -24,11 +24,17 @@ use bson::Document;
 use crate::index::{IndexManager, Value};
 use crate::text::TextIndex;
 
-/// Cache format version — bump when the serialised layout changes.
-/// Old caches with a different version are silently rejected.
+/// Cache format version — bump when the serialised layout **or the meaning of
+/// its contents** changes.  Old caches with a different version are silently
+/// rejected and rebuilt from the documents.
 ///   1 -> 2: `index::Value` gained DateTime/ObjectId variants, which changes
 ///           the bincode discriminants of every indexed value.
-const CACHE_VERSION: u32 = 2;
+///   2 -> 3: the text analyzer changed — digits are no longer discarded and
+///           array fields are indexed instead of skipped.  The layout is
+///           identical, so a stale cache would load happily and keep serving
+///           the old token set; only the version bump forces the rebuild that
+///           makes the new analyzer take effect.
+const CACHE_VERSION: u32 = 3;
 
 /// Magic bytes at the start of every cache file, so we can quickly reject
 /// non-cache files (e.g. a pickle written by the Python implementation).

@@ -119,9 +119,9 @@ impl IndexManager {
             }
         }
         for field in &self.text_fields {
-            if let Some(bson::Bson::String(text)) = doc.get(field) {
+            if let Some(text) = doc.get(field).and_then(text_index_value) {
                 if let Some(ti) = self.text_indexes.get_mut(field) {
-                    ti.add_document(_id.clone(), text);
+                    ti.add_document(_id.clone(), &text);
                 }
             }
         }
@@ -470,6 +470,30 @@ fn is_operator_doc(val: &bson::Bson) -> bool {
     matches!(val, bson::Bson::Document(d) if d.keys().any(|k| k.starts_with('$')))
 }
 
+/// Flatten a BSON value into the text an inverted index should see.
+///
+/// Strings index as themselves.  Arrays are squashed into one space-joined
+/// string and indexed like any other field, which is what Lucene does for
+/// multi-valued fields -- previously an array field matched
+/// `Bson::String` and was skipped, so declaring a text index on `tags` built
+/// an empty index in silence and every search against it returned nothing.
+/// Nested arrays flatten recursively; non-textual scalars are stringified so
+/// numeric tags stay searchable.
+fn text_index_value(val: &bson::Bson) -> Option<String> {
+    match val {
+        bson::Bson::String(s) => Some(s.clone()),
+        bson::Bson::Array(arr) => {
+            let parts: Vec<String> = arr.iter().filter_map(text_index_value).collect();
+            if parts.is_empty() { None } else { Some(parts.join(" ")) }
+        }
+        bson::Bson::Int32(i) => Some(i.to_string()),
+        bson::Bson::Int64(i) => Some(i.to_string()),
+        bson::Bson::Double(f) => Some(f.to_string()),
+        bson::Bson::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 fn bson_to_value(v: &bson::Bson) -> Option<Value> {
     match v {
         bson::Bson::Null => Some(Value::Null), bson::Bson::Boolean(b) => Some(Value::Bool(*b)),
@@ -488,6 +512,43 @@ mod tests {
     fn m() -> IndexManager {
         IndexManager::new(&["email".into(),"age".into()], &[("embedding".into(),3)], &["content".into()])
     }
+    fn mt() -> IndexManager {
+        IndexManager::new(&[], &[], &["tags".into(), "content".into()])
+    }
+
+    #[test]
+    fn array_fields_are_text_indexed() {
+        // Declaring a text index on an array field used to build an empty
+        // index in silence: the add path matched Bson::String only.
+        let mut im = mt();
+        im.add(doc!{"_id":"a","tags":["gaming","grim-dawn","ritualist"]});
+        im.add(doc!{"_id":"b","tags":["kubernetes","helm"]});
+
+        assert_eq!(im.text_search("tags","gaming",5).len(), 1);
+        assert_eq!(im.text_search("tags","gaming",5)[0].0.get_str("_id").unwrap(), "a");
+        assert_eq!(im.text_search("tags","helm",5)[0].0.get_str("_id").unwrap(), "b");
+        // Multi-valued fields squash to one string, so any element matches.
+        assert_eq!(im.text_search("tags","ritualist",5)[0].0.get_str("_id").unwrap(), "a");
+    }
+
+    #[test]
+    fn array_text_index_survives_removal() {
+        let mut im = mt();
+        im.add(doc!{"_id":"a","tags":["alpha","beta"]});
+        im.add(doc!{"_id":"b","tags":["alpha"]});
+        assert_eq!(im.text_search("tags","alpha",5).len(), 2);
+        im.remove("a");
+        assert_eq!(im.text_search("tags","alpha",5).len(), 1);
+    }
+
+    #[test]
+    fn non_string_scalars_index_as_text() {
+        let mut im = mt();
+        im.add(doc!{"_id":"a","tags":["release", 2026i32]});
+        // Numeric elements are stringified, so they stay searchable.
+        assert_eq!(im.text_search("tags","2026",5).len(), 1);
+    }
+
     #[test] fn exact_lookup() {
         let mut im = m(); im.add(doc!{"_id":"a","email":"a@b.com","age":30}); im.add(doc!{"_id":"b","email":"c@d.com","age":25}); im.add(doc!{"_id":"c","email":"a@b.com","age":30});
         assert_eq!(im.lookup_exact_ids("email",&bson::Bson::String("a@b.com".into())), Some(vec!["a".into(),"c".into()]));

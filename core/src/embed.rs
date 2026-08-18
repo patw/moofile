@@ -166,8 +166,23 @@ pub struct AutoEmbedConfig {
     /// embedding is quadratic in memory (16·T²·4 B for the attention mask), so
     /// raise this only for the rare whole-document case.
     pub max_length: usize,
-    /// Maximum batch size for embedding (1 = one at a time)
+    /// Maximum batch size for embedding (1 = one at a time).  This is a cap
+    /// on document *count*; `max_batch_tokens` usually binds first.
     pub batch_size: usize,
+    /// Memory budget for one forward pass, in padded token slots
+    /// (`batch x padded_sequence_length`).
+    ///
+    /// Peak RSS during inference is dominated by this product, not by the
+    /// model weights: measured on voyage-4-nano the weights are ~170 MiB
+    /// while a batch of 32 x 1024 tokens peaks at ~9.2 GiB.  Batching purely
+    /// by document count made that peak depend on how long the caller's
+    /// documents happened to be, which is how a re-embed of a few hundred
+    /// ordinary documents could OOM a 16 GB machine.  Budgeting by token
+    /// slots instead bounds the peak no matter what the corpus looks like:
+    /// long documents get small batches, short ones get large batches.
+    ///
+    /// The default of 8192 slots holds inference to roughly 2.5 GiB.
+    pub max_batch_tokens: usize,
 }
 
 /// The default model: voyage-4-nano, 180M + 160M params, 2048 dims, 32k
@@ -191,6 +206,7 @@ impl Default for AutoEmbedConfig {
             doc_prefix: String::new(),
             max_length: 1024,
             batch_size: 32,
+            max_batch_tokens: 8192,
         }
     }
 }
@@ -362,6 +378,59 @@ fn ensure_model_files(cache_dir: &Path) -> Result<(PathBuf, PathBuf), MooFileErr
 // ---------------------------------------------------------------------------
 // Quantization helpers
 // ---------------------------------------------------------------------------
+
+/// Group texts into batches that respect both the count cap and the token
+/// budget, longest first.
+///
+/// Returns batches of indices into `texts`.  Two things matter here:
+///
+/// * **Sorting by length.** The tokenizer pads to the longest member of a
+///   batch, so one long document in an otherwise short batch inflates every
+///   row to its width.  Sorting groups similar lengths together, which cuts
+///   both wasted compute and wasted memory.
+/// * **Budgeting by `batch x padded_len`.** That product is what inference
+///   memory tracks.  Because the batch is built longest-first, the first
+///   member's length *is* the padded width, so the budget can be enforced
+///   exactly rather than guessed.
+pub(crate) fn plan_batches(
+    texts: &[String],
+    config: &AutoEmbedConfig,
+) -> Vec<Vec<usize>> {
+    let count_cap = config.batch_size.max(1);
+    let token_budget = config.max_batch_tokens.max(1);
+
+    // Token count is estimated from bytes rather than by running the
+    // tokenizer: this only decides batch shape, and over-estimating is the
+    // safe direction (smaller batches).  3 bytes/token is deliberately
+    // pessimistic -- technical prose with identifiers and punctuation
+    // tokenizes far worse than the ~4 bytes/token of ordinary English.
+    let est = |i: usize| (texts[i].len() / 3 + 2).clamp(1, config.max_length.max(1));
+
+    let mut order: Vec<usize> = (0..texts.len()).collect();
+    order.sort_by(|&a, &b| est(b).cmp(&est(a)).then_with(|| a.cmp(&b)));
+
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut width = 0usize;
+
+    for i in order {
+        // Longest-first means the running width can only be set by the first
+        // member, so it never grows once the batch has started.
+        let w = if current.is_empty() { est(i) } else { width };
+        let fits = current.len() < count_cap && (current.len() + 1) * w <= token_budget;
+        if !current.is_empty() && !fits {
+            batches.push(std::mem::take(&mut current));
+            width = est(i);
+        } else if current.is_empty() {
+            width = w;
+        }
+        current.push(i);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
 
 /// Quantize an f32 embedding vector to the specified precision.
 pub fn quantize(emb: &[f32], precision: EmbeddingPrecision) -> Vec<u8> {
@@ -556,5 +625,81 @@ mod resolve_tests {
     #[test]
     fn model_dims_are_2048() {
         assert_eq!(MODEL_DIMS, 2048);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn cfg(batch_size: usize, max_batch_tokens: usize) -> AutoEmbedConfig {
+        AutoEmbedConfig { batch_size, max_batch_tokens, ..Default::default() }
+    }
+
+    fn texts(byte_lens: &[usize]) -> Vec<String> {
+        byte_lens.iter().map(|&n| "x".repeat(n)).collect()
+    }
+
+    /// Every index appears exactly once, or a re-embed would silently skip or
+    /// double-write documents.
+    #[test]
+    fn batches_partition_the_input() {
+        let t = texts(&[10, 3000, 50, 900, 12, 4000, 77, 2100]);
+        let mut seen: Vec<usize> = plan_batches(&t, &cfg(32, 8192)).concat();
+        seen.sort();
+        assert_eq!(seen, (0..t.len()).collect::<Vec<_>>());
+    }
+
+    /// The whole point: batch x padded width stays under budget, so peak
+    /// inference memory does not depend on how long the corpus happens to be.
+    #[test]
+    fn token_budget_is_respected() {
+        let budget = 4096;
+        // 3 KB of text ~= 1024 estimated tokens, the max_length cap.
+        let t = texts(&[3000; 40]);
+        let batches = plan_batches(&t, &cfg(32, budget));
+        for b in &batches {
+            assert!(b.len() * 1024 <= budget, "batch of {} exceeds budget", b.len());
+        }
+        // 1024-token documents: 4 per batch at this budget, not 32.
+        assert!(batches.iter().all(|b| b.len() <= 4));
+    }
+
+    /// Short documents must still batch widely -- the budget should cost
+    /// throughput only where memory actually demands it.
+    #[test]
+    fn short_texts_still_fill_the_count_cap() {
+        let t = texts(&[30; 64]); // ~12 estimated tokens each
+        let batches = plan_batches(&t, &cfg(32, 8192));
+        assert_eq!(batches[0].len(), 32, "short docs should hit the count cap");
+    }
+
+    /// One long document must not drag a batch of short ones up to its width.
+    #[test]
+    fn long_and_short_are_not_mixed() {
+        let mut lens = vec![20usize; 30];
+        lens.push(3000);
+        let t = texts(&lens);
+        let batches = plan_batches(&t, &cfg(32, 8192));
+        let long_batch = batches.iter().find(|b| b.contains(&30)).unwrap();
+        assert!(long_batch.len() <= 8, "long doc batched with {} others", long_batch.len() - 1);
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(plan_batches(&[], &cfg(32, 8192)).is_empty());
+    }
+
+    /// Degenerate settings must not produce a zero-sized batch and spin.
+    #[test]
+    fn tiny_budget_still_makes_progress() {
+        let t = texts(&[100_000; 3]);
+        let batches = plan_batches(&t, &cfg(32, 1));
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|b| b.len() == 1));
     }
 }

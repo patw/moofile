@@ -63,10 +63,12 @@ fn py_auto_embed_config(
         if !matches!(
             key.as_str(),
             "model" | "target" | "dims" | "precision" | "normalize" | "query_prefix" | "doc_prefix" | "max_length"
+                | "batch_size" | "max_batch_tokens"
         ) {
             return Err(err(format!(
                 "auto_embed['{source_field}']: unknown key '{key}' (expected one of: \
-                 model, target, dims, precision, normalize, query_prefix, doc_prefix, max_length)"
+                 model, target, dims, precision, normalize, query_prefix, doc_prefix, \
+                 max_length, batch_size, max_batch_tokens)"
             )));
         }
     }
@@ -88,6 +90,15 @@ fn py_auto_embed_config(
     }
     if let Some(v) = cfg.get_item("max_length")? {
         out.max_length = v.extract()?;
+    }
+    // Both batching knobs bound peak memory during embedding; see
+    // AutoEmbedConfig::max_batch_tokens.  They were previously reachable only
+    // from Rust, which left Python callers with no way to cap a re-embed.
+    if let Some(v) = cfg.get_item("batch_size")? {
+        out.batch_size = v.extract()?;
+    }
+    if let Some(v) = cfg.get_item("max_batch_tokens")? {
+        out.max_batch_tokens = v.extract()?;
     }
     if let Some(v) = cfg.get_item("precision")? {
         let p: String = v.extract()?;

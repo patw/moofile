@@ -1030,7 +1030,6 @@ impl Collection {
         // The model's true width wins over `config.dims`, except where dims
         // asks for a narrower MRL truncation.
         let width = config.dims.min(engine.dims());
-        let batch_size = config.batch_size.max(1);
 
         let count = inner.with_write_lock(|inner| {
             let targets: Vec<(String, String)> = inner
@@ -1046,14 +1045,22 @@ impl Collection {
                 .collect();
 
             let mut done = 0usize;
-            for chunk in targets.chunks(batch_size) {
-                let texts: Vec<String> = chunk
-                    .iter()
-                    .map(|(_, t)| format!("{}{}", config.doc_prefix, t))
-                    .collect();
+            // Batch by token budget, not document count: see
+            // `AutoEmbedConfig::max_batch_tokens`.  A whole-corpus re-embed is
+            // the one place where a caller hands us hundreds of arbitrarily
+            // long documents at once, so it is also where a count-based batch
+            // size turns into an OOM.
+            let prefixed: Vec<String> = targets
+                .iter()
+                .map(|(_, t)| format!("{}{}", config.doc_prefix, t))
+                .collect();
+
+            for chunk in embed::plan_batches(&prefixed, &config) {
+                let texts: Vec<String> = chunk.iter().map(|&i| prefixed[i].clone()).collect();
                 let embeddings = engine.embed_batch(texts)?;
 
-                for ((id, _), raw) in chunk.iter().zip(embeddings) {
+                for (&idx, raw) in chunk.iter().zip(embeddings) {
+                    let (id, _) = &targets[idx];
                     // The document may have changed under us between the scan
                     // and here only if another writer held the lock, which
                     // with_write_lock rules out — but it may simply be gone.
@@ -1275,19 +1282,20 @@ impl CollectionInner {
                 .map(|(i, _)| i)
                 .collect();
 
-            for chunk in positions.chunks(config.batch_size.max(1)) {
-                let texts: Vec<String> = chunk
-                    .iter()
-                    .map(|&i| match docs[i].get(source_field) {
-                        Some(Bson::String(t)) => format!("{}{}", config.doc_prefix, t),
-                        _ => unreachable!("positions only holds string fields"),
-                    })
-                    .collect();
+            let prefixed: Vec<String> = positions
+                .iter()
+                .map(|&i| match docs[i].get(source_field) {
+                    Some(Bson::String(t)) => format!("{}{}", config.doc_prefix, t),
+                    _ => unreachable!("positions only holds string fields"),
+                })
+                .collect();
 
+            for chunk in embed::plan_batches(&prefixed, config) {
+                let texts: Vec<String> = chunk.iter().map(|&i| prefixed[i].clone()).collect();
                 let embeddings = engine.embed_batch(texts)?;
-                for (&i, raw) in chunk.iter().zip(embeddings) {
+                for (&pi, raw) in chunk.iter().zip(embeddings) {
                     let arr = finalize_embedding(raw, width, config);
-                    docs[i].insert(&config.target_field, Bson::Array(arr));
+                    docs[positions[pi]].insert(&config.target_field, Bson::Array(arr));
                 }
             }
         }
