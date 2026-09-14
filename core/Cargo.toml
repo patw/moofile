@@ -36,6 +36,13 @@ v4nano-embed = { path = "../v4nano-embed", optional = true }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"], optional = true }
 dirs = "6"
 
+# `malloc_trim` is a glibc extension used to hand freed heap arenas back to
+# the OS after a collection open, which can transiently allocate large
+# buffers (the disposable index cache read, a cold BSON scan). Only pulled
+# in on the one target where it's meaningful.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [features]
 # Autoembedding: on-device ONNX inference (voyage-4-nano) plus HuggingFace
 # model downloads. On by default. `--no-default-features` drops the embedding

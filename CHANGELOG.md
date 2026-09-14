@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.2.3 (2026-09-14)
+
+### Opening a large collection peaked at roughly double its steady-state memory
+
+Found while chasing a downstream app (TheWatcher) whose systemd unit was
+consuming gigabytes of RSS against a ~170 MB data file. moofile keeps every
+live document decoded in RAM (`documents: BTreeMap<String, Arc<Document>>`
+with no paging), so that's expected to scale with document count — but
+*opening* a collection cost noticeably more than the index it built.
+
+- **`scan_file`/`scan_from` buffered the whole file before replaying it.**
+  Both returned a `Vec<Record>` holding every decoded record — live, dead,
+  and tombstones — and only after the full scan finished did the caller loop
+  over it to build the index. For the whole scan's duration, every document
+  existed twice: once in the scan `Vec`, once in the index. Measured against
+  a 638k-live/767k-total-record collection, this alone doubled peak RSS
+  during open (3811 MB peak vs. ~1900 MB actually retained). Load, catch-up,
+  full-reload, and reindex now stream through a new `scan_from_streaming`,
+  applying each record to the index as it's decoded and dropping it
+  immediately after — no second copy. `apply_record` also now takes the
+  record by value and moves its document into the index instead of cloning
+  it, cutting one more full-document allocation per record during replay.
+  `scan_file`/`scan_from` are kept as thin `Vec`-collecting wrappers around
+  the streaming core for callers that want a batch.
+- **glibc never returned the scan's freed arena to the OS.** Even after the
+  transient buffers above are dropped, `malloc_trim` is required to hand
+  freed heap back to the kernel — without it, RSS sits at its load-time peak
+  for the life of the process. `Collection::open` now calls `malloc_trim(0)`
+  once, after the cache load or BSON scan completes. Linux+glibc only
+  (`cfg(target_os = "linux", target_env = "gnu")`); a no-op elsewhere.
+
+Together these brought RSS after open on the collection above from 3735 MB
+down to 1965 MB, with no change to what ends up in the index — same
+document counts, same query results (`cargo test` — including the existing
+`scan_*` unit tests, unmodified — passes unchanged).
+
 ## v1.2.2 (2026-08-18)
 
 ### Text analyzer: digits are indexed, arrays are no longer skipped (re-index)

@@ -87,11 +87,13 @@ pub(crate) fn encode_record(record_type: u8, doc: &Document) -> Vec<u8> {
 ///
 /// Returns every complete record found and, if the file ends with a partial
 /// write, the byte offset where truncation should occur.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_file(path: &Path) -> Result<(Vec<Record>, Option<u64>), MooFileError> {
     scan_from(path, 0)
 }
 
-/// Scan a BSON file starting at `start` bytes.
+/// Scan a BSON file starting at `start` bytes, collecting every record into
+/// a `Vec`.
 ///
 /// The file format is append-only, so records written by another process
 /// after this handle last read are always a contiguous suffix.  That lets a
@@ -100,22 +102,49 @@ pub(crate) fn scan_file(path: &Path) -> Result<(Vec<Record>, Option<u64>), MooFi
 ///
 /// `start` must be a record boundary — pass an offset this handle has
 /// previously scanned up to.
+///
+/// This is a thin `Vec`-collecting wrapper around [`scan_from_streaming`]
+/// kept for tests and callers that genuinely want the whole batch at once.
+/// Hot paths that replay records straight into an index (open, catch-up,
+/// reindex) should call `scan_from_streaming` directly — collecting into a
+/// `Vec` first means every record briefly exists twice: once in the `Vec`,
+/// once in the index it's replayed into.  On a large collection that
+/// doubles the peak memory of a load for no benefit.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn scan_from(
     path: &Path,
     start: u64,
 ) -> Result<(Vec<Record>, Option<u64>), MooFileError> {
+    let mut records = Vec::new();
+    let truncate_to = scan_from_streaming(path, start, |record| records.push(record))?;
+    Ok((records, truncate_to))
+}
+
+/// Scan a BSON file starting at `start` bytes, invoking `on_record` for each
+/// complete record as it's decoded instead of buffering them.
+///
+/// Returns the byte offset to truncate at if the file ends with a partial
+/// write, or `None` if it ends cleanly. See [`scan_from`] for the semantics
+/// of `start`.
+pub(crate) fn scan_from_streaming<F>(
+    path: &Path,
+    start: u64,
+    mut on_record: F,
+) -> Result<Option<u64>, MooFileError>
+where
+    F: FnMut(Record),
+{
     let mut f = File::open(path).map_err(|e| errors::io_err(path, e))?;
     let file_len = f
         .metadata()
         .map_err(|e| errors::io_err(path, e))?
         .len();
 
-    let mut records = Vec::new();
     let mut buf = [0u8; HEADER_SIZE];
 
     // Nothing new (or an empty file) — return cleanly.
     if file_len == 0 || start >= file_len {
-        return Ok((records, None));
+        return Ok(None);
     }
 
     if start > 0 {
@@ -133,7 +162,7 @@ pub(crate) fn scan_from(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Partial header at end of file — truncate here.
-                return Ok((records, Some(offset)));
+                return Ok(Some(offset));
             }
             Err(e) => return Err(errors::io_err(path, e)),
         }
@@ -147,7 +176,7 @@ pub(crate) fn scan_from(
         // matches the Python implementation's behaviour.
         if payload_len > 100 * 1024 * 1024 {
             if offset + HEADER_SIZE as u64 + payload_len as u64 > file_len {
-                return Ok((records, Some(offset)));
+                return Ok(Some(offset));
             }
             return Err(MooFileError::CorruptRecord {
                 offset,
@@ -161,7 +190,7 @@ pub(crate) fn scan_from(
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 // Partial payload — truncate here.
-                return Ok((records, Some(offset)));
+                return Ok(Some(offset));
             }
             Err(e) => return Err(errors::io_err(path, e)),
         }
@@ -172,19 +201,22 @@ pub(crate) fn scan_from(
                 reason: format!("BSON decode failed: {e}"),
             })?;
 
-        records.push(Record {
+        // Compute before `on_record` consumes the record.
+        let at_end = offset + HEADER_SIZE as u64 + payload_len as u64 >= file_len;
+
+        on_record(Record {
             offset,
             record_type,
             doc,
         });
 
         // Guard against infinite loops on truncated files
-        if offset + HEADER_SIZE as u64 + payload_len as u64 >= file_len {
+        if at_end {
             break;
         }
     }
 
-    Ok((records, None))
+    Ok(None)
 }
 
 /// Rewrite the BSON file keeping only `live_docs`.

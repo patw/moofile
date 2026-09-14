@@ -75,6 +75,27 @@ pub(crate) fn engine_key(model: &str, max_length: usize) -> (String, usize) {
     (model.to_string(), max_length)
 }
 
+/// Hand freed heap arenas back to the OS.
+///
+/// Opening a large collection can transiently allocate big buffers that are
+/// then dropped — the disposable index cache's raw file read, or a cold
+/// BSON scan on a collection with many dead (deleted/replaced) records.
+/// glibc's allocator doesn't proactively return freed arenas to the kernel,
+/// so without this the process's RSS sits at its load-time peak for the
+/// rest of its life even once those buffers are gone — on a large
+/// collection that peak can be roughly double the memory actually retained
+/// by the index. `malloc_trim` is a glibc extension; this is a no-op
+/// everywhere else (e.g. musl, macOS).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn trim_heap() {
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn trim_heap() {}
+
 // ---------------------------------------------------------------------------
 // Batch buffer
 // ---------------------------------------------------------------------------
@@ -479,7 +500,7 @@ impl Collection {
             );
         }
 
-        Ok(Self {
+        let collection = Self {
             inner: Arc::new(RwLock::new(CollectionInner {
                 path: path.to_path_buf(),
                 readonly,
@@ -498,7 +519,14 @@ impl Collection {
                 embedding_engines,
                 disabled_vector_fields,
             })),
-        })
+        };
+
+        // The cache read and/or BSON scan above are done and their buffers
+        // dropped; give any freed arenas back to the OS now rather than
+        // carrying this open's peak for the collection's whole lifetime.
+        trim_heap();
+
+        Ok(collection)
     }
 
     // ------------------------------------------------------------------
@@ -1137,32 +1165,16 @@ impl Collection {
 
         inner.index_manager.clear();
 
-        let (records, truncate_to) = storage::scan_file(&path)?;
+        let mut total = 0u64;
+        let truncate_to = storage::scan_from_streaming(&path, 0, |record| {
+            total += 1;
+            apply_record(&mut inner.index_manager, record);
+        })?;
         if let Some(at) = truncate_to {
             if !readonly {
                 inner.storage.close();
                 storage::truncate(&path, at)?;
                 inner.storage.reopen()?;
-            }
-        }
-
-        let total = records.len() as u64;
-        for record in &records {
-            let _id = match record.doc.get("_id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-            match record.record_type {
-                RECORD_LIVE | RECORD_REPLACEMENT => {
-                    if inner.index_manager.get(&_id).is_some() {
-                        inner.index_manager.remove(&_id);
-                    }
-                    inner.index_manager.add(record.doc.clone());
-                }
-                RECORD_TOMBSTONE => {
-                    inner.index_manager.remove(&_id);
-                }
-                _ => {}
             }
         }
 
@@ -1429,11 +1441,12 @@ impl CollectionInner {
             return Ok(());
         }
 
-        let (records, partial) = storage::scan_from(&self.path, self.known_len)?;
-        for record in &records {
+        let mut new_records = 0u64;
+        let partial = storage::scan_from_streaming(&self.path, self.known_len, |record| {
+            new_records += 1;
             apply_record(&mut self.index_manager, record);
-        }
-        self.total_records += records.len() as u64;
+        })?;
+        self.total_records += new_records;
         // Resume from the start of any partial record next time.
         self.known_len = partial.unwrap_or(len);
         self.known_mtime_ns = mtime;
@@ -1447,12 +1460,13 @@ impl CollectionInner {
         // our fd refers to the unlinked old inode, so appends would be lost.
         self.storage.reopen()?;
         self.index_manager.clear();
-        let (records, partial) = storage::scan_file(&self.path)?;
-        for record in &records {
+        let mut total = 0u64;
+        let partial = storage::scan_from_streaming(&self.path, 0, |record| {
+            total += 1;
             apply_record(&mut self.index_manager, record);
-        }
+        })?;
         self.index_manager.rebuild_vector_indexes();
-        self.total_records = records.len() as u64;
+        self.total_records = total;
         let (len, mtime, ino) = self.file_state().unwrap_or((0, 0, 0));
         self.known_len = partial.unwrap_or(len);
         self.known_mtime_ns = mtime;
@@ -1656,7 +1670,11 @@ fn insert_locked_embedded(
 }
 
 /// Apply one scanned record to the index (last write wins per `_id`).
-fn apply_record(index_manager: &mut IndexManager, record: &storage::Record) {
+///
+/// Takes the record by value and moves its document straight into the
+/// index instead of cloning — the record is decoded fresh from the scan
+/// and discarded right after, so there's never a second reader of it.
+fn apply_record(index_manager: &mut IndexManager, record: storage::Record) {
     let _id = match record.doc.get("_id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
         None => return,
@@ -1666,7 +1684,7 @@ fn apply_record(index_manager: &mut IndexManager, record: &storage::Record) {
             if index_manager.get(&_id).is_some() {
                 index_manager.remove(&_id);
             }
-            index_manager.add(record.doc.clone());
+            index_manager.add(record.doc);
         }
         RECORD_TOMBSTONE => {
             index_manager.remove(&_id);
@@ -1687,35 +1705,22 @@ fn load_from_file(
         return Ok(0);
     }
 
-    let (records, truncate_to) = storage::scan_file(path)?;
+    // Stream records straight into the index as they're decoded, instead of
+    // collecting the whole file into a `Vec<Record>` first — on a large
+    // collection, buffering every record before replaying it doubled the
+    // peak memory of a cold start for no benefit (the `Vec` is dropped
+    // immediately after the loop below).
+    let mut total = 0u64;
+    let truncate_to = storage::scan_from_streaming(path, 0, |record| {
+        total += 1;
+        apply_record(index_manager, record);
+    })?;
 
     if let Some(at) = truncate_to {
         if !readonly {
             storage.close();
             storage::truncate(path, at)?;
             storage.reopen()?;
-        }
-    }
-
-    let total = records.len() as u64;
-
-    for record in &records {
-        let _id = match record.doc.get("_id").and_then(|v| v.as_str()) {
-            Some(id) => id.to_string(),
-            None => continue,
-        };
-
-        match record.record_type {
-            RECORD_LIVE | RECORD_REPLACEMENT => {
-                if index_manager.get(&_id).is_some() {
-                    index_manager.remove(&_id);
-                }
-                index_manager.add(record.doc.clone());
-            }
-            RECORD_TOMBSTONE => {
-                index_manager.remove(&_id);
-            }
-            _ => {}
         }
     }
 
