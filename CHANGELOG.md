@@ -1,5 +1,180 @@
 # Changelog
 
+## v1.2.4 (2026-09-14)
+
+Three more fixes from the same investigation as v1.2.3, benchmarked separately
+before landing (see each entry). Where v1.2.3 was an emergency stop-gap that
+halved *open-time peak* RSS, the third change below removes the steady-state
+cost of holding documents in memory — together they are the complete fix for
+the downstream app (TheWatcher) whose systemd unit was holding gigabytes of
+RSS against a ~170 MB data file.
+
+### `try_index` always used the first indexed filter field, regardless of selectivity
+
+`try_index` walked a multi-field filter document and returned candidates
+from whichever indexed field it hit *first*, in the filter's insertion
+order — with no regard for how selective that field's condition actually
+was. A filter like `{metric, timestamp_ms: {$gte, $lte}}` (thewatcher's
+rollup queries the vast majority of hits this) always resolved on `metric`
+(written first), even though it's the low-cardinality field: every document
+that ever had that metric became a "candidate," each then walked through a
+full-document `query::matches` check to apply the timestamp range — turning
+a query that should touch a handful of documents in a tight time window
+into a scan of everything sharing that metric across the collection's whole
+history.
+
+`try_index` now evaluates every indexed field present in the filter and
+keeps whichever yields the smallest candidate set. Same `IndexResult`
+contract (`get_matching`/`count_matching` still re-verify the full filter
+via `query::matches` against whichever candidates come back), so this is a
+pure performance change — no behavior/result difference, confirmed by the
+full test suite passing unmodified.
+
+Benchmarked against thewatcher's actual rollup query
+(`{metric, timestamp_ms: {$gte, $lte}}`, 1-hour bucket) on a real 638k-doc
+production collection: **47–146ms → 8–30ms per call (4–5x)**, metric-
+dependent on how many documents share that metric. A simulated 24-bucket
+catch-up (e.g. after a day of service downtime) for the highest-cardinality
+metric went **3519ms → 748ms**.
+
+### `Query::to_list` deep-cloned every match before applying `sort`/`limit`
+
+`to_list()` fetched matches as `Arc<Document>` (cheap) from the index, then
+immediately deep-cloned all of them into owned `Document`s *before* sorting
+and truncating to the requested `limit`. A `.sort(...).limit(1)` query —
+e.g. the resume-point lookup every rollup/downstream consumer doing
+incremental sync tends to run (`find({field}).sort(...).limit(1)`) — paid
+to clone the *entire* matching set just to keep one document.
+
+`to_list()` now keeps documents as `Arc<Document>` through sort/skip/limit
+(sorting and truncating references, not data) and only deep-clones the
+survivors at the very end. The one exception is `.group()`/aggregation,
+which reads every input document's fields regardless of any later limit —
+that path still clones up front since there's no deferral to be had, then
+sorts/skips/limits the synthesized aggregate output same as before.
+
+Benchmarked against the resume-point lookup pattern on a collection sized
+to represent a year of hourly-rollup retention (70k docs): **14.7–69.5ms →
+2.1–22.2ms per call (3–7x)**, more pronounced on the smaller/more common
+case (5.2k docs, today's actual size): **1.5–7.6ms → 0.12–1.2ms (6–12x)**.
+
+### Documents were stored fully decoded — ~10x their on-wire size, for the life of the collection
+
+The big one from the same investigation. `IndexManager.documents` held
+`Arc<bson::Document>` — every live document, decoded, forever, no paging
+(moofile's design is deliberately all-in-memory; this isn't a paging
+proposal). The problem: `bson::Bson` is a 112-byte enum sized to its
+largest variant (`JavaScriptCodeWithScope { code: String, scope: Document }`
+— 24 + 88 bytes, confirmed via `size_of`), so a `bool` field costs the same
+112 bytes as a decimal128, plus a heap-allocated key per field on top via
+`Document`'s `IndexMap`. Measured: a 298-byte-on-wire, 12-field document
+cost **2978 bytes in memory — 10.0x**. Against a real 638k-doc production
+collection this meant ~1.9 GB retained for ~180 MB of actual data.
+
+Documents are now stored as `Arc<bson::raw::RawDocumentBuf>` — the raw BSON
+bytes, wrapped, already part of the `bson` crate we depend on (no new
+dependency). `RawBsonRef`, the value type reading a raw field returns,
+borrows into the bytes (`&str` not `String`, etc.) — measured `size_of`
+40 bytes vs `Bson`'s 112, and reading a field allocates nothing. Same
+document, same measurement: **491 bytes — 1.65x wire, a 6.1x reduction**.
+Verified end-to-end against thewatcher's real 638k-doc collection, not just
+the synthetic probe: **RSS after open 1965 MB → 418 MB** (a 4.7x reduction
+on top of what v1.2.3 already bought; ~8.9x off the original, pre-any-of-
+this-work baseline).
+
+- `IndexManager::add`/`remove` now read only the handful of configured
+  regular/text/vector fields out of the raw bytes via `RawDocument::get()`
+  — never a full decode just to index a document. That lookup is
+  O(fields-in-document) (an unindexed byte scan — raw BSON has no built-in
+  field index) versus `Document::get()`'s O(1) `IndexMap` hash lookup;
+  measured within noise of each other for realistic field counts (73.8ns
+  vs 74.6ns/field, 12-field doc, 3 fields looked up) — it degrades for
+  documents with many more fields than are actually indexed.
+- A `Document` is materialized (`RawDocumentBuf::to_document()`) only at
+  the point a document is about to leave the index for a caller — `get()`,
+  the survivors of `to_list()`'s sort/skip/limit, an updated/deleted
+  document's old content. Existence checks (duplicate-key checks on the
+  insert hot path in particular) go through a new `contains()` — no decode,
+  no clone, just a `BTreeMap` key lookup.
+- `insert()`'s hot path now encodes a document exactly once — the same
+  bytes are written to disk and wrapped as the raw index entry — instead of
+  encoding for disk (`storage.append`) and separately deep-cloning the
+  whole `Document` for the index. Measured: insert throughput went from
+  98.6k/sec to 106-107k/sec (a side effect, not the point of this change,
+  but a real one).
+- `compact()` no longer decodes anything either: each live document's raw
+  bytes are already exactly the bytes it needs to write, so it went from
+  clone-every-live-document-then-re-encode to a straight byte copy. This
+  incidentally closes a gap flagged when v1.2.3 shipped — `compact()`'s
+  `all_docs()` clone was the one transient-spike path the v1.2.3
+  `malloc_trim` fix didn't cover, since there was nothing to trim there
+  once there's no clone left to make.
+- The disposable index cache (`cache.rs`) already stored documents as raw
+  BSON bytes on disk (bincode can't handle `Document`'s `deserialize_any`)
+  and decoded them back into `Document` on every cache-hit load, purely to
+  satisfy the old in-memory type. That decode is gone — cache load now just
+  wraps the bytes.
+- `Query::to_list`'s sort step needed one adjustment to avoid a regression:
+  a naive `sort_by` that reads the sort key from each side's raw bytes
+  *inside the comparator* pays that O(fields) scan on every one of the
+  O(n log n) comparisons, not once per document. Fixed with a decorate-
+  sort-undecorate — extract each document's sort key once into a side
+  vector, sort using the cached values. Measured before/after this specific
+  fix on the `last_timestamp`-shaped query below: network 6.63ms → 911μs.
+
+**What this doesn't cover**: `query::matches()` (~1000 lines of filter
+evaluation) still takes a decoded `&Document`. Candidates that reach it
+(the post-index-selection, pre-final-result set) are decoded individually
+right before the check — safe, correct, and already a small set thanks to
+the `try_index` selectivity fix above, but a real, measured cost on queries
+whose winning index is a broad range with a secondary field to check
+against `query::matches` (see benchmarks below). A raw-native fast path for
+flat, non-nested filters (thewatcher's entire actual query surface) would
+close that gap; deliberately out of scope here — proposed as a follow-up,
+not attempted alongside a storage-representation change this size.
+
+**Benchmarked** (real 638k-doc production data = "peak"; synthetic 46k-doc
+/2d-retention + 70k-doc/365d-retention data = "steady", matching where
+retention tuning is taking that collection):
+
+| query | peak (638k) before→after | steady (46k/70k) before→after |
+|---|---|---|
+| `last_timestamp` (single-field `Exact` match, no decode needed) | 123μs–1.22ms → 185–911μs (flat to faster) | 2.2–21.6ms → 2.2–13.8ms (faster) |
+| bucket query (`{metric, timestamp_ms: $gte/$lte}`, 1h window) | 8.3–31.0ms → 8.4–30.0ms (flat) | 422μs–951μs → 1.3–2.1ms (**slower, 2-3x**) |
+| 24h sorted query (`{metric, timestamp_ms: $gte/$lte}` over a day, then sort) | 62.1ms → 81.1ms (**slower, 31%**) | 36.1ms → 60.7ms (**slower, 68%**) |
+| `insert()` | 10.1μs/doc → 9.4μs/doc (faster) | 10.2μs/doc → 9.3μs/doc (faster) |
+
+The two "slower" rows are the `get_matching` `Candidates`-path decode cost
+described above — real, and worth naming plainly rather than only reporting
+the wins. In absolute terms every number here is sub-100ms; the *aggregate*
+5-metric granular→hourly rollup step (`last_timestamp` + bucket query,
+what actually runs every 5 minutes) is a net wash-to-improvement at both
+scales once you sum it (steady: 42.1ms → 36.8ms combined) — the bucket-
+query regression is more than paid for by the `last_timestamp` win on the
+same workload. The 24h-sorted-query row is the one place this trades real
+latency for the memory win with nothing offsetting it on the same query;
+it's a large-candidate-set, decode-then-sort shape thewatcher's dashboard
+does exercise (the "Last 24 hours" charts) but only on user-facing HTTP
+requests, not the recurring background rollup.
+
+Cold-open *time* was not re-measured for this change — the table above covers
+queries and inserts, not a collection open — and the load path now re-encodes
+each record into the raw form the index stores it in (~280 ns/doc for a
+12-field/263-byte document, ≈0.2 s across 638k records) where it previously
+moved the decoded document straight into the index. Expect a small open-time
+increase alongside the much larger RSS reduction above.
+
+All existing tests pass unmodified: 90 unit + 13 `api_guard` + 1 doc-test with
+default features, 84 unit + 13 `api_guard` under `--no-default-features` (the
+difference is the six tests gated on the `embed` feature), plus every suite in
+`scripts/test-all.sh` — Rust (both feature configurations), Python
+`tests/`+`tests-cross/` (319 passed, 7 skipped), C 73, C++ 43, parity 8,
+Node 23, Go, Java 32, C# 33. Cross-checked independently of the test
+suite: ran the pre- and post-change binaries against byte-identical copies
+of the same real 638k-doc collection and diffed `/api/history` responses
+across every metric, resolution, and filter combination thewatcher's API
+supports — byte-identical output.
+
 ## v1.2.3 (2026-09-14)
 
 ### Opening a large collection peaked at roughly double its steady-state memory

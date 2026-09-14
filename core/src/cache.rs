@@ -19,8 +19,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use bson::Document;
-
 use crate::index::{IndexManager, Value};
 use crate::text::TextIndex;
 
@@ -169,12 +167,16 @@ pub(crate) fn try_load_cache(
     }
 
     // --- All checks passed: reconstruct the IndexManager ---
-    // Decode documents from raw BSON bytes.
-    let documents: std::collections::BTreeMap<String, Arc<Document>> = cache
+    // Wrap the raw BSON bytes directly — no decode. `RawDocumentBuf::
+    // from_bytes` only validates BSON framing (length prefix, trailing
+    // NUL), it doesn't walk the document's fields, so this is strictly
+    // cheaper than the full `bson::from_slice::<Document>` decode this
+    // replaced.
+    let documents: std::collections::BTreeMap<String, Arc<bson::raw::RawDocumentBuf>> = cache
         .documents
         .into_iter()
         .filter_map(|(k, bytes)| {
-            bson::from_slice::<Document>(&bytes).ok().map(|d| (k, Arc::new(d)))
+            bson::raw::RawDocumentBuf::from_bytes(bytes).ok().map(|d| (k, Arc::new(d)))
         })
         .collect();
 
@@ -256,13 +258,13 @@ pub(crate) fn save_cache(
 
     // Flatten BTreeMaps into Vecs for bincode (slightly more compact).
     // Documents are stored as raw BSON bytes (bincode can't handle
-    // bson::Document's deserialize_any).
+    // bson::Document's deserialize_any — and now that the in-memory
+    // representation already *is* raw BSON bytes, this is a byte copy,
+    // not a re-encode).
     let documents: Vec<(String, Vec<u8>)> = index_manager
         .documents
         .iter()
-        .map(|(k, v)| {
-            (k.clone(), bson::to_vec(v.as_ref()).unwrap_or_default())
-        })
+        .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
         .collect();
 
     let regular: Vec<(String, Vec<(Value, Vec<String>)>)> = index_manager

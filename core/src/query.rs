@@ -448,30 +448,77 @@ impl Query {
     // Terminal methods
     // -----------------------------------------------------------
 
+    // Fetches matches as `Arc<Document>` — cheap refcount clones from the
+    // index, not deep clones — and keeps them that way through group/sort/
+    // skip/limit. Only the documents that survive truncation get deep-
+    // cloned into owned `Document`s, at the very end. Previously every
+    // match was deep-cloned up front, so e.g. `.sort(...).limit(1)` paid to
+    // clone the *entire* matching set just to keep one document.
     pub fn to_list(self) -> Result<Vec<Document>, MooFileError> {
         refresh_inner(&self.inner)?;
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 
-        let mut docs: Vec<Document> = if self.filter.is_empty() {
-            inner.index_manager.all_docs()
+        let matched: Vec<Arc<bson::raw::RawDocumentBuf>> = if self.filter.is_empty() {
+            inner.index_manager.all_docs_arc()
         } else {
             inner.index_manager.get_matching(&self.filter)
-                .iter().map(|d| d.as_ref().clone()).collect()
         };
 
         if let Some(ref field) = self.group_field {
-            docs = apply_group_agg(&docs, field, &self.agg_funcs);
+            // Aggregation reads every input's fields regardless of the
+            // eventual limit, so there's no clone to defer here — group
+            // first (the one path that still needs owned Documents up
+            // front, since it synthesizes new output docs unrelated to the
+            // originals), then sort/skip/limit the synthesized output.
+            let owned: Vec<Document> = matched.iter().filter_map(|d| d.to_document().ok()).collect();
+            let mut docs = apply_group_agg(&owned, field, &self.agg_funcs);
+            if let Some(ref key) = self.sort_key {
+                docs.sort_by(|a, b| {
+                    let va = a.get(key);
+                    let vb = b.get(key);
+                    let ord = bson_cmp(va.unwrap_or(&Bson::Null), vb.unwrap_or(&Bson::Null))
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if self.sort_desc { ord.reverse() } else { ord }
+                });
+            }
+            if self.skip_n > 0 {
+                docs = docs.into_iter().skip(self.skip_n).collect();
+            }
+            if let Some(n) = self.limit_n {
+                docs.truncate(n);
+            }
+            return Ok(docs);
         }
 
+        let mut docs = matched;
+
         if let Some(ref key) = self.sort_key {
-            docs.sort_by(|a, b| {
-                let va = a.get(key);
-                let vb = b.get(key);
-                let ord = bson_cmp(va.unwrap_or(&Bson::Null), vb.unwrap_or(&Bson::Null))
+            // Decorate-sort-undecorate: extract the sort key once per
+            // document (an O(fields-in-doc) raw byte scan + one `Bson::
+            // try_from` conversion each — the only real added cost of raw
+            // storage here) into a cached side vector, then sort using
+            // those cached values. A naive `sort_by` that re-reads `a`/`b`
+            // from raw bytes inside the comparator pays that scan on every
+            // one of the O(n log n) comparisons instead of once per
+            // element — measured 2-5x slower on `last_timestamp`-shaped
+            // queries (sort+limit(1) over a large candidate set) before
+            // this fix; this restores it to roughly the pre-raw-storage
+            // cost (one lookup per element, same as `Document::get()`'s
+            // O(1) hash lookup — just a pricier lookup, not a repeated one).
+            let mut keyed: Vec<(Option<Bson>, Arc<bson::raw::RawDocumentBuf>)> = docs
+                .into_iter()
+                .map(|d| {
+                    let k = d.get(key).ok().flatten().and_then(|v| Bson::try_from(v).ok());
+                    (k, d)
+                })
+                .collect();
+            keyed.sort_by(|(ka, _), (kb, _)| {
+                let ord = bson_cmp(ka.as_ref().unwrap_or(&Bson::Null), kb.as_ref().unwrap_or(&Bson::Null))
                     .unwrap_or(std::cmp::Ordering::Equal);
                 if self.sort_desc { ord.reverse() } else { ord }
             });
+            docs = keyed.into_iter().map(|(_, d)| d).collect();
         }
 
         if self.skip_n > 0 {
@@ -482,7 +529,7 @@ impl Query {
             docs.truncate(n);
         }
 
-        Ok(docs)
+        Ok(docs.into_iter().filter_map(|d| d.to_document().ok()).collect())
     }
 
     pub fn first(self) -> Result<Option<Document>, MooFileError> {

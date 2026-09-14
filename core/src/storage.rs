@@ -75,11 +75,19 @@ pub(crate) struct Record {
 /// Encode a document and record type into the on-disk wire format.
 pub(crate) fn encode_record(record_type: u8, doc: &Document) -> Vec<u8> {
     let payload = bson::to_vec(doc).expect("BSON serialisation is infallible for Document");
+    encode_record_bytes(record_type, &payload)
+}
+
+/// As `encode_record`, but for a payload that's already encoded — the
+/// insert hot path builds the BSON bytes once (to write to disk) and reuses
+/// the same bytes to build the in-memory raw-document index entry, instead
+/// of encoding twice.
+pub(crate) fn encode_record_bytes(record_type: u8, payload: &[u8]) -> Vec<u8> {
     let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
     buf.extend_from_slice(&len.to_le_bytes());
     buf.push(record_type);
-    buf.extend_from_slice(&payload);
+    buf.extend_from_slice(payload);
     buf
 }
 
@@ -223,13 +231,35 @@ where
 ///
 /// Writes to a `.tmp` file first, then atomically renames — if the process
 /// is interrupted the original file is untouched.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compact(path: &Path, live_docs: &[Document]) -> Result<(), MooFileError> {
+    let encoded: Vec<Vec<u8>> = live_docs
+        .iter()
+        .map(|d| bson::to_vec(d).expect("BSON serialisation is infallible for Document"))
+        .collect();
+    compact_raw_bytes(path, encoded.iter().map(|v| v.as_slice()))
+}
+
+/// As `compact`, but for documents whose encoded bytes are already in hand
+/// (the raw-document index stores exactly these bytes) — no decode, no
+/// re-encode, just a straight byte copy into the new file.
+pub(crate) fn compact_raw<'a>(
+    path: &Path,
+    live_docs: impl Iterator<Item = &'a [u8]>,
+) -> Result<(), MooFileError> {
+    compact_raw_bytes(path, live_docs)
+}
+
+fn compact_raw_bytes<'a>(
+    path: &Path,
+    live_docs: impl Iterator<Item = &'a [u8]>,
+) -> Result<(), MooFileError> {
     let tmp_path = path.with_extension("bson.tmp");
 
     let mut f = File::create(&tmp_path).map_err(|e| errors::io_err(&tmp_path, e))?;
 
-    for doc in live_docs {
-        let record = encode_record(RECORD_LIVE, doc);
+    for payload in live_docs {
+        let record = encode_record_bytes(RECORD_LIVE, payload);
         f.write_all(&record)
             .map_err(|e| errors::io_err(&tmp_path, e))?;
     }
@@ -309,11 +339,18 @@ impl StorageEngine {
 
     /// Append a record to the file and flush.
     pub fn append(&mut self, record_type: u8, doc: &Document) -> Result<(), MooFileError> {
+        let payload = bson::to_vec(doc).expect("BSON serialisation is infallible for Document");
+        self.append_bytes(record_type, &payload)
+    }
+
+    /// As `append`, but for a payload that's already encoded — see
+    /// `encode_record_bytes`.
+    pub fn append_bytes(&mut self, record_type: u8, payload: &[u8]) -> Result<(), MooFileError> {
         if self.readonly {
             return Err(MooFileError::ReadOnly);
         }
 
-        let data = encode_record(record_type, doc);
+        let data = encode_record_bytes(record_type, payload);
         let f = self.file.as_mut().expect("StorageEngine: file handle missing");
         f.write_all(&data)
             .map_err(|e| errors::io_err(&self.path, e))?;

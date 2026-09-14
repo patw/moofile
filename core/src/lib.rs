@@ -285,7 +285,7 @@ fn detect_vector_dim_mismatches(
             index_manager
                 .documents
                 .values()
-                .filter(|d| matches!(d.get(field), Some(bson::Bson::Array(_))))
+                .filter(|d| matches!(d.get(field), Ok(Some(bson::raw::RawBsonRef::Array(_)))))
                 .count()
         };
 
@@ -301,11 +301,16 @@ fn detect_vector_dim_mismatches(
         // Case 2: config and index agree, but documents on disk do not —
         // a collection written before the config was corrected.
         for doc in index_manager.documents.values() {
-            if let Some(bson::Bson::Array(arr)) = doc.get(field) {
-                if arr.len() != *declared {
+            if let Ok(Some(bson::raw::RawBsonRef::Array(arr))) = doc.get(field) {
+                // RawArray has no O(1) len() (arrays share BSON's document
+                // wire format — no built-in count), so this walks the raw
+                // bytes once to count elements. Only runs at collection
+                // open, not a hot path.
+                let len = arr.into_iter().count();
+                if len != *declared {
                     let e = out
                         .entry(field.clone())
-                        .or_insert((*declared, arr.len(), 0));
+                        .or_insert((*declared, len, 0));
                     e.2 += 1;
                 }
             }
@@ -564,7 +569,7 @@ impl Collection {
                 match batch.overlay.get(&_id) {
                     Some(Some(_)) => true,
                     Some(None) => false,
-                    None => inner.index_manager.get(&_id).is_some(),
+                    None => inner.index_manager.contains(&_id),
                 }
             };
             if exists {
@@ -632,7 +637,7 @@ impl Collection {
             // before erroring.  Duplicates *within* the batch are still caught
             // per document, by the running index.
             for (_, id) in &prepared {
-                if inner.index_manager.get(id).is_some() {
+                if inner.index_manager.contains(id) {
                     return Err(MooFileError::DuplicateKey(id.clone()));
                 }
             }
@@ -687,7 +692,7 @@ impl Collection {
         // is still the one we update.
         inner.with_write_lock(|inner| {
             let docs_arc = inner.index_manager.get_matching(&where_clause);
-            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            let docs: Vec<Document> = docs_arc.iter().filter_map(|d| d.to_document().ok()).collect();
             if docs.is_empty() {
                 return Err(MooFileError::DocumentNotFound);
             }
@@ -741,7 +746,7 @@ impl Collection {
         // interleave in the middle of a bulk update.
         let count = inner.with_write_lock(|inner| {
             let docs_arc = inner.index_manager.get_matching(&where_clause);
-            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            let docs: Vec<Document> = docs_arc.iter().filter_map(|d| d.to_document().ok()).collect();
             let mut count = 0;
 
             for old_doc in &docs {
@@ -795,7 +800,7 @@ impl Collection {
 
         inner.with_write_lock(|inner| {
             let docs_arc = inner.index_manager.get_matching(&where_clause);
-            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
+            let docs: Vec<Document> = docs_arc.iter().filter_map(|d| d.to_document().ok()).collect();
             if docs.is_empty() {
                 return Err(MooFileError::DocumentNotFound);
             }
@@ -841,11 +846,13 @@ impl Collection {
 
         let deleted = inner.with_write_lock(|inner| {
             let docs_arc = inner.index_manager.get_matching(&where_clause);
-            let docs: Vec<Document> = docs_arc.iter().map(|d| d.as_ref().clone()).collect();
-            if docs.is_empty() {
+            // Only `_id` is needed here — `get_str` reads it straight off
+            // the raw bytes (same cost as before: RawDocumentBuf's Deref
+            // gives it the identical `ValueAccessResult<&str>` signature
+            // Document::get_str has), no decode of the matched document(s).
+            let Some(_id) = docs_arc.first().and_then(|d| d.get_str("_id").ok()).map(String::from) else {
                 return Ok(false);
-            }
-            let _id = docs[0].get_str("_id").unwrap().to_string();
+            };
 
             inner.storage.append(RECORD_TOMBSTONE, &doc! { "_id": &_id })?;
             inner.index_manager.remove(&_id);
@@ -1065,8 +1072,8 @@ impl Collection {
                 .documents
                 .values()
                 .filter_map(|d| match (d.get_str("_id"), d.get(source_field)) {
-                    (Ok(id), Some(Bson::String(text))) => {
-                        Some((id.to_string(), text.clone()))
+                    (Ok(id), Ok(Some(bson::raw::RawBsonRef::String(text)))) => {
+                        Some((id.to_string(), text.to_string()))
                     }
                     _ => None,
                 })
@@ -1092,8 +1099,7 @@ impl Collection {
                     // The document may have changed under us between the scan
                     // and here only if another writer held the lock, which
                     // with_write_lock rules out — but it may simply be gone.
-                    let Some(old) = inner.index_manager.get(id) else { continue };
-                    let mut new_doc = old.as_ref().clone();
+                    let Some(mut new_doc) = inner.index_manager.get(id) else { continue };
 
                     let emb = finalize_embedding(raw, width, &config);
                     new_doc.insert(&config.target_field, Bson::Array(emb));
@@ -1142,8 +1148,11 @@ impl Collection {
         // runs under the exclusive lock), or compaction rewrites the file from
         // a stale snapshot and permanently destroys another process's records.
         let result = inner.with_write_lock(|inner| {
-            let live_docs = inner.index_manager.all_docs();
-            storage::compact(&inner.path, &live_docs)?;
+            // No decode, no clone: each live document's raw bytes are
+            // written straight through — they're already exactly the bytes
+            // compact() needs on disk.
+            let live_docs = inner.index_manager.all_docs_arc();
+            storage::compact_raw(&inner.path, live_docs.iter().map(|d| d.as_bytes()))?;
             inner.total_records = live_docs.len() as u64;
             Ok(())
         });
@@ -1643,7 +1652,7 @@ fn insert_locked(
     doc: Document,
     _id: &str,
 ) -> Result<Document, MooFileError> {
-    if inner.index_manager.get(_id).is_some() {
+    if inner.index_manager.contains(_id) {
         return Err(MooFileError::DuplicateKey(_id.to_string()));
     }
     let doc = inner.apply_auto_embed(doc)?;
@@ -1660,11 +1669,20 @@ fn insert_locked_embedded(
     doc: Document,
     _id: &str,
 ) -> Result<Document, MooFileError> {
-    if inner.index_manager.get(_id).is_some() {
+    if inner.index_manager.contains(_id) {
         return Err(MooFileError::DuplicateKey(_id.to_string()));
     }
-    inner.storage.append(RECORD_LIVE, &doc)?;
-    inner.index_manager.add(doc.clone());
+    // Encode once, share the bytes between the disk write and the raw-
+    // document index entry — previously this encoded via `storage.append`
+    // (its own internal `bson::to_vec`) and then separately deep-cloned the
+    // whole `Document` for `index_manager.add`. Both `bson::to_vec` and
+    // `RawDocumentBuf::from_bytes` are infallible on bytes/a Document we
+    // just built ourselves — matches `encode_record`'s existing assumption.
+    let payload = bson::to_vec(&doc).expect("BSON serialisation is infallible for Document");
+    inner.storage.append_bytes(RECORD_LIVE, &payload)?;
+    let raw = bson::raw::RawDocumentBuf::from_bytes(payload)
+        .expect("bytes we just encoded are well-formed BSON");
+    inner.index_manager.add_raw(raw);
     inner.total_records += 1;
     Ok(doc)
 }
@@ -1681,7 +1699,7 @@ fn apply_record(index_manager: &mut IndexManager, record: storage::Record) {
     };
     match record.record_type {
         RECORD_LIVE | RECORD_REPLACEMENT => {
-            if index_manager.get(&_id).is_some() {
+            if index_manager.contains(&_id) {
                 index_manager.remove(&_id);
             }
             index_manager.add(record.doc);
@@ -1745,7 +1763,11 @@ fn batch_get_matching(inner: &CollectionInner, filter: &Document) -> Vec<Documen
         match batch.overlay.get(id) {
             Some(Some(replacement)) => view.push(replacement.clone()),
             Some(None) => {}
-            None => view.push(doc.as_ref().clone()),
+            None => {
+                if let Ok(d) = doc.to_document() {
+                    view.push(d);
+                }
+            }
         }
     }
 

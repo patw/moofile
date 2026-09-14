@@ -1,11 +1,19 @@
 /// In-memory index management.
 ///
-/// Documents are stored as `Arc<Document>` — cheap reference-counted
-/// clones instead of deep-copying 128-dim vectors on every query.
+/// Documents are stored as `Arc<RawDocumentBuf>` — raw, undecoded BSON
+/// bytes behind a cheap reference-counted pointer. A decoded `bson::Document`
+/// is ~10x its on-wire size (`Bson` is a 112-byte enum sized to its largest
+/// variant, `Document` wraps an `IndexMap` with its own per-entry overhead
+/// on top) — that cost is only worth paying for a document a caller is
+/// actually about to read. Indexing extracts just the handful of configured
+/// fields via `RawDocument::get()` (no decode); a full `Document` is
+/// materialized via `to_document()` only at the point a document is about
+/// to leave the index for a caller.
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::Arc;
 
+use bson::raw::{RawBsonRef, RawDocumentBuf};
 use bson::Document;
 use rayon::prelude::*;
 
@@ -52,7 +60,7 @@ pub(crate) struct IndexManager {
     pub(crate) vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
     pub(crate) text_indexes: BTreeMap<String, TextIndex>,
     pub(crate) text_fields: Vec<String>,
-    pub(crate) documents: BTreeMap<String, Arc<Document>>,
+    pub(crate) documents: BTreeMap<String, Arc<RawDocumentBuf>>,
     pub(crate) vectors_stale: bool,
 }
 
@@ -94,7 +102,7 @@ impl IndexManager {
         vector_data: BTreeMap<String, (Vec<String>, Vec<f32>, usize)>,
         text_fields: Vec<String>,
         text_indexes: BTreeMap<String, TextIndex>,
-        documents: BTreeMap<String, Arc<Document>>,
+        documents: BTreeMap<String, Arc<RawDocumentBuf>>,
     ) -> Self {
         Self {
             regular,
@@ -108,20 +116,46 @@ impl IndexManager {
         }
     }
 
+    /// Index a document, taking ownership of an already-decoded `Document`.
+    /// Encodes once internally to build the raw storage representation.
+    /// Prefer `add_raw` on hot paths that already have the encoded bytes in
+    /// hand (insert, load/replay) — this exists for callers (tests, the
+    /// batch-commit path, cache replay) that only have a `Document`.
     pub fn add(&mut self, doc: Document) {
-        let _id = doc.get_str("_id").unwrap_or("").to_string();
-        if _id.is_empty() { return; }
+        let Ok(raw) = RawDocumentBuf::try_from(&doc) else { return };
+        self.add_raw(raw);
+    }
+
+    /// Index a document from its already-encoded BSON bytes — no decode, no
+    /// re-encode. `insert()` builds these bytes once (to write to disk) and
+    /// hands them straight here; only the handful of configured
+    /// regular/text/vector fields are read out of them, via
+    /// `RawDocument::get()`, which — unlike `bson::Document::get()`'s O(1)
+    /// `IndexMap` lookup — is an O(fields-in-document) scan of the raw bytes.
+    /// For the small, flat documents moofile is typically used for this is
+    /// within noise of the decoded lookup (measured: 73.8ns vs 74.6ns/field
+    /// on a 12-field doc); it degrades for documents with many more fields
+    /// than are actually indexed.
+    pub fn add_raw(&mut self, raw: RawDocumentBuf) {
+        // get_str returns Result<&str, ValueAccessError> — a missing/wrong-
+        // typed "_id" is an Err here, not an Ok(None); treat any error as
+        // "skip", mirroring the decoded path's `.unwrap_or("")` behavior.
+        let Ok(id_ref) = raw.get_str("_id") else { return };
+        if id_ref.is_empty() { return; }
+        let _id = id_ref.to_string();
         for field in &self.regular_fields {
-            if let Some(val) = doc.get(field) {
-                if let Some(key) = bson_to_value(val) {
+            if let Ok(Some(val)) = raw.get(field) {
+                if let Some(key) = raw_bson_to_value(val) {
                     self.regular.entry(field.clone()).or_default().entry(key).or_default().insert(_id.clone());
                 }
             }
         }
         for field in &self.text_fields {
-            if let Some(text) = doc.get(field).and_then(text_index_value) {
-                if let Some(ti) = self.text_indexes.get_mut(field) {
-                    ti.add_document(_id.clone(), &text);
+            if let Ok(Some(val)) = raw.get(field) {
+                if let Some(text) = raw_text_index_value(val) {
+                    if let Some(ti) = self.text_indexes.get_mut(field) {
+                        ti.add_document(_id.clone(), &text);
+                    }
                 }
             }
         }
@@ -130,11 +164,11 @@ impl IndexManager {
         // rebuild on the next search.  Only remove() sets vectors_stale.
         if !self.vectors_stale {
             for (field, dim) in &self.vector_fields {
-                if let Some(bson::Bson::Array(arr)) = doc.get(field) {
-                    let vec: Vec<f32> = arr.iter().filter_map(|v| match v {
-                        bson::Bson::Double(f) => Some(*f as f32),
-                        bson::Bson::Int32(i) => Some(*i as f32),
-                        bson::Bson::Int64(i) => Some(*i as f32),
+                if let Ok(Some(RawBsonRef::Array(arr))) = raw.get(field) {
+                    let vec: Vec<f32> = arr.into_iter().filter_map(|v| match v.ok()? {
+                        RawBsonRef::Double(f) => Some(f as f32),
+                        RawBsonRef::Int32(i) => Some(i as f32),
+                        RawBsonRef::Int64(i) => Some(i as f32),
                         _ => None,
                     }).collect();
                     if vec.len() == *dim {
@@ -155,14 +189,17 @@ impl IndexManager {
                 }
             }
         }
-        self.documents.insert(_id, Arc::new(doc));
+        self.documents.insert(_id, Arc::new(raw));
     }
 
+    /// Removes a document and returns its decoded content. Callers that
+    /// only need the `_id` (most of them) never trigger this decode — see
+    /// `contains`.
     pub fn remove(&mut self, _id: &str) -> Option<Document> {
-        let doc = Arc::unwrap_or_clone(self.documents.remove(_id)?);
+        let raw = Arc::unwrap_or_clone(self.documents.remove(_id)?);
         for field in &self.regular_fields {
-            if let Some(val) = doc.get(field) {
-                if let Some(key) = bson_to_value(val) {
+            if let Ok(Some(val)) = raw.get(field) {
+                if let Some(key) = raw_bson_to_value(val) {
                     if let Some(map) = self.regular.get_mut(field) {
                         if let Some(ids) = map.get_mut(&key) {
                             // O(log k) — this was `retain`, an O(k) scan of every
@@ -203,15 +240,34 @@ impl IndexManager {
                 }
             }
         }
-        Some(doc)
+        raw.to_document().ok()
     }
 
-    pub fn get(&self, _id: &str) -> Option<Arc<Document>> {
-        self.documents.get(_id).cloned()
+    /// Existence check with no decode and no Arc clone — prefer this over
+    /// `get(...).is_some()` (duplicate-key checks on the insert hot path in
+    /// particular).
+    pub fn contains(&self, _id: &str) -> bool {
+        self.documents.contains_key(_id)
     }
 
+    pub fn get(&self, _id: &str) -> Option<Document> {
+        self.documents.get(_id)?.to_document().ok()
+    }
+
+    /// No internal caller left after `compact()`/`Query::to_list()` moved to
+    /// `all_docs_arc()` (decode-on-demand); kept as a convenience API for a
+    /// full-collection decode.
+    #[allow(dead_code)]
     pub fn all_docs(&self) -> Vec<Document> {
-        self.documents.values().map(|d| d.as_ref().clone()).collect()
+        self.documents.values().filter_map(|d| d.to_document().ok()).collect()
+    }
+
+    /// As `all_docs`, but without decoding each document — cheap `Arc`
+    /// clones of the raw bytes only. Used by `Query::to_list` (so sort/skip
+    /// /limit can run before paying to decode) and by `compact()` (which
+    /// never needs a `Document` at all — see `storage::compact_raw`).
+    pub fn all_docs_arc(&self) -> Vec<Arc<RawDocumentBuf>> {
+        self.documents.values().cloned().collect()
     }
 
     pub fn doc_count(&self) -> usize { self.documents.len() }
@@ -222,24 +278,33 @@ impl IndexManager {
             Some(IndexResult::Exact(ids)) => ids.len(),
             Some(IndexResult::Candidates(ids)) => ids.iter()
                 .filter_map(|id| self.documents.get(id))
-                .filter(|d| crate::query::matches(d.as_ref(), filter))
+                .filter(|raw| raw.to_document().is_ok_and(|d| crate::query::matches(&d, filter)))
                 .count(),
             None => self.documents.values()
-                .filter(|d| crate::query::matches(d.as_ref(), filter)).count(),
+                .filter(|raw| raw.to_document().is_ok_and(|d| crate::query::matches(&d, filter)))
+                .count(),
         }
     }
 
-    pub fn get_matching(&self, filter: &Document) -> Vec<Arc<Document>> {
+    /// Returns matches as `Arc<RawDocumentBuf>` — un-decoded. The `Exact`
+    /// path (index alone proves the match) never decodes at all; the
+    /// `Candidates`/`None` paths decode each candidate transiently to
+    /// evaluate `query::matches`, but return the original `Arc`, not the
+    /// decoded copy — callers that only need `_id` (most of them: delete,
+    /// vector/text prefilter) never pay for a second decode, and callers
+    /// that need full content decode exactly once, at the point they
+    /// actually consume it.
+    pub fn get_matching(&self, filter: &Document) -> Vec<Arc<RawDocumentBuf>> {
         if filter.is_empty() { return self.documents.values().cloned().collect(); }
         match self.try_index(filter) {
             Some(IndexResult::Exact(ids)) => ids.iter()
                 .filter_map(|id| self.documents.get(id).cloned()).collect(),
             Some(IndexResult::Candidates(ids)) => ids.iter()
                 .filter_map(|id| self.documents.get(id))
-                .filter(|d| crate::query::matches(d.as_ref(), filter))
+                .filter(|raw| raw.to_document().is_ok_and(|d| crate::query::matches(&d, filter)))
                 .cloned().collect(),
             None => self.documents.values()
-                .filter(|d| crate::query::matches(d.as_ref(), filter))
+                .filter(|raw| raw.to_document().is_ok_and(|d| crate::query::matches(&d, filter)))
                 .cloned().collect(),
         }
     }
@@ -262,13 +327,25 @@ impl IndexManager {
                 return self.try_index_single_field(field, condition);
             }
         }
+        // Multiple indexed fields can appear in the same filter — evaluate
+        // every one of them and keep whichever yields the smallest
+        // candidate set, rather than always taking the first indexed field
+        // in filter-document insertion order. Insertion order has no
+        // relationship to selectivity: e.g. `{metric, timestamp_ms: {$gte,
+        // $lte}}` used to always resolve on `metric` (written first) even
+        // when it's the low-cardinality field, turning a query that should
+        // touch a handful of documents in a tight time window into a scan
+        // of every document that ever had that metric.
+        let mut best: Option<Vec<String>> = None;
         for (field, condition) in filter.iter() {
             if !self.regular.contains_key(field) { continue; }
             if let Some(ids) = self.lookup_ids(field, condition) {
-                return Some(IndexResult::Candidates(ids));
+                if best.as_ref().map_or(true, |b| ids.len() < b.len()) {
+                    best = Some(ids);
+                }
             }
         }
-        None
+        best.map(IndexResult::Candidates)
     }
 
     fn try_index_single_field(&self, field: &str, condition: &bson::Bson) -> Option<IndexResult> {
@@ -341,11 +418,11 @@ impl IndexManager {
         for (field, dim) in &self.vector_fields {
             let mut ids = Vec::new(); let mut data = Vec::new();
             for (_id, doc) in &self.documents {
-                if let Some(bson::Bson::Array(arr)) = doc.get(field) {
-                    let vec: Vec<f32> = arr.iter().filter_map(|v| match v {
-                        bson::Bson::Double(f) => Some(*f as f32),
-                        bson::Bson::Int32(i) => Some(*i as f32),
-                        bson::Bson::Int64(i) => Some(*i as f32),
+                if let Ok(Some(RawBsonRef::Array(arr))) = doc.get(field) {
+                    let vec: Vec<f32> = arr.into_iter().filter_map(|v| match v.ok()? {
+                        RawBsonRef::Double(f) => Some(f as f32),
+                        RawBsonRef::Int32(i) => Some(i as f32),
+                        RawBsonRef::Int64(i) => Some(i as f32),
                         _ => None,
                     }).collect();
                     if vec.len() == *dim {
@@ -407,7 +484,7 @@ impl IndexManager {
         scored.sort_by(cmp);
 
         scored.into_iter().filter_map(|(i, score)|
-            self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
+            self.documents.get(&ids[i]).and_then(|doc| doc.to_document().ok()).map(|doc| (doc, score))
         ).collect()
     }
 
@@ -454,14 +531,14 @@ impl IndexManager {
         scored.sort_by(cmp);
 
         scored.into_iter().filter_map(|(i, score)|
-            self.documents.get(&ids[i]).map(|doc| (doc.as_ref().clone(), score))
+            self.documents.get(&ids[i]).and_then(|doc| doc.to_document().ok()).map(|doc| (doc, score))
         ).collect()
     }
 
     pub fn text_search(&self, field: &str, query: &str, limit: usize) -> Vec<(Document, f32)> {
         let ti = match self.text_indexes.get(field) { Some(ti) => ti, None => return Vec::new() };
         ti.search(query, limit).into_iter().filter_map(|(id, score)|
-            self.documents.get(&id).map(|doc| (doc.as_ref().clone(), score))
+            self.documents.get(&id).and_then(|doc| doc.to_document().ok()).map(|doc| (doc, score))
         ).collect()
     }
 }
@@ -470,7 +547,11 @@ fn is_operator_doc(val: &bson::Bson) -> bool {
     matches!(val, bson::Bson::Document(d) if d.keys().any(|k| k.starts_with('$')))
 }
 
-/// Flatten a BSON value into the text an inverted index should see.
+/// Flatten a raw BSON value into the text an inverted index should see.
+/// Mirror of the old `&bson::Bson`-based `text_index_value`, operating on
+/// `RawBsonRef` (borrowed, no allocation until a `String` is actually built)
+/// so `add_raw`/`remove` never need to decode a document just to index its
+/// text fields.
 ///
 /// Strings index as themselves.  Arrays are squashed into one space-joined
 /// string and indexed like any other field, which is what Lucene does for
@@ -479,21 +560,26 @@ fn is_operator_doc(val: &bson::Bson) -> bool {
 /// an empty index in silence and every search against it returned nothing.
 /// Nested arrays flatten recursively; non-textual scalars are stringified so
 /// numeric tags stay searchable.
-fn text_index_value(val: &bson::Bson) -> Option<String> {
+fn raw_text_index_value(val: RawBsonRef) -> Option<String> {
     match val {
-        bson::Bson::String(s) => Some(s.clone()),
-        bson::Bson::Array(arr) => {
-            let parts: Vec<String> = arr.iter().filter_map(text_index_value).collect();
+        RawBsonRef::String(s) => Some(s.to_string()),
+        RawBsonRef::Array(arr) => {
+            let parts: Vec<String> = arr.into_iter()
+                .filter_map(|v| raw_text_index_value(v.ok()?))
+                .collect();
             if parts.is_empty() { None } else { Some(parts.join(" ")) }
         }
-        bson::Bson::Int32(i) => Some(i.to_string()),
-        bson::Bson::Int64(i) => Some(i.to_string()),
-        bson::Bson::Double(f) => Some(f.to_string()),
-        bson::Bson::Boolean(b) => Some(b.to_string()),
+        RawBsonRef::Int32(i) => Some(i.to_string()),
+        RawBsonRef::Int64(i) => Some(i.to_string()),
+        RawBsonRef::Double(f) => Some(f.to_string()),
+        RawBsonRef::Boolean(b) => Some(b.to_string()),
         _ => None,
     }
 }
 
+/// Mirror of `raw_bson_to_value` for already-decoded `&bson::Bson` values —
+/// still used by filter-side lookups (`lookup_exact_ids`/`lookup_range_ids`
+/// take a query filter's `&Bson`, not a stored document's raw bytes).
 fn bson_to_value(v: &bson::Bson) -> Option<Value> {
     match v {
         bson::Bson::Null => Some(Value::Null), bson::Bson::Boolean(b) => Some(Value::Bool(*b)),
@@ -502,6 +588,21 @@ fn bson_to_value(v: &bson::Bson) -> Option<Value> {
         bson::Bson::String(s) => Some(Value::String(s.clone())),
         bson::Bson::DateTime(d) => Some(Value::DateTime(d.timestamp_millis())),
         bson::Bson::ObjectId(o) => Some(Value::ObjectId(o.bytes())),
+        _ => None,
+    }
+}
+
+/// As `bson_to_value`, for a value borrowed straight out of a stored
+/// document's raw BSON bytes — used by `add_raw`/`remove` so indexing never
+/// needs a full `Document` decode.
+fn raw_bson_to_value(v: RawBsonRef) -> Option<Value> {
+    match v {
+        RawBsonRef::Null => Some(Value::Null), RawBsonRef::Boolean(b) => Some(Value::Bool(b)),
+        RawBsonRef::Int32(i) => Some(Value::I32(i)), RawBsonRef::Int64(i) => Some(Value::I64(i)),
+        RawBsonRef::Double(f) => Some(Value::Double(OrderedFloat(f))),
+        RawBsonRef::String(s) => Some(Value::String(s.to_string())),
+        RawBsonRef::DateTime(d) => Some(Value::DateTime(d.timestamp_millis())),
+        RawBsonRef::ObjectId(o) => Some(Value::ObjectId(o.bytes())),
         _ => None,
     }
 }
