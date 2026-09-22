@@ -168,6 +168,8 @@ final class Native {
         FunctionDescriptor.of(C_INT, PTR, PTR));
     static final MethodHandle REEMBED = handle("moofile_reembed",
         FunctionDescriptor.of(C_LONG, PTR, PTR, PTR));
+    static final MethodHandle REPAIR = handle("moofile_repair",
+        FunctionDescriptor.of(PTR_DEREF, PTR, PTR));
 
     // Memory
     static final MethodHandle FREE_STRING = handle("moofile_free_string",

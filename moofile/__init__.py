@@ -18,12 +18,16 @@ import warnings as _warnings
 
 from .aggregation import collect, count, first, last, max, mean, min, sum
 from .errors import (
+    BinaryFieldTooLargeError,
     ConcurrentAccessError,
+    CorruptRecordError,
     DocumentNotFoundError,
+    DocumentTooLargeError,
     DuplicateKeyError,
     MooFileError,
     ReadOnlyError,
 )
+from .storage import MAX_BINARY_SIZE, MAX_DOCUMENT_SIZE, RepairGap, RepairReport
 
 from importlib.metadata import PackageNotFoundError, version as _package_version
 
@@ -78,6 +82,14 @@ __all__ = [
     "DocumentNotFoundError",
     "ReadOnlyError",
     "ConcurrentAccessError",
+    "CorruptRecordError",
+    "DocumentTooLargeError",
+    "BinaryFieldTooLargeError",
+    # Recovery
+    "RepairReport",
+    "RepairGap",
+    "MAX_DOCUMENT_SIZE",
+    "MAX_BINARY_SIZE",
     # Aggregation functions
     "count",
     "sum",

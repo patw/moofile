@@ -606,6 +606,40 @@ public class Collection implements AutoCloseable {
         }
     }
 
+    /**
+     * Salvage a damaged data file, without opening it.
+     *
+     * <p>Keeps every record that still decodes and drops the byte spans that
+     * do not, resynchronising past damage where an intact record follows it
+     * and truncating where none does.  Surviving records are copied verbatim
+     * and in order, so the repaired log replays to exactly the state its
+     * intact part describes.
+     *
+     * <p>This is a static method rather than an instance one because the case
+     * it exists for is a file {@link #open(String, Config)} throws on — at
+     * which point there is no Collection to call a method on.  Use
+     * {@link Config#repair(boolean)} to have it run automatically.
+     *
+     * <p>A cleanly truncated tail (an interrupted write, including one that
+     * left an all-zero tail) is already trimmed on open and needs none of
+     * this.  An intact file is left untouched and reported with
+     * {@code rewritten() == false}.
+     */
+    public static RepairReport repair(String path) {
+        if (path == null) throw new MooFileException("path must not be null");
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment err = Native.errOut(arena);
+            MemorySegment result = (MemorySegment) Native.REPAIR.invokeExact(
+                Native.cString(arena, path), err);
+            Native.checkError(err);
+            String json = Native.takeString(result);
+            if (json == null) throw new MooFileException("repair failed: " + path);
+            return RepairReport.fromJson(json);
+        } catch (Throwable t) {
+            throw Native.rethrow(t);
+        }
+    }
+
     /** Rewrite the file, reclaiming space from dead records. */
     public synchronized void compact() { callVoid(Native.COMPACT); }
 

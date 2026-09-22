@@ -147,8 +147,12 @@ type Config struct {
 	TextIndexes   []string                   `json:"text_indexes,omitempty"`
 	AutoEmbed     map[string]AutoEmbedConfig `json:"auto_embed,omitempty"`
 	Readonly      bool                       `json:"readonly,omitempty"`
-	Durability    string                     `json:"durability,omitempty"` // "none", "os" (default), "fsync"
-	ModelCacheDir string                     `json:"model_cache_dir,omitempty"`
+	// Repair salvages a corrupt data file instead of failing to open it.  A
+	// repair drops data, so this is off by default — see [Repair], which it
+	// runs for you.
+	Repair        bool   `json:"repair,omitempty"`
+	Durability    string `json:"durability,omitempty"` // "none", "os" (default), "fsync"
+	ModelCacheDir string `json:"model_cache_dir,omitempty"`
 }
 
 func (c *Config) toJSON() (string, error) {
@@ -314,6 +318,71 @@ func Open(path string, config *Config) (*Collection, error) {
 	// Backstop for callers who forget Close; Close remains the documented way.
 	runtime.SetFinalizer(c, func(c *Collection) { _ = c.Close() })
 	return c, nil
+}
+
+// RepairGap is a span of bytes a repair could not parse and dropped.
+type RepairGap struct {
+	// Offset is the byte offset where the damage starts.
+	Offset int64 `json:"offset"`
+	// Length is the number of bytes dropped.
+	Length int64 `json:"length"`
+	// ToEndOfFile reports whether the damage ran to the end of the file —
+	// i.e. this was a truncation rather than a skipped-over hole.
+	ToEndOfFile bool `json:"to_end_of_file"`
+}
+
+// RepairReport describes what a [Repair] pass did.
+type RepairReport struct {
+	// RecordsKept counts records that decoded and were preserved.
+	RecordsKept int64 `json:"records_kept"`
+	// BytesKept counts bytes of intact records preserved.
+	BytesKept int64 `json:"bytes_kept"`
+	// BytesDropped counts bytes of unparseable data dropped.
+	BytesDropped int64 `json:"bytes_dropped"`
+	// Rewritten is false when the file was already intact and was left alone.
+	Rewritten bool `json:"rewritten"`
+	// Gaps lists every damaged span, in file order.
+	Gaps []RepairGap `json:"gaps"`
+}
+
+// IsDamaged reports whether any damage was found.
+func (r RepairReport) IsDamaged() bool { return len(r.Gaps) > 0 }
+
+// Repair salvages a damaged data file, without opening it.
+//
+// It keeps every record that still decodes and drops the byte spans that do
+// not, resynchronising past damage where an intact record follows it and
+// truncating where none does.  Surviving records are copied verbatim and in
+// order, so the repaired log replays to exactly the state its intact part
+// describes.
+//
+// This is a package function rather than a [Collection] method because the
+// case it exists for is a file [Open] refuses — at which point there is no
+// Collection to call a method on.  Set Config.Repair to have it run for you.
+//
+// A cleanly truncated tail (an interrupted write, including one that left an
+// all-zero tail) is already trimmed on open and needs none of this.  An intact
+// file is left untouched and reported with Rewritten false.
+func Repair(path string) (RepairReport, error) {
+	var arena cstrings
+	defer arena.free()
+	cPath := arena.new(path)
+
+	var report RepairReport
+	var errPtr *C.char
+	raw := C.moofile_repair(cPath, &errPtr)
+	if err := newError(errPtr); err != nil {
+		return report, err
+	}
+	if raw == nil {
+		return report, &Error{Msg: "moofile_repair returned null"}
+	}
+	s := takeString(raw)
+
+	if err := json.Unmarshal([]byte(s), &report); err != nil {
+		return report, fmt.Errorf("moofile: cannot decode repair report: %w", err)
+	}
+	return report, nil
 }
 
 // Path returns the file this collection was opened from.

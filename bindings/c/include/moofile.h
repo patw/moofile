@@ -72,6 +72,7 @@ typedef struct MooFileSearchCursor MooFileSearchCursor;
  *     "text_indexes": ["content"],
  *     "readonly": false,
  *     "durability": "os",   // "none", "os" (default), "fsync"
+ *     "repair": false,      // salvage a corrupt file instead of failing to open
  *     "auto_embed": {        // on-device embedding (v0.5.0+)
  *       "content": {
  *         "target": "embedding",                   // target vector field
@@ -414,6 +415,31 @@ int moofile_batch_rollback(MooFileCollection* handle, char** err_out);
  * Must be freed with moofile_free_string().
  */
 char* moofile_stats(MooFileCollection* handle, char** err_out);
+
+/**
+ * Salvage a damaged data file, without opening it.
+ *
+ * Keeps every record that still decodes and drops the byte spans that do not,
+ * resynchronising past damage where an intact record follows it and truncating
+ * where none does.  Surviving records are copied verbatim and in order, so the
+ * repaired log replays to exactly the state its intact part describes.
+ *
+ * Takes a path rather than a handle because the case it exists for is a file
+ * that moofile_open() refuses — at which point there is no handle to pass.
+ * Pass "repair": true in the open config to have this run automatically.
+ *
+ * Note that a cleanly truncated tail (an interrupted write, including one that
+ * left an all-zero tail) is already trimmed on open and needs none of this.
+ *
+ * Returns a JSON report, which must be freed with moofile_free_string():
+ *   {"records_kept": 19, "bytes_kept": 1387, "bytes_dropped": 73,
+ *    "rewritten": true,
+ *    "gaps": [{"offset": 688, "length": 73, "to_end_of_file": false}]}
+ *
+ * An intact file is left untouched and reported with "rewritten": false and an
+ * empty "gaps" array.  Returns NULL and sets *err_out on failure.
+ */
+char* moofile_repair(const char* path, char** err_out);
 
 /**
  * Compact the data file, reclaiming space from dead records.

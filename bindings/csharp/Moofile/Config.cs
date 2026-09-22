@@ -54,6 +54,15 @@ public class Config
 
     public bool Readonly { get; set; }
 
+    /// <summary>
+    /// Salvage a corrupt data file instead of failing to open it.
+    /// </summary>
+    /// <remarks>
+    /// A repair drops data, so this is off by default — see
+    /// <see cref="Collection.Repair(string)"/>, which this runs for you.
+    /// </remarks>
+    public bool Repair { get; set; }
+
     /// <summary>"none", "os" (default), or "fsync".</summary>
     public string Durability { get; set; } = "os";
 
@@ -93,6 +102,7 @@ public class Config
         }
 
         if (Readonly) obj["readonly"] = true;
+        if (Repair) obj["repair"] = true;
         obj["durability"] = Durability;
         if (ModelCacheDir != null) obj["model_cache_dir"] = ModelCacheDir;
 

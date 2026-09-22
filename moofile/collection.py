@@ -10,15 +10,23 @@ import time
 import bson
 from datetime import datetime, timezone
 
-from .errors import DocumentNotFoundError, DuplicateKeyError, ReadOnlyError
+from .errors import (
+    CorruptRecordError,
+    DocumentNotFoundError,
+    DuplicateKeyError,
+    ReadOnlyError,
+)
 from .index import IndexManager
 from .query import Query, copy_doc, matches, validate_filter
 from .storage import (
     RECORD_LIVE,
     RECORD_REPLACEMENT,
     RECORD_TOMBSTONE,
+    RepairGap,
+    RepairReport,
     StorageEngine,
     compact,
+    repair_file,
     scan_file,
     scan_from,
 )
@@ -27,7 +35,8 @@ from .storage import (
 #: Pickle cache layout version.  Bumped when the in-memory index structures
 #: change shape, so stale caches are rejected instead of misread.
 #:   1 -> 2: posting lists changed from list to insertion-ordered dict
-_CACHE_VERSION = 2
+#:   2 -> 3: the fingerprint gained the data file's (dev, ino)
+_CACHE_VERSION = 3
 
 
 def _generate_id() -> str:
@@ -105,6 +114,7 @@ class Collection:
         durability: str = "os",
         auto_embed=None,
         model_cache_dir=None,
+        repair: bool = False,
     ) -> None:
         # Accepted so that both backends have the same constructor signature —
         # a TypeError here would make a portable `auto_embed` block look like a
@@ -166,7 +176,84 @@ class Collection:
         self._index_manager = IndexManager(
             loaded_indexes, loaded_vector_indexes, loaded_text_indexes
         )
-        self._load_from_file()
+        try:
+            self._load_from_file()
+        except CorruptRecordError:
+            # A damaged record mid-file is unrecoverable by the scanner alone.
+            # With repair=True the caller has said they would rather lose the
+            # damaged span than not start; salvage the file and replay it once
+            # more.  Without it, the error stands.
+            if not repair or readonly:
+                raise
+            self._storage.close()
+            repair_file(path)
+            self._storage.reopen()
+            self._delete_cache()
+            self._index_manager = IndexManager(
+                loaded_indexes, loaded_vector_indexes, loaded_text_indexes
+            )
+            self._load_from_file()
+
+    @staticmethod
+    def repair(path: str) -> RepairReport:
+        """
+        Salvage a damaged data file, without needing to open it first.
+
+        Keeps every record that decodes and drops the byte spans that do not,
+        resynchronising past damage where an intact record follows it and
+        truncating where none does.  Surviving records are copied verbatim and
+        in order, so the repaired log replays to exactly the state its intact
+        part describes.
+
+        This is a static method rather than an instance one because the case
+        it exists for is a file that the constructor refuses — at which point
+        there is no Collection to call a method on.  Nothing else in the public
+        API can reach the file.
+
+        The rewrite is staged through a temp file and renamed into place, under
+        the same exclusive lock writes take, so it is safe against other
+        processes holding the file open: they see the inode change and reload.
+        A file with nothing wrong is left untouched and reported as such.
+
+        Returns a RepairReport describing what was kept and what was dropped.
+        """
+        if not os.path.exists(path):
+            return RepairReport()
+
+        # Take the lock writes take: a repair rewrites the file wholesale, so
+        # interleaving it with another process's append would drop that append.
+        # Best-effort, like every other lock acquisition here.
+        lock_fd = None
+        try:
+            lock_fd = os.open(path + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+        except OSError:
+            lock_fd = None
+
+        try:
+            report = repair_file(path)
+        finally:
+            if lock_fd is not None:
+                try:
+                    import fcntl
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (ImportError, OSError):
+                    pass
+                os.close(lock_fd)
+
+        # The cache describes the pre-repair file; it is wrong now, and its
+        # (length, mtime) stamp would not catch that on its own.
+        if report.rewritten:
+            try:
+                os.remove(path + ".cache")
+            except OSError:
+                pass
+
+        return report
 
     # -----------------------------------------------------------------------
     # Insert
@@ -810,16 +897,21 @@ class Collection:
     # Cache management
     # ------------------------------------------------------------------
 
-    def _file_fingerprint(self) -> tuple[int, int] | None:
-        """Return (size, mtime_ns) for the data file, or None if unreadable."""
-        try:
-            stat = os.stat(self._path)
-            return (stat.st_size, stat.st_mtime_ns)
-        except OSError:
-            return None
-
     def _file_identity(self):
-        """Return (size, mtime_ns, (dev, ino)) or None if unreadable."""
+        """Return (size, mtime_ns, (dev, ino)) for the data file, or None.
+
+        The identity is part of this because size and mtime alone cannot see a
+        compact(): it renames a freshly written file over the path, and
+        rewriting the same live set reproduces the same size — not by
+        coincidence but by construction, since that is exactly what compaction
+        does when there is nothing dead to drop.  (dev, ino) is the only part
+        that always changes when the file is replaced.
+
+        Platform note: os.stat populates st_ino on Windows too (the file
+        index), so this check is live there, where the Rust backend's is not —
+        it has no stable API for the file index and stamps 0.  The asymmetry
+        only ever costs the stricter side a rebuild; see _try_load_cache.
+        """
         try:
             st = os.stat(self._path)
             return (st.st_size, st.st_mtime_ns, (st.st_dev, st.st_ino))
@@ -832,10 +924,10 @@ class Collection:
             return False
 
         # Current data file fingerprint
-        fp = self._file_fingerprint()
+        fp = self._file_identity()
         if fp is None:
             return False
-        actual_len, actual_mtime_ns = fp
+        actual_len, actual_mtime_ns, actual_ident = fp
 
         try:
             with open(self._cache_path, "rb") as f:
@@ -847,10 +939,16 @@ class Collection:
         if cache.get("_magic") != b"MOOF" or cache.get("_version") != _CACHE_VERSION:
             return False
 
-        # Validate data file fingerprint
+        # Validate data file fingerprint (length + mtime + identity).
+        #
+        # A mismatch in any of the three is a miss, which only ever costs a
+        # rebuild — so an identity that one platform can supply and another
+        # cannot (or a cache file carried between them) errs the safe way.
         if cache.get("_data_file_length") != actual_len:
             return False
         if cache.get("_data_file_mtime_ns") != actual_mtime_ns:
+            return False
+        if cache.get("_data_file_ident") != actual_ident:
             return False
 
         # Validate index configuration matches
@@ -881,8 +979,9 @@ class Collection:
 
         # Stamp the file state the index actually describes.  With multiple
         # processes that differs from the current state: another writer may
-        # have appended since. Stamping the current state would produce a cache
-        # that passes validation while silently omitting their records.
+        # have appended, or compacted, since.  Stamping the current state would
+        # produce a cache that passes validation while silently omitting their
+        # records.
         data_len, data_mtime_ns = self._known_len, self._known_mtime_ns
 
         cache = {
@@ -890,6 +989,7 @@ class Collection:
             "_version": _CACHE_VERSION,
             "_data_file_length": data_len,
             "_data_file_mtime_ns": data_mtime_ns,
+            "_data_file_ident": self._known_ino,
             "_total_records": self._total_records,
             "_regular_fields": list(self._index_manager._fields),
             "_vector_fields": dict(self._index_manager._vector_fields),

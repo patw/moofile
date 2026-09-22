@@ -73,6 +73,26 @@ the second as a plain result.
 whether to compact. Note that one delete produces **two** dead records (the
 superseded original plus a tombstone) and one update produces one.
 
+**Size limits.** Two caps are enforced on write, so that neither
+implementation can produce a file the other cannot read. A document whose
+encoded size exceeds **100 MiB** is rejected (`"document is N bytes, over the
+… limit"`), because the scanner refuses a longer record. A **single binary
+value over 16 MiB** is rejected too (`"binary field 'x' is N bytes, over the …
+limit"`) — that one is the BSON encoder's own cap, well below the first, and
+exceeding it makes the document unencodable and therefore invisible. Both
+arrive through the ordinary `err_out` path; bindings need no special handling.
+
+**Recovery.** `moofile_open()` trims a partial record at the end of the file
+by itself, including the all-zero tail a filesystem with delayed allocation
+leaves after a crash — a binding needs to do nothing for that case. Damage
+*with intact records after it* is reported instead (`"corrupt record at byte
+N"`), because truncating there would silently discard them.
+`moofile_repair(path, &err)` salvages such a file; it takes a **path, not a
+handle**, precisely because the file it exists for is one `moofile_open()`
+refuses. It returns the same owned-`char*` JSON as `moofile_stats()`. Every
+binding surfaces it as a static/free function alongside the collection type,
+plus a `"repair": true` open-config flag that runs it on demand.
+
 **Threading.** A collection handle may be shared between threads; the Rust
 core guards it. Cursors are not thread-safe.
 
@@ -586,15 +606,15 @@ Every suite below runs against a freshly built `libmoofile`.
 
 | Language | Tests | Command |
 |----------|:-----:|---------|
-| Python (both backends) | 320 | `PYTHONPATH=. pytest tests/ tests-cross/` |
-| Rust core | 92 | `cargo test` |
-| C | 73 | `cd bindings/c/tests && ./run_tests.sh --release` |
-| C++ | 43 | (same command) |
+| Python (both backends) | 398 | `PYTHONPATH=. pytest tests/ tests-cross/` |
+| Rust core | 118 | `cargo test` |
+| C | 78 | `cd bindings/c/tests && ./run_tests.sh --release` |
+| C++ | 47 | (same command) |
 | Cross-backend parity | 8 | (same command) |
-| Node.js | 23 | `cd bindings/node && node test.js` |
-| Go | 24 | `cd bindings/go && go test ./moofile/` |
-| Java | 32 | `cd bindings/java && ./build.sh test` |
-| C# | 33 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
+| Node.js | 28 | `cd bindings/node && node test.js` |
+| Go | 29 | `cd bindings/go && go test ./moofile/` |
+| Java | 37 | `cd bindings/java && ./build.sh test` |
+| C# | 38 | `cd bindings/csharp && dotnet run --project Moofile.Tests` |
 
 `run_tests.sh` now runs `test_parity.py` as its third stage. That script
 cross-checks the pure-Python, PyO3 and C backends against each other over the
@@ -604,7 +624,8 @@ exercise the Node, Go, Java or C# bindings, which have their own suites above.
 Each binding's suite covers the same ground: lifecycle, insert, the filter
 operators, the query builder, updates and deletes (including the differing
 no-match contracts), vector and text search, batch commit and rollback, stats
-and compaction, and the document/JSON round trip.
+and compaction, crash recovery (zero tail trimmed on open, interior damage
+reported and then repaired), and the document/JSON round trip.
 
 Every binding also ships a runnable example covering the same six topics —
 CRUD, sorting and aggregation, vector search, text search, atomic batches, and

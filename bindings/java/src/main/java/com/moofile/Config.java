@@ -18,6 +18,7 @@ public class Config {
     final List<String> textIndexes = new ArrayList<>();
     final Map<String, AutoEmbedConfig> autoEmbeds = new LinkedHashMap<>();
     boolean readonly = false;
+    boolean repair = false;
     String durability = "os";
     String modelCacheDir = "";
 
@@ -30,6 +31,13 @@ public class Config {
     public Config textIndex(String field) { textIndexes.add(field); return this; }
     public Config autoEmbed(String sourceField, AutoEmbedConfig cfg) { autoEmbeds.put(sourceField, cfg); return this; }
     public Config readonly(boolean r) { this.readonly = r; return this; }
+    /**
+     * Salvage a corrupt data file instead of failing to open it.
+     *
+     * A repair drops data, so this is off by default — see
+     * {@link Collection#repair(String)}, which this runs for you.
+     */
+    public Config repair(boolean r) { this.repair = r; return this; }
     public Config durability(String d) { this.durability = d; return this; }
     public Config modelCacheDir(String d) { this.modelCacheDir = d; return this; }
 
@@ -47,6 +55,7 @@ public class Config {
             cfg.put("auto_embed", ae);
         }
         if (readonly) cfg.put("readonly", true);
+        if (repair) cfg.put("repair", true);
         cfg.put("durability", durability);
         if (!modelCacheDir.isEmpty()) cfg.put("model_cache_dir", modelCacheDir);
         return new Document(cfg).toJson();

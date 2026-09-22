@@ -169,6 +169,7 @@ function loadLibrary(libPath) {
         sync: lib.func('int moofile_sync(MooFileCollection*, _Out_ void**)'),
         reindex: lib.func('int moofile_reindex(MooFileCollection*, _Out_ void**)'),
         reembed: lib.func('int64_t moofile_reembed(MooFileCollection*, const char*, _Out_ void**)'),
+        repair: lib.func('void* moofile_repair(const char*, _Out_ void**)'),
 
         // Memory
         freeString: lib.func('void moofile_free_string(void*)'),
@@ -360,8 +361,8 @@ class Collection {
     /**
      * @param {string} path Path to the .bson file (created if absent).
      * @param {object} config indexes, vector_indexes, text_indexes, readonly,
-     *   durability, auto_embed, model_cache_dir, and `libPath` to override
-     *   shared-library discovery.
+     *   repair, durability, auto_embed, model_cache_dir, and `libPath` to
+     *   override shared-library discovery.
      */
     constructor(filePath, config = {}) {
         this.api = loadLibrary(config.libPath);
@@ -373,6 +374,7 @@ class Collection {
             vector_indexes: config.vector_indexes,
             text_indexes: config.text_indexes,
             readonly: config.readonly,
+            repair: config.repair,
             durability: config.durability,
             auto_embed: config.auto_embed,
             model_cache_dir: config.model_cache_dir,
@@ -656,4 +658,37 @@ function open(filePath, config = {}) {
     return new Collection(filePath, config);
 }
 
-module.exports = { Collection, Cursor, SearchCursor, MooFileError, open };
+/**
+ * Salvage a damaged data file, without opening it.
+ *
+ * Keeps every record that still decodes and drops the byte spans that do not,
+ * resynchronising past damage where an intact record follows it and truncating
+ * where none does.  Surviving records are copied verbatim and in order, so the
+ * repaired log replays to exactly the state its intact part describes.
+ *
+ * This is a module function rather than a Collection method because the case
+ * it exists for is a file the constructor throws on — at which point there is
+ * no Collection to call a method on.  Pass `{ repair: true }` to the
+ * constructor to have this run automatically.
+ *
+ * A cleanly truncated tail (an interrupted write, including one that left an
+ * all-zero tail) is already trimmed on open and needs none of this.
+ *
+ * @param {string} filePath Path to the .bson file.
+ * @param {object} options `libPath` to override shared-library discovery.
+ * @returns {{records_kept: number, bytes_kept: number, bytes_dropped: number,
+ *   rewritten: boolean, gaps: Array<{offset: number, length: number,
+ *   to_end_of_file: boolean}>}} An intact file reports `rewritten: false` and
+ *   an empty `gaps`.
+ */
+function repair(filePath, options = {}) {
+    const api = loadLibrary(options.libPath);
+    const errOut = makeErrOut();
+    const raw = api.repair(filePath, errOut);
+    checkError(api, errOut);
+    const s = takeString(api, raw);
+    if (s === null) throw new MooFileError(`repair failed: ${filePath}`);
+    return JSON.parse(s);
+}
+
+module.exports = { Collection, Cursor, SearchCursor, MooFileError, open, repair };

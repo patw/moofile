@@ -122,7 +122,24 @@ impl IndexManager {
     /// hand (insert, load/replay) — this exists for callers (tests, the
     /// batch-commit path, cache replay) that only have a `Document`.
     pub fn add(&mut self, doc: Document) {
-        let Ok(raw) = RawDocumentBuf::try_from(&doc) else { return };
+        let raw = match RawDocumentBuf::try_from(&doc) {
+            Ok(raw) => raw,
+            Err(e) => {
+                // Skipping keeps the load total — returning an error here
+                // would make one unencodable record fail the whole open — but
+                // it must not be silent: the document is on disk and reads
+                // back as nothing, which is the same shape of bug as a
+                // non-string `_id`.  In practice this is a binary value over
+                // `MAX_BINARY_SIZE`, which both implementations now reject at
+                // insert, so reaching this means a file written by something
+                // that did not.
+                log::warn!(
+                    "moofile: document {} cannot be re-encoded and is absent                      from the index: {e}",
+                    doc.get_str("_id").unwrap_or("<no _id>"),
+                );
+                return;
+            }
+        };
         self.add_raw(raw);
     }
 

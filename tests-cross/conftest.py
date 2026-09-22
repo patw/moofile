@@ -47,8 +47,13 @@ def _rust_collection():
 
 
 @pytest.fixture
-def make_collection(backend, tmp_path):
-    """Return a factory for creating collections in a temp dir."""
+def collection_impl(backend):
+    """The Collection *class* for this backend.
+
+    Needed on its own by tests for the class-level recovery API (repair), which
+    exists precisely for files that cannot be opened — so there is no instance
+    to reach it through.
+    """
     if backend == "python":
         # Explicitly the pure-Python reference implementation.
         from moofile.collection import Collection as Impl
@@ -58,6 +63,13 @@ def make_collection(backend, tmp_path):
             pytest.skip("native extension not built — run cargo build in bindings/python")
     else:
         raise ValueError(f"Unknown backend: {backend}")
+    return Impl
+
+
+@pytest.fixture
+def make_collection(collection_impl, tmp_path):
+    """Return a factory for creating collections in a temp dir."""
+    Impl = collection_impl
 
     def _make(name="test.bson", **kwargs):
         path = tmp_path / name

@@ -555,6 +555,129 @@ public class CollectionTest {
     }
 
     // -----------------------------------------------------------------
+    // Recovery
+    //
+    // An interrupted write on a filesystem with delayed allocation leaves a
+    // file that is full length and reads back as zeros, not a short file.
+    // Open must recognise that as a tail and trim it; damage with intact
+    // records after it must be reported instead, and salvaged by repair().
+    // -----------------------------------------------------------------
+
+    /** Three documents, written and closed; returns the file path. */
+    private static String seed(String file) {
+        try (Collection db = Collection.open(path(file))) {
+            db.insertMany(List.of(
+                Document.of("_id", "a", "x", 1),
+                Document.of("_id", "b", "x", 2),
+                Document.of("_id", "c", "x", 3)));
+        }
+        return path(file);
+    }
+
+    /** Overwrite bytes in place, the way a lost filesystem block would. */
+    private static void clobber(String file, long at, int n) throws IOException {
+        byte[] bytes = Files.readAllBytes(Path.of(file));
+        for (int i = 0; i < n && at + i < bytes.length; i++) {
+            bytes[(int) at + i] = (byte) 0xCD;
+        }
+        Files.write(Path.of(file), bytes);
+        Files.deleteIfExists(Path.of(file + ".cache"));
+    }
+
+    private static void testOpenSelfHealsZeroTail() {
+        test("open trims an all-zero tail");
+        try {
+            String file = seed("zerotail.bson");
+            long good = Files.size(Path.of(file));
+
+            byte[] bytes = Files.readAllBytes(Path.of(file));
+            byte[] grown = Arrays.copyOf(bytes, bytes.length + 1814);
+            Files.write(Path.of(file), grown);
+
+            try (Collection db = Collection.open(file)) {
+                checkEquals(db.count(), 3L, "records before the zeros survive");
+                checkEquals(Files.size(Path.of(file)), good, "zero tail trimmed");
+            }
+        } catch (IOException e) {
+            check(false, "io: " + e);
+        }
+    }
+
+    private static void testOpenReportsInteriorDamage() {
+        test("open refuses damage that has records after it");
+        try {
+            String file = seed("interior.bson");
+            long good = Files.size(Path.of(file));
+            clobber(file, good / 3, 20);
+
+            boolean threw = false;
+            try (Collection db = Collection.open(file)) {
+                check(false, "open should have thrown");
+            } catch (MooFileException e) {
+                threw = e.getMessage().contains("corrupt record");
+            }
+            check(threw, "must throw MooFileException naming a corrupt record");
+            checkEquals(Files.size(Path.of(file)), good, "must not silently truncate");
+        } catch (IOException e) {
+            check(false, "io: " + e);
+        }
+    }
+
+    private static void testRepairSalvagesInteriorDamage() {
+        test("repair salvages a file open refuses");
+        try {
+            String file = seed("salvage.bson");
+            clobber(file, Files.size(Path.of(file)) / 3, 20);
+
+            RepairReport report = Collection.repair(file);
+            check(report.rewritten(), "rewritten");
+            check(report.isDamaged(), "damaged");
+            checkEquals(report.recordsKept(), 2L, "records kept");
+            checkEquals(report.gaps().size(), 1, "one gap");
+            check(!report.gaps().get(0).toEndOfFile(), "resynced, not truncated");
+            check(report.bytesDropped() > 0, "dropped bytes reported");
+
+            try (Collection db = Collection.open(file)) {
+                checkEquals(db.count(), 2L, "reopens after repair");
+            }
+        } catch (IOException e) {
+            check(false, "io: " + e);
+        }
+    }
+
+    private static void testConfigRepairOnOpen() {
+        test("Config.repair(true) salvages on open");
+        try {
+            String file = seed("repaircfg.bson");
+            clobber(file, Files.size(Path.of(file)) / 3, 20);
+
+            try (Collection db = Collection.open(file, Config.create().repair(true))) {
+                checkEquals(db.count(), 2L, "opened and salvaged");
+            }
+        } catch (IOException e) {
+            check(false, "io: " + e);
+        }
+    }
+
+    private static void testRepairIntactFileIsNoOp() {
+        test("repair leaves an intact file untouched");
+        try {
+            String file = seed("repairclean.bson");
+            byte[] before = Files.readAllBytes(Path.of(file));
+
+            RepairReport report = Collection.repair(file);
+            check(!report.rewritten(), "not rewritten");
+            check(!report.isDamaged(), "not damaged");
+            checkEquals(report.recordsKept(), 3L, "records counted");
+            check(report.gaps().isEmpty(), "no gaps");
+            check(Arrays.equals(before, Files.readAllBytes(Path.of(file))),
+                "bytes unchanged");
+        } catch (IOException e) {
+            check(false, "io: " + e);
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Main
     // -----------------------------------------------------------------
 
@@ -597,6 +720,11 @@ public class CollectionTest {
             CollectionTest::testReembedWithoutConfig,
             CollectionTest::testSyncAndReindex,
             CollectionTest::testReadonlyRejectsWrites,
+            CollectionTest::testOpenSelfHealsZeroTail,
+            CollectionTest::testOpenReportsInteriorDamage,
+            CollectionTest::testRepairSalvagesInteriorDamage,
+            CollectionTest::testConfigRepairOnOpen,
+            CollectionTest::testRepairIntactFileIsNoOp,
         };
 
         for (Runnable t : tests) {

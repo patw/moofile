@@ -94,6 +94,12 @@ export interface CollectionConfig {
     /** Source text fields to embed on insert, keyed by field name. */
     auto_embed?: Record<string, AutoEmbedConfig>;
     readonly?: boolean;
+    /**
+     * Salvage a corrupt data file instead of failing to open it.  A repair
+     * drops data, so this is off by default — see {@link repair}, which this
+     * runs for you.
+     */
+    repair?: boolean;
     /** Defaults to "os". */
     durability?: 'none' | 'os' | 'fsync';
     model_cache_dir?: string;
@@ -263,3 +269,41 @@ export class Collection {
 
 /** Convenience wrapper for `new Collection(path, config)`. */
 export function open(path: string, config?: CollectionConfig): Collection;
+
+/** A span of bytes a repair could not parse and dropped. */
+export interface RepairGap {
+    /** Byte offset where the damage starts. */
+    offset: number;
+    /** Number of bytes dropped. */
+    length: number;
+    /** True if the damage ran to the end of the file — a truncation, not a hole. */
+    to_end_of_file: boolean;
+}
+
+/** What a {@link repair} pass did. */
+export interface RepairReport {
+    /** Records that decoded and were preserved. */
+    records_kept: number;
+    /** Bytes of intact records preserved. */
+    bytes_kept: number;
+    /** Bytes of unparseable data dropped. */
+    bytes_dropped: number;
+    /** False when the file was already intact and was left untouched. */
+    rewritten: boolean;
+    /** Every damaged span, in file order. */
+    gaps: RepairGap[];
+}
+
+/**
+ * Salvage a damaged data file, without opening it.
+ *
+ * A module function rather than a Collection method because the case it exists
+ * for is a file the constructor throws on.  Pass `{ repair: true }` to the
+ * constructor to have it run automatically.  A cleanly truncated tail (an
+ * interrupted write, including one that left an all-zero tail) is already
+ * trimmed on open and needs none of this.
+ */
+export function repair(
+    path: string,
+    options?: { libPath?: string },
+): RepairReport;

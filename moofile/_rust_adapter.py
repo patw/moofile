@@ -61,8 +61,11 @@ def _validate_filter(filter_dict):
 def _map_errors(e):
     """Re-raise a native RuntimeError/ValueError as the proper MooFile exception."""
     from .errors import (
+        BinaryFieldTooLargeError,
         ConcurrentAccessError,
+        CorruptRecordError,
         DocumentNotFoundError,
+        DocumentTooLargeError,
         DuplicateKeyError,
         InvalidFilterError,
         InvalidIdError,
@@ -82,6 +85,12 @@ def _map_errors(e):
         raise InvalidIdError(str(e)) from e
     if "invalid filter" in msg:
         raise InvalidFilterError(str(e)) from e
+    if "corrupt record" in msg:
+        raise CorruptRecordError(str(e)) from e
+    if "binary field" in msg and "byte limit" in msg:
+        raise BinaryFieldTooLargeError(str(e)) from e
+    if "over the" in msg and "byte limit" in msg:
+        raise DocumentTooLargeError(str(e)) from e
     # Autoembedding failures (missing model file, no config for the source
     # field, a build without the `embed` feature, a failed download).  The
     # core has no dedicated exception for these, so they surface as the base
@@ -126,6 +135,7 @@ class Collection:
         durability: str = "os",
         auto_embed=None,
         model_cache_dir=None,
+        repair: bool = False,
     ):
         if _NativeCollection is None:
             raise ImportError("Native moofile extension not loaded")
@@ -139,6 +149,7 @@ class Collection:
                 durability=durability,
                 auto_embed=dict(auto_embed) if auto_embed else None,
                 model_cache_dir=str(model_cache_dir) if model_cache_dir else None,
+                repair=repair,
             )
         except RuntimeError as e:
             _map_errors(e)
@@ -154,6 +165,48 @@ class Collection:
             vfields = dict(vector_indexes) if vector_indexes else {}
             tfields = list(text_indexes) if text_indexes else []
         self._index_manager = _IndexManagerShim(vfields, tfields)
+
+    @staticmethod
+    def repair(path: str):
+        """
+        Salvage a damaged data file, without needing to open it first.
+
+        Keeps every record that decodes and drops the byte spans that do not,
+        resynchronising past damage where an intact record follows it and
+        truncating where none does.  Surviving records are copied verbatim and
+        in order, so the repaired log replays to exactly the state its intact
+        part describes.
+
+        This is a static method rather than an instance one because the case
+        it exists for is a file that the constructor refuses — at which point
+        there is no Collection to call a method on.
+
+        Returns a RepairReport describing what was kept and what was dropped.
+        """
+        from ._native import repair as _native_repair  # type: ignore[import-untyped]
+        from .storage import RepairGap, RepairReport
+
+        try:
+            kept, bytes_kept, bytes_dropped, rewritten, gaps = _native_repair(str(path))
+        except (RuntimeError, ValueError) as e:
+            _map_errors(e)
+
+        return RepairReport(
+            records_kept=kept,
+            bytes_kept=bytes_kept,
+            bytes_dropped=bytes_dropped,
+            gaps=[RepairGap(o, l, eof) for (o, l, eof) in gaps],
+            rewritten=rewritten,
+        )
+
+    @property
+    def _loaded_from_cache(self) -> bool:
+        """Whether the index came from the .cache snapshot rather than a scan.
+
+        Diagnostic only, and named to match the pure-Python attribute so tests
+        can assert the same thing against either backend.
+        """
+        return self._native.loaded_from_cache()
 
     # --- Insert ---
 

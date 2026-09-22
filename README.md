@@ -87,6 +87,45 @@ many simultaneous writers will queue.
 
 ---
 
+## Surviving a crash
+
+The file is an append-only log, so a write interrupted by a crash or a power
+cut leaves a partial record at the end and nothing else damaged. Opening the
+collection trims it — that includes the case where the filesystem gives the
+file its new length but loses the data blocks, so the tail reads back as zeros
+rather than as a short file. Nothing to do; it just opens.
+
+Damage *in the middle* of the file is a different thing, and gets a different
+answer: opening raises `CorruptRecordError` rather than quietly truncating
+away everything after it. To salvage what is still readable:
+
+```python
+from moofile import Collection
+
+report = Collection.repair("app.bson")       # takes a path, not an open handle
+if report.is_damaged:
+    print(f"kept {report.records_kept} records, "
+          f"dropped {report.bytes_dropped} bytes across {len(report.gaps)} span(s)")
+```
+
+`repair` keeps every record that still decodes and drops the byte spans that do
+not, resynchronising past the damage where intact records follow it. It stages
+the rewrite through a temp file and renames, so an interrupted repair leaves
+the original alone, and an intact file is not rewritten at all.
+
+A long-running service that would rather lose a damaged span than fail to start
+can have that happen on open:
+
+```python
+db = Collection("app.bson", repair=True)     # salvage instead of raising
+```
+
+It is off by default because a repair drops data, and for anyone who keeps
+backups or wants to look at the file first, failing loudly is the better
+answer.
+
+---
+
 ## Installation
 
 ```bash

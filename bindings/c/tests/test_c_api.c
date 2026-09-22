@@ -1331,6 +1331,155 @@ static void test_reindex(void) {
  * Error handling tests
  * --------------------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * Recovery
+ *
+ * An interrupted write on a filesystem with delayed allocation leaves a file
+ * that is full length and reads back as zeros, not a short file.  Open must
+ * recognise that as a tail and trim it; damage with intact records after it
+ * must be reported instead, and salvaged by moofile_repair().
+ * ------------------------------------------------------------------------ */
+
+/* Append `n` bytes of `byte` to a file. */
+static void append_bytes(const char* path, unsigned char byte, size_t n) {
+    FILE* f = fopen(path, "ab");
+    ASSERT(f != NULL);
+    for (size_t i = 0; i < n; i++) fputc(byte, f);
+    fclose(f);
+}
+
+static long file_size(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fclose(f);
+    return n;
+}
+
+static void test_open_self_heals_zero_tail(void) {
+    TEST("open trims an all-zero tail instead of failing");
+    char* err = NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s", make_path("zerotail.bson"));
+
+    MooFileCollection* db = moofile_open(path, NULL, &err);
+    ASSERT(db != NULL);
+    moofile_insert_many(db, "[{\"x\":1},{\"x\":2},{\"x\":3}]", &err);
+    moofile_close(db, &err);
+
+    long good = file_size(path);
+    append_bytes(path, 0x00, 1814);
+    ASSERT(file_size(path) == good + 1814);
+
+    db = moofile_open(path, NULL, &err);
+    ASSERT(err == NULL);
+    ASSERT(db != NULL);
+    ASSERT(moofile_count(db, "{}", &err) == 3);
+    ASSERT(file_size(path) == good);
+    moofile_close(db, &err);
+}
+
+static void test_open_reports_interior_damage(void) {
+    TEST("open refuses a file whose damage has records after it");
+    char* err = NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s", make_path("interior.bson"));
+
+    MooFileCollection* db = moofile_open(path, NULL, &err);
+    ASSERT(db != NULL);
+    moofile_insert_many(db, "[{\"x\":1},{\"x\":2},{\"x\":3}]", &err);
+    moofile_close(db, &err);
+
+    /* Clobber a record in the middle, leaving intact ones on both sides. */
+    long good = file_size(path);
+    FILE* f = fopen(path, "r+b");
+    ASSERT(f != NULL);
+    fseek(f, good / 3, SEEK_SET);
+    for (int i = 0; i < 20; i++) fputc(0xCD, f);
+    fclose(f);
+    remove(make_path("interior.bson.cache"));
+
+    db = moofile_open(path, NULL, &err);
+    ASSERT(db == NULL);
+    ASSERT(err != NULL);
+    ASSERT(strstr(err, "corrupt record") != NULL);
+    moofile_free_string(err);
+    err = NULL;
+    ASSERT(file_size(path) == good); /* must not silently truncate */
+
+    /* ...and repair salvages the rest. */
+    char* report = moofile_repair(path, &err);
+    ASSERT(err == NULL);
+    ASSERT(report != NULL);
+    ASSERT(strstr(report, "\"rewritten\":true") != NULL);
+    ASSERT(strstr(report, "\"to_end_of_file\":false") != NULL);
+    moofile_free_string(report);
+
+    db = moofile_open(path, NULL, &err);
+    ASSERT(err == NULL);
+    ASSERT(db != NULL);
+    ASSERT(moofile_count(db, "{}", &err) == 2);
+    moofile_close(db, &err);
+}
+
+static void test_open_with_repair_config(void) {
+    TEST("open with \"repair\":true salvages instead of failing");
+    char* err = NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s", make_path("repaircfg.bson"));
+
+    MooFileCollection* db = moofile_open(path, NULL, &err);
+    ASSERT(db != NULL);
+    moofile_insert_many(db, "[{\"x\":1},{\"x\":2},{\"x\":3}]", &err);
+    moofile_close(db, &err);
+
+    long good = file_size(path);
+    FILE* f = fopen(path, "r+b");
+    ASSERT(f != NULL);
+    fseek(f, good / 3, SEEK_SET);
+    for (int i = 0; i < 20; i++) fputc(0xCD, f);
+    fclose(f);
+    remove(make_path("repaircfg.bson.cache"));
+
+    db = moofile_open(path, "{\"repair\":true}", &err);
+    ASSERT(err == NULL);
+    ASSERT(db != NULL);
+    ASSERT(moofile_count(db, "{}", &err) == 2);
+    moofile_close(db, &err);
+}
+
+static void test_repair_intact_file_is_a_no_op(void) {
+    TEST("repair leaves an intact file untouched");
+    char* err = NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s", make_path("repairclean.bson"));
+
+    MooFileCollection* db = moofile_open(path, NULL, &err);
+    ASSERT(db != NULL);
+    moofile_insert_many(db, "[{\"x\":1},{\"x\":2}]", &err);
+    moofile_close(db, &err);
+    long before = file_size(path);
+
+    char* report = moofile_repair(path, &err);
+    ASSERT(err == NULL);
+    ASSERT(report != NULL);
+    ASSERT(strstr(report, "\"rewritten\":false") != NULL);
+    ASSERT(strstr(report, "\"gaps\":[]") != NULL);
+    ASSERT(strstr(report, "\"records_kept\":2") != NULL);
+    moofile_free_string(report);
+    ASSERT(file_size(path) == before);
+}
+
+static void test_repair_null_path(void) {
+    TEST("repair with a NULL path reports an error");
+    char* err = NULL;
+    char* report = moofile_repair(NULL, &err);
+    ASSERT(report == NULL);
+    ASSERT(err != NULL);
+    moofile_free_string(err);
+}
+
 static void test_error_null_handle_on_all_ops(void) {
     TEST("all functions reject null handle with error");
     char* err = NULL;
@@ -1530,6 +1679,13 @@ int main(void) {
     test_compact();
     test_sync();
     test_reindex();
+    
+    /* Recovery */
+    test_open_self_heals_zero_tail();
+    test_open_reports_interior_damage();
+    test_open_with_repair_config();
+    test_repair_intact_file_is_a_no_op();
+    test_repair_null_path();
     
     /* Error handling */
     test_error_null_handle_on_all_ops();

@@ -40,9 +40,20 @@ fn py_document_via_pymongo(dict: &Bound<PyDict>) -> PyResult<Document> {
 /// Encode a BSON document to raw bytes for Python-side decoding (item #6).
 /// Returning raw bytes avoids the slow recursive PyDict building in bson_to_py
 /// and the lossy _ => val.to_string() fallback.
-fn doc_to_bson_bytes(doc: &Document, py: Python<'_>) -> PyObject {
-    let bytes = bson::to_vec(doc).unwrap_or_default();
-    PyBytes::new(py, &bytes).into()
+/// Encode a document for return to Python.
+///
+/// This used to be `unwrap_or_default()`, which handed back an empty buffer on
+/// an encode failure — the adapter then decoded it and raised pymongo's
+/// "not enough data for a BSON document", naming neither the document nor the
+/// real cause.  The core now rejects unencodable documents on the way in, so
+/// this should be unreachable; if it ever is reached, say so.
+fn doc_to_bson_bytes(doc: &Document, py: Python<'_>) -> PyResult<PyObject> {
+    match bson::to_vec(doc) {
+        Ok(bytes) => Ok(PyBytes::new(py, &bytes).into()),
+        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+            "cannot encode result document: {e}"
+        ))),
+    }
 }
 
 /// Build an [`AutoEmbedConfig`] from the Python dict for one source field.
@@ -140,7 +151,7 @@ struct NativeCollection {
 #[pymethods]
 impl NativeCollection {
     #[new]
-    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false, durability="os", auto_embed=None, model_cache_dir=None))]
+    #[pyo3(signature = (path, indexes=None, vector_indexes=None, text_indexes=None, readonly=false, durability="os", auto_embed=None, model_cache_dir=None, repair=false))]
     fn new(
         path: String,
         indexes: Option<Vec<String>>,
@@ -150,6 +161,7 @@ impl NativeCollection {
         durability: &str,
         auto_embed: Option<&Bound<PyDict>>,
         model_cache_dir: Option<String>,
+        repair: bool,
     ) -> PyResult<Self> {
         let dur = match durability {
             "none" => moofile_core::Durability::None,
@@ -192,6 +204,9 @@ impl NativeCollection {
         if readonly {
             builder = builder.readonly();
         }
+        if repair {
+            builder = builder.repair();
+        }
         let inner = builder
             .open()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -212,7 +227,11 @@ impl NativeCollection {
         let results = self.inner.insert_many(rust_docs).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
         })?;
-        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
+        let encoded = results
+            .iter()
+            .map(|d| doc_to_bson_bytes(d, py))
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -229,7 +248,11 @@ impl NativeCollection {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
+        let encoded = results
+            .iter()
+            .map(|d| doc_to_bson_bytes(d, py))
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -243,7 +266,7 @@ impl NativeCollection {
         let result = self.inner.insert(d).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string())
         })?;
-        Ok(doc_to_bson_bytes(&result, py))
+        doc_to_bson_bytes(&result, py)
     }
 
     fn find_one(
@@ -259,7 +282,7 @@ impl NativeCollection {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })?;
         match result {
-            Some(doc) => Ok(doc_to_bson_bytes(&doc, py)),
+            Some(doc) => doc_to_bson_bytes(&doc, py),
             None => Ok(py.None()),
         }
     }
@@ -282,7 +305,11 @@ impl NativeCollection {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let list = PyList::new(py, results.iter().map(|d| doc_to_bson_bytes(d, py)));
+        let encoded = results
+            .iter()
+            .map(|d| doc_to_bson_bytes(d, py))
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -300,7 +327,7 @@ impl NativeCollection {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
         })?;
         match result {
-            Some(doc) => Ok(doc_to_bson_bytes(&doc, py)),
+            Some(doc) => doc_to_bson_bytes(&doc, py),
             None => Ok(py.None()),
         }
     }
@@ -393,13 +420,14 @@ impl NativeCollection {
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let list = PyList::new(
-            py,
-            results.iter().map(|(doc, score)| {
-                let bytes = doc_to_bson_bytes(doc, py);
-                (bytes, *score as f64).to_object(py)
-            }),
-        );
+        let encoded = results
+            .iter()
+            .map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py)?;
+                Ok((bytes, *score as f64).to_object(py))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -425,13 +453,14 @@ impl NativeCollection {
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let list = PyList::new(
-            py,
-            results.iter().map(|(doc, score)| {
-                let bytes = doc_to_bson_bytes(doc, py);
-                (bytes, *score as f64).to_object(py)
-            }),
-        );
+        let encoded = results
+            .iter()
+            .map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py)?;
+                Ok((bytes, *score as f64).to_object(py))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -458,13 +487,14 @@ impl NativeCollection {
             .and_then(|vq| vq.to_list())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let list = PyList::new(
-            py,
-            results.iter().map(|(doc, score)| {
-                let bytes = doc_to_bson_bytes(doc, py);
-                (bytes, *score as f64).to_object(py)
-            }),
-        );
+        let encoded = results
+            .iter()
+            .map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py)?;
+                Ok((bytes, *score as f64).to_object(py))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -492,13 +522,14 @@ impl NativeCollection {
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        let list = PyList::new(
-            py,
-            results.iter().map(|(doc, score)| {
-                let bytes = doc_to_bson_bytes(doc, py);
-                (bytes, *score as f64).to_object(py)
-            }),
-        );
+        let encoded = results
+            .iter()
+            .map(|(doc, score)| {
+                let bytes = doc_to_bson_bytes(doc, py)?;
+                Ok((bytes, *score as f64).to_object(py))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let list = PyList::new(py, encoded);
         Ok(list.unwrap().into())
     }
 
@@ -528,6 +559,12 @@ impl NativeCollection {
     }
 
     /// Return index configuration for compatibility shims.
+    /// Whether the index came from the `.cache` snapshot rather than a scan.
+    /// Diagnostic only — see `Collection::loaded_from_cache`.
+    fn loaded_from_cache(&self) -> bool {
+        self.inner.loaded_from_cache()
+    }
+
     fn index_config(&self) -> PyResult<(Vec<String>, HashMap<String, usize>, Vec<String>)> {
         // Read the meta file to get the configured indexes.
         // This is a simplified approach — the Rust core doesn't expose
@@ -619,8 +656,34 @@ impl NativeCollection {
 // Module
 // ---------------------------------------------------------------------------
 
+/// Salvage a damaged data file without opening it.
+///
+/// Returns `(records_kept, bytes_kept, bytes_dropped, rewritten, gaps)` where
+/// `gaps` is a list of `(offset, length, to_end_of_file)`.  The adapter turns
+/// that into the same `RepairReport` the pure-Python backend returns — this
+/// stays a plain tuple so the two backends share one Python-side type rather
+/// than each defining their own.
+#[pyfunction]
+fn repair(path: String) -> PyResult<(u64, u64, u64, bool, Vec<(u64, u64, bool)>)> {
+    let report = RustCollection::repair(&path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    let gaps = report
+        .gaps
+        .iter()
+        .map(|g| (g.offset, g.length, g.to_end_of_file))
+        .collect();
+    Ok((
+        report.records_kept,
+        report.bytes_kept,
+        report.bytes_dropped,
+        report.rewritten,
+        gaps,
+    ))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NativeCollection>()?;
+    m.add_function(wrap_pyfunction!(repair, m)?)?;
     Ok(())
 }

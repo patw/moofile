@@ -539,3 +539,188 @@ func TestClosedCollectionRejectsCalls(t *testing.T) {
 		t.Errorf("Close should be idempotent, got %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Recovery
+//
+// An interrupted write on a filesystem with delayed allocation leaves a file
+// that is full length and reads back as zeros, not a short file.  Open must
+// recognise that as a tail and trim it; damage with intact records after it
+// must be reported instead, and salvaged by Repair.
+// ---------------------------------------------------------------------------
+
+// seedCollection writes n documents and returns the closed file's path.
+func seedCollection(t *testing.T, n int) string {
+	t.Helper()
+	path := tmpPath(t)
+	db, err := moofile.Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := make([]map[string]any, n)
+	for i := range docs {
+		docs[i] = map[string]any{"_id": string(rune('a' + i)), "x": i}
+	}
+	if _, err := db.InsertMany(docs); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	return path
+}
+
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+// clobber overwrites n bytes at `at` with garbage, simulating a lost block.
+func clobber(t *testing.T, path string, at int64, n int) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	junk := make([]byte, n)
+	for i := range junk {
+		junk[i] = 0xCD
+	}
+	if _, err := f.WriteAt(junk, at); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	os.Remove(path + ".cache")
+}
+
+func TestOpenSelfHealsZeroTail(t *testing.T) {
+	path := seedCollection(t, 3)
+	good := fileSize(t, path)
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(make([]byte, 1814)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	db, err := moofile.Open(path, nil)
+	if err != nil {
+		t.Fatalf("open should have trimmed the zero tail: %v", err)
+	}
+	defer db.Close()
+
+	n, err := db.Count(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Errorf("count = %d, want 3", n)
+	}
+	if got := fileSize(t, path); got != good {
+		t.Errorf("file size = %d, want %d (zero tail not trimmed)", got, good)
+	}
+}
+
+func TestOpenReportsInteriorDamage(t *testing.T) {
+	path := seedCollection(t, 3)
+	good := fileSize(t, path)
+	clobber(t, path, good/3, 20)
+
+	db, err := moofile.Open(path, nil)
+	if err == nil {
+		db.Close()
+		t.Fatal("open should refuse a file whose damage has records after it")
+	}
+	if !strings.Contains(err.Error(), "corrupt record") {
+		t.Errorf("error = %q, want it to mention a corrupt record", err)
+	}
+	if got := fileSize(t, path); got != good {
+		t.Errorf("file size = %d, want %d — must not silently truncate", got, good)
+	}
+}
+
+func TestRepairSalvagesInteriorDamage(t *testing.T) {
+	path := seedCollection(t, 3)
+	clobber(t, path, fileSize(t, path)/3, 20)
+
+	report, err := moofile.Repair(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Rewritten {
+		t.Error("report.Rewritten = false, want true")
+	}
+	if !report.IsDamaged() {
+		t.Error("report.IsDamaged() = false, want true")
+	}
+	if report.RecordsKept != 2 {
+		t.Errorf("RecordsKept = %d, want 2", report.RecordsKept)
+	}
+	if len(report.Gaps) != 1 {
+		t.Fatalf("len(Gaps) = %d, want 1", len(report.Gaps))
+	}
+	if report.Gaps[0].ToEndOfFile {
+		t.Error("gap should have resynced, not truncated")
+	}
+	if report.BytesDropped == 0 {
+		t.Error("BytesDropped = 0, want the damaged span's size")
+	}
+
+	db, err := moofile.Open(path, nil)
+	if err != nil {
+		t.Fatalf("reopen after repair: %v", err)
+	}
+	defer db.Close()
+	if n, _ := db.Count(nil); n != 2 {
+		t.Errorf("count after repair = %d, want 2", n)
+	}
+}
+
+func TestOpenWithRepairConfig(t *testing.T) {
+	path := seedCollection(t, 3)
+	clobber(t, path, fileSize(t, path)/3, 20)
+
+	db, err := moofile.Open(path, &moofile.Config{Repair: true})
+	if err != nil {
+		t.Fatalf("Config.Repair should salvage instead of failing: %v", err)
+	}
+	defer db.Close()
+	if n, _ := db.Count(nil); n != 2 {
+		t.Errorf("count = %d, want 2", n)
+	}
+}
+
+func TestRepairIntactFileIsNoOp(t *testing.T) {
+	path := seedCollection(t, 4)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := moofile.Repair(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Rewritten {
+		t.Error("Rewritten = true, want false for an intact file")
+	}
+	if report.IsDamaged() {
+		t.Error("IsDamaged() = true, want false")
+	}
+	if report.RecordsKept != 4 {
+		t.Errorf("RecordsKept = %d, want 4", report.RecordsKept)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Error("an intact file must be left byte-for-byte untouched")
+	}
+}

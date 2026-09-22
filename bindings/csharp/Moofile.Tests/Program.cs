@@ -618,6 +618,119 @@ public static class Program
     }
 
     // -----------------------------------------------------------------
+    // Recovery
+    //
+    // An interrupted write on a filesystem with delayed allocation leaves a
+    // file that is full length and reads back as zeros, not a short file.
+    // Open must recognise that as a tail and trim it; damage with intact
+    // records after it must be reported instead, and salvaged by Repair.
+    // -----------------------------------------------------------------
+
+    /// <summary>Three documents, written and closed; returns the file path.</summary>
+    private static string Seed(string file)
+    {
+        var path = Path(file);
+        using (var db = Collection.Open(path))
+        {
+            db.InsertMany(new[]
+            {
+                Document.Of("_id", "a", "x", 1),
+                Document.Of("_id", "b", "x", 2),
+                Document.Of("_id", "c", "x", 3),
+            });
+        }
+        return path;
+    }
+
+    /// <summary>Overwrite bytes in place, the way a lost block would.</summary>
+    private static void Clobber(string path, long at, int n)
+    {
+        var bytes = File.ReadAllBytes(path);
+        for (var i = 0; i < n && at + i < bytes.Length; i++) bytes[at + i] = 0xCD;
+        File.WriteAllBytes(path, bytes);
+        File.Delete(path + ".cache");
+    }
+
+    private static void TestOpenSelfHealsZeroTail()
+    {
+        Test("open trims an all-zero tail");
+        var path = Seed("zerotail.bson");
+        var good = new FileInfo(path).Length;
+
+        using (var f = new FileStream(path, FileMode.Append))
+        {
+            f.Write(new byte[1814], 0, 1814);
+        }
+
+        using var db = Collection.Open(path);
+        CheckEquals(db.Count(), 3L, "records before the zeros survive");
+        CheckEquals(new FileInfo(path).Length, good, "zero tail trimmed");
+    }
+
+    private static void TestOpenReportsInteriorDamage()
+    {
+        Test("open refuses damage that has records after it");
+        var path = Seed("interior.bson");
+        var good = new FileInfo(path).Length;
+        Clobber(path, good / 3, 20);
+
+        var threw = false;
+        try
+        {
+            using var db = Collection.Open(path);
+            Check(false, "open should have thrown");
+        }
+        catch (MooFileException e)
+        {
+            threw = e.Message.Contains("corrupt record");
+        }
+        Check(threw, "must throw MooFileException naming a corrupt record");
+        CheckEquals(new FileInfo(path).Length, good, "must not silently truncate");
+    }
+
+    private static void TestRepairSalvagesInteriorDamage()
+    {
+        Test("Repair salvages a file Open refuses");
+        var path = Seed("salvage.bson");
+        Clobber(path, new FileInfo(path).Length / 3, 20);
+
+        var report = Collection.Repair(path);
+        Check(report.Rewritten, "rewritten");
+        Check(report.IsDamaged, "damaged");
+        CheckEquals(report.RecordsKept, 2L, "records kept");
+        CheckEquals(report.Gaps.Count, 1, "one gap");
+        Check(!report.Gaps[0].ToEndOfFile, "resynced, not truncated");
+        Check(report.BytesDropped > 0, "dropped bytes reported");
+
+        using var db = Collection.Open(path);
+        CheckEquals(db.Count(), 2L, "reopens after repair");
+    }
+
+    private static void TestConfigRepairOnOpen()
+    {
+        Test("Config.Repair salvages on open");
+        var path = Seed("repaircfg.bson");
+        Clobber(path, new FileInfo(path).Length / 3, 20);
+
+        using var db = Collection.Open(path, new Config { Repair = true });
+        CheckEquals(db.Count(), 2L, "opened and salvaged");
+    }
+
+    private static void TestRepairIntactFileIsNoOp()
+    {
+        Test("Repair leaves an intact file untouched");
+        var path = Seed("repairclean.bson");
+        var before = File.ReadAllBytes(path);
+
+        var report = Collection.Repair(path);
+        Check(!report.Rewritten, "not rewritten");
+        Check(!report.IsDamaged, "not damaged");
+        CheckEquals(report.RecordsKept, 3L, "records counted");
+        Check(report.Gaps.Count == 0, "no gaps");
+        Check(before.AsSpan().SequenceEqual(File.ReadAllBytes(path)), "bytes unchanged");
+    }
+
+    // -----------------------------------------------------------------
     // Main
     // -----------------------------------------------------------------
 
@@ -663,6 +776,11 @@ public static class Program
             TestReembedWithoutConfig,
             TestSyncAndReindex,
             TestReadonlyRejectsWrites,
+            TestOpenSelfHealsZeroTail,
+            TestOpenReportsInteriorDamage,
+            TestRepairSalvagesInteriorDamage,
+            TestConfigRepairOnOpen,
+            TestRepairIntactFileIsNoOp,
         };
 
         foreach (var t in tests)

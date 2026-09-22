@@ -204,6 +204,10 @@ internal static class Native
     internal static extern int moofile_compact(IntPtr handle, out IntPtr errOut);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr moofile_repair(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path, out IntPtr errOut);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     internal static extern int moofile_sync(IntPtr handle, out IntPtr errOut);
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

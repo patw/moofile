@@ -39,3 +39,43 @@ class InvalidFilterError(MooFileError, ValueError):
     For example a ``$or`` whose elements are not documents, or an unknown
     operator.  Subclasses ValueError so ``except ValueError`` still catches it.
     """
+
+
+class CorruptRecordError(MooFileError):
+    """Raised when a record in the data file cannot be decoded.
+
+    Damage at the *tail* of the file is not this: an interrupted write leaves
+    either a short record or an all-zero one, and both are recognised as a
+    truncation point and trimmed on open.  This is raised only for damage with
+    intact records after it, where trimming would silently discard them.
+
+    Recover with :meth:`Collection.repair`, which salvages every record that
+    still decodes, or open with ``repair=True`` to have that happen
+    automatically.
+    """
+
+
+class DocumentTooLargeError(MooFileError, ValueError):
+    """Raised when a document's encoded size exceeds MAX_DOCUMENT_SIZE.
+
+    The cap exists in the reader so a corrupt length field cannot trigger a
+    wild allocation.  Without the matching check on write, a caller could
+    append a document that every later open refuses — a file broken by its own
+    writer, which is worse than a rejected insert.
+
+    Subclasses ValueError so ``except ValueError`` still catches it.
+    """
+
+
+class BinaryFieldTooLargeError(MooFileError, ValueError):
+    """Raised when a binary field exceeds MAX_BINARY_SIZE.
+
+    A lower limit than MAX_DOCUMENT_SIZE, and one that belongs to the BSON
+    layer rather than to MooFile: the Rust encoder refuses to write a binary
+    value over 16 MiB.  pymongo has no such cap, so without this check the
+    pure-Python backend could write documents the Rust backend cannot encode
+    — and a document that cannot be re-encoded is dropped from the index, so
+    the record would sit on disk and read back as nothing at all.
+
+    Subclasses ValueError so ``except ValueError`` still catches it.
+    """

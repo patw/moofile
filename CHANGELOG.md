@@ -1,5 +1,173 @@
 # Changelog
 
+## v1.2.5 (2026-09-22)
+
+Recovery fixes, from the TheWatcher incident of 2026-09-18: `granular.bson`
+grew a 1,814-byte all-zero tail when miniserv died mid-write, and the service
+then failed to start **20,427 times over three days and nineteen hours** — a
+16-second restart loop that ran from the start of the boot to the end of it,
+never once serving a request. Remediation was a one-line `truncate`; the point
+of these changes is that no human should have had to type it.
+
+### An all-zero tail was read as a corrupt record, not as a partial write
+
+The scanner had two "this is an interrupted write, truncate here" escape
+hatches and both were triggered by hitting physical EOF — a short header or a
+short payload. But an interrupted write does not always leave a *short* file.
+On a filesystem with delayed allocation (ext4 in its default `data=ordered`),
+the inode's new size can reach the journal while the data blocks never reach
+the disk, so the tail reads back at full length as **zeros**.
+
+Zeros are not short. The scanner read a complete 5-byte header out of the zero
+region — `payload_len = 0`, `record_type = 0` — and `read_exact` on a
+zero-length buffer succeeds, so it fell through to `bson::from_slice(&[])`,
+which fails with `"document too short"`. That arm was a hard
+`Err(CorruptRecord)`, returned by `?` from inside the very scan whose return
+value `load_from_file` needed in order to truncate the tail. The self-healing
+code was three lines further down and unreachable:
+
+```rust
+let truncate_to = storage::scan_from_streaming(path, 0, ...)?;  // bails here
+if let Some(at) = truncate_to { storage::truncate(path, at)?; } // never runs
+```
+
+Deterministic on-disk state, deterministic failure, forever. A zero tail of
+one to four bytes self-healed correctly; five or more did not.
+
+A header claiming a payload below the 5-byte minimum BSON document is now a
+truncation point rather than something to decode. A concurrent writer mid-
+append cannot produce one — an interrupted `write()` leaves the file short,
+which is the pre-existing EOF path — and `catch_up` still stops at such an
+offset without truncating, since there another writer may genuinely be mid-
+append.
+
+### Symmetrically: mid-file damage was silently truncating the file on open
+
+Found while writing the regression test for the above. A clobbered block in
+the middle of the file usually reads as an implausible payload length, and the
+rule for that was "if the claimed length runs past EOF, treat it as a partial
+write" — i.e. truncate. For a genuine tail that is right. For damage with
+intact records *after* it, it silently discarded every one of them, on open,
+with no error and no log. Worse than the bug above, and it had been there
+longer.
+
+Neither case can be decided from the header alone, because the format carries
+no magic and no checksum to resynchronise on. Both now consult
+`damage_is_tail()`, which looks ahead (bounded, 1 MiB) for a record that
+validates *and* is followed by another that validates. Found means the damage
+is interior — raise `CorruptRecord` and let `repair()` handle it. Not found
+means the file really does end there — truncate, losing nothing readable.
+
+### New: `Collection::repair()`, and a `repair` flag on open
+
+There was no way to salvage a damaged file at all: `reindex()` and `compact()`
+are methods on an open collection, and the file that needs them is the one
+`open()` refuses. So `repair` takes a path, not a handle.
+
+It keeps every record that still decodes and drops the byte spans that do not,
+resynchronising past damage where an intact record follows it and truncating
+where none does. Surviving records are copied verbatim and in order, so the
+repaired log replays to exactly the state its intact part describes — inserts,
+replacements and tombstones all keep their meaning. The rewrite is staged
+through a temp file, fsynced, and renamed under the same exclusive lock writes
+take, so an interrupted repair leaves the damaged file untouched and other
+processes holding the file open see the inode change and reload. An intact
+file is not rewritten at all.
+
+The returned report says what was lost — `records_kept`, `bytes_kept`,
+`bytes_dropped`, `rewritten`, and every `gap` with its offset, length and
+whether it ran to EOF — so a caller can log or alert on data loss instead of
+discovering it later.
+
+Surfaced in all seven bindings, with a `repair` open flag that runs it on
+demand for unattended services that would rather lose a damaged span than not
+start:
+
+| | salvage | open flag |
+|---|---|---|
+| Rust | `Collection::repair(path)` | `.repair()` |
+| Python | `Collection.repair(path)` | `repair=True` |
+| C | `moofile_repair(path, &err)` | `"repair": true` |
+| C++ | `moofile::repair(path)` | `Config::set_repair()` |
+| Node | `moofile.repair(path)` | `{ repair: true }` |
+| Go | `moofile.Repair(path)` | `Config.Repair` |
+| Java | `Collection.repair(path)` | `Config.repair(true)` |
+| C# | `Collection.Repair(path)` | `Config.Repair` |
+
+Python also gains `CorruptRecordError`; the pure-Python scanner previously let
+pymongo's raw decode exception escape, so the two backends did not even raise
+the same type.
+
+### The index cache's fingerprint could not see the file being replaced
+
+The `.cache` sidecar is accepted on open if it still describes the data file,
+which was checked as (length, mtime). Neither sees a `compact()`: it renames a
+freshly written file over the path, and rewriting the same live set reproduces
+the same length — not by coincidence but by construction, since that is exactly
+what compaction does when there is nothing dead to drop. Two handles, or a
+handle and a crash, can land on the same mtime nanosecond too.
+
+The result would be a cache validating against a file it does not describe, and
+being served as truth — the one case where the cache stops being disposable.
+`catch_up()` had carried an inode check since v0.5.2 for exactly this reason;
+the cache had not.
+
+The fingerprint now includes the data file's inode (Rust) / `(st_dev, st_ino)`
+(Python), stamped from the same basis as the length and mtime — the file state
+the index actually describes, not the file's current state. Cache versions
+bumped (Rust 3 → 4, Python 2 → 3), so existing caches are rebuilt once.
+
+### Writes that produced a file the reader could not read
+
+Nothing checked, on the way in, that a document was one the reader would give
+back. Three ways that went wrong, all silent or worse:
+
+**A document over the 100 MiB record cap.** The scanner refuses a longer record
+— correctly, because from its side an over-cap length field is
+indistinguishable from a corrupt one. So a single oversized insert produced a
+file that every later cold open rejected. It did not even fail immediately:
+`close()` writes an index cache, so the collection kept opening from cache and
+only detonated once the cache was invalidated.
+
+**A single binary value over 16 MiB.** This is the `bson` crate's own cap, far
+below the record cap, and crossing it failed in three directions at once:
+
+* `bson::to_vec` returns an error there, and every write path called it as
+  `.expect("BSON serialisation is infallible for Document")`. It is not
+  infallible. The panic fired while holding the collection's `RwLock`, which
+  poisons it — so a single 17 MiB insert permanently bricked the handle, the
+  exact failure the "matches() never panics" invariant exists to prevent.
+* `IndexManager::add` did `let Ok(raw) = RawDocumentBuf::try_from(&doc) else
+  { return }` — it dropped, without a word, any document it could not
+  re-encode. A record written by the Python backend (pymongo has no such cap)
+  was therefore *on disk and invisible*: the file scanned clean, and `count()`
+  returned 0.
+* The two implementations disagreed about what was writable at all, so the
+  pure-Python backend could produce files whose documents the Rust backend
+  silently could not see.
+
+Both caps are now enforced on write in both implementations, raising
+`DocumentTooLarge` / `DocumentTooLargeError` and `BinaryFieldTooLarge` /
+`BinaryFieldTooLargeError`. The binary check walks the document (including
+nested documents and arrays, naming the offending path) which is O(fields), and
+only runs ahead of an encode of the same document which is O(bytes) — so it
+costs nothing measurable. The batch path validates on the way into the buffer
+rather than at commit, so the error names the insert that caused it.
+
+`bson::to_vec` is no longer `expect`ed anywhere on a write path; failures
+propagate as `BsonEncode`. `IndexManager::add` still skips a document it cannot
+re-encode — erroring there would fail a whole open for one bad record — but now
+logs a warning instead of saying nothing.
+
+**Also fixed in passing:** the PyO3 bridge encoded every returned document with
+`bson::to_vec(doc).unwrap_or_default()`, handing Python an *empty buffer* when
+encoding failed. The adapter then decoded it and raised pymongo's "not enough
+data for a BSON document", naming neither the document nor the cause. It now
+propagates a real error.
+
+New: `MAX_DOCUMENT_SIZE` and `MAX_BINARY_SIZE` are public in both
+implementations.
+
 ## v1.2.4 (2026-09-14)
 
 Three more fixes from the same investigation as v1.2.3, benchmarked separately

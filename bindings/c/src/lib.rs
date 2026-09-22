@@ -309,6 +309,10 @@ pub extern "C" fn moofile_open(
         builder = builder.readonly();
     }
 
+    if config.get("repair").and_then(|v| v.as_bool()).unwrap_or(false) {
+        builder = builder.repair();
+    }
+
     if let Some(dur) = config.get("durability").and_then(|v| v.as_str()) {
         let d = match dur {
             "none" => moofile::Durability::None,
@@ -1058,6 +1062,57 @@ pub extern "C" fn moofile_stats(
             to_c_string(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
         }
         Err(e) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
+    }
+}
+
+/// Salvage a damaged data file, without opening it.
+///
+/// Takes a path rather than a handle because the case it exists for is a file
+/// `moofile_open` refuses — at which point there is no handle to pass.
+///
+/// Returns a JSON report on success, which the caller must free with
+/// `moofile_free_string`:
+///
+/// ```json
+/// {"records_kept":19,"bytes_kept":1387,"bytes_dropped":73,"rewritten":true,
+///  "gaps":[{"offset":688,"length":73,"to_end_of_file":false}]}
+/// ```
+///
+/// Returns NULL and sets `*err_out` on failure.  A file with nothing wrong is
+/// left untouched and reported with `"rewritten":false` and an empty `gaps`.
+#[no_mangle]
+pub extern "C" fn moofile_repair(path: *const i8, err_out: *mut *mut i8) -> *mut i8 {
+    unsafe { clear_error(err_out); }
+
+    let path_str = match unsafe { c_str_to_str(path) } {
+        Ok(s) => s,
+        Err(e) => { unsafe { set_error(err_out, &e); } return ptr::null_mut(); }
+    };
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| RustCollection::repair(path_str)));
+
+    match result {
+        Ok(Ok(report)) => {
+            let gaps: Vec<serde_json::Value> = report
+                .gaps
+                .iter()
+                .map(|g| serde_json::json!({
+                    "offset": g.offset,
+                    "length": g.length,
+                    "to_end_of_file": g.to_end_of_file,
+                }))
+                .collect();
+            let out = serde_json::json!({
+                "records_kept": report.records_kept,
+                "bytes_kept": report.bytes_kept,
+                "bytes_dropped": report.bytes_dropped,
+                "rewritten": report.rewritten,
+                "gaps": gaps,
+            });
+            to_c_string(serde_json::to_string(&out).unwrap_or_else(|_| "{}".to_string()))
+        }
+        Ok(Err(e)) => { unsafe { set_error(err_out, &e.to_string()); } ptr::null_mut() }
+        Err(_) => { unsafe { set_error(err_out, "Rust panic in moofile_repair"); } ptr::null_mut() }
     }
 }
 

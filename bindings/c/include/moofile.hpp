@@ -118,6 +118,7 @@ struct Config {
     std::vector<std::string> text_indexes;
     std::vector<std::pair<std::string, AutoEmbedConfig>> auto_embeds;
     bool readonly = false;
+    bool repair = false;
     std::string durability = "os";
     std::string model_cache_dir;
 
@@ -143,6 +144,17 @@ struct Config {
 
     Config& set_readonly(bool r = true) {
         readonly = r;
+        return *this;
+    }
+
+    /**
+     * Salvage a corrupt data file instead of failing to open it.
+     *
+     * A repair drops data, so this is off by default — see
+     * moofile::repair(), which this runs for you.
+     */
+    Config& set_repair(bool r = true) {
+        repair = r;
         return *this;
     }
 
@@ -181,6 +193,7 @@ struct Config {
             j["auto_embed"] = ae;
         }
         if (readonly) j["readonly"] = true;
+        if (repair) j["repair"] = true;
         j["durability"] = durability;
         if (!model_cache_dir.empty()) j["model_cache_dir"] = model_cache_dir;
         return j.dump();
@@ -475,6 +488,84 @@ public:
 private:
     MooFileSearchCursor* cursor_;
 };
+
+// ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+/** A span of bytes a repair could not parse and dropped. */
+struct RepairGap {
+    /** Byte offset where the damage starts. */
+    int64_t offset = 0;
+    /** Number of bytes dropped. */
+    int64_t length = 0;
+    /**
+     * True if the damage ran to the end of the file — i.e. this was a
+     * truncation rather than a skipped-over hole.
+     */
+    bool to_end_of_file = false;
+};
+
+/** What a repair() pass did. */
+struct RepairReport {
+    /** Records that decoded and were preserved. */
+    int64_t records_kept = 0;
+    /** Bytes of intact records preserved. */
+    int64_t bytes_kept = 0;
+    /** Bytes of unparseable data dropped. */
+    int64_t bytes_dropped = 0;
+    /** False when the file was already intact and was left untouched. */
+    bool rewritten = false;
+    /** Every damaged span, in file order. */
+    std::vector<RepairGap> gaps;
+
+    /** Whether any damage was found. */
+    bool is_damaged() const { return !gaps.empty(); }
+};
+
+/**
+ * Salvage a damaged data file, without opening it.
+ *
+ * Keeps every record that still decodes and drops the byte spans that do not,
+ * resynchronising past damage where an intact record follows it and truncating
+ * where none does.  Surviving records are copied verbatim and in order, so the
+ * repaired log replays to exactly the state its intact part describes.
+ *
+ * This is a free function rather than a Collection method because the case it
+ * exists for is a file the constructor throws on — at which point there is no
+ * Collection to call a method on.  `Config::set_repair()` runs it for you.
+ *
+ * A cleanly truncated tail (an interrupted write, including one that left an
+ * all-zero tail) is already trimmed on open and needs none of this.  An intact
+ * file is left untouched and reported with `rewritten == false`.
+ */
+inline RepairReport repair(const std::string& path) {
+    char* err = nullptr;
+    char* s = moofile_repair(path.c_str(), &err);
+    if (err) {
+        std::string msg(err);
+        moofile_free_string(err);
+        throw error(msg);
+    }
+    if (!s) throw error("repair failed: " + path);
+    std::string raw(s);
+    moofile_free_string(s);
+
+    json j = json::parse(raw);
+    RepairReport report;
+    report.records_kept = j.value("records_kept", int64_t{0});
+    report.bytes_kept = j.value("bytes_kept", int64_t{0});
+    report.bytes_dropped = j.value("bytes_dropped", int64_t{0});
+    report.rewritten = j.value("rewritten", false);
+    for (const auto& g : j.value("gaps", json::array())) {
+        RepairGap gap;
+        gap.offset = g.value("offset", int64_t{0});
+        gap.length = g.value("length", int64_t{0});
+        gap.to_end_of_file = g.value("to_end_of_file", false);
+        report.gaps.push_back(gap);
+    }
+    return report;
+}
 
 // ---------------------------------------------------------------------------
 // Collection

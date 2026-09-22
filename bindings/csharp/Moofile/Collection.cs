@@ -622,6 +622,35 @@ public sealed class Collection : IDisposable
         }
     }
 
+    /// <summary>Salvage a damaged data file, without opening it.</summary>
+    /// <remarks>
+    /// Keeps every record that still decodes and drops the byte spans that do
+    /// not, resynchronising past damage where an intact record follows it and
+    /// truncating where none does.  Surviving records are copied verbatim and
+    /// in order, so the repaired log replays to exactly the state its intact
+    /// part describes.
+    ///
+    /// This is a static method rather than an instance one because the case it
+    /// exists for is a file <see cref="Open(string, Config?)"/> throws on — at
+    /// which point there is no Collection to call a method on.  Set
+    /// <see cref="Config.Repair"/> to have it run automatically.
+    ///
+    /// A cleanly truncated tail (an interrupted write, including one that left
+    /// an all-zero tail) is already trimmed on open and needs none of this.
+    /// An intact file is left untouched and reported with
+    /// <see cref="RepairReport.Rewritten"/> false.
+    /// </remarks>
+    public static RepairReport Repair(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+
+        var raw = Native.moofile_repair(path, out var err);
+        Native.ThrowIfError(err);
+        var json = Native.TakeString(raw)
+            ?? throw new MooFileException($"repair failed: {path}");
+        return RepairReport.FromJson(json);
+    }
+
     /// <summary>Rewrite the file, reclaiming space from dead records.</summary>
     public void Compact()
     {

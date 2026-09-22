@@ -6,7 +6,7 @@
  * Requires: npm install, libmoofile.so built
  */
 
-const { Collection, MooFileError } = require('./moofile');
+const { Collection, MooFileError, repair } = require('./moofile');
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -506,6 +506,110 @@ function testReplaceOne() {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Recovery
+//
+// An interrupted write on a filesystem with delayed allocation leaves a file
+// that is full length and reads back as zeros, not a short file.  Open must
+// recognise that as a tail and trim it; damage with intact records after it
+// must be reported instead, and salvaged by repair().
+// ---------------------------------------------------------------------------
+
+function seed(dir, name, n = 3) {
+    const p = tmpPath(dir, name);
+    const db = new Collection(p);
+    db.insertMany(Array.from({ length: n }, (_, i) => ({ _id: String(i), x: i })));
+    db.close();
+    return p;
+}
+
+function clobber(p, at, n) {
+    const fd = fs.openSync(p, 'r+');
+    fs.writeSync(fd, Buffer.alloc(n, 0xCD), 0, n, at);
+    fs.closeSync(fd);
+    fs.rmSync(p + '.cache', { force: true });
+}
+
+function testOpenSelfHealsZeroTail() {
+    test('open trims an all-zero tail');
+    const dir = tmpDir();
+    try {
+        const p = seed(dir, 'zerotail.bson');
+        const good = fs.statSync(p).size;
+        fs.appendFileSync(p, Buffer.alloc(1814, 0));
+
+        const db = new Collection(p);
+        checkEqual(db.count(), 3, 'all records survive');
+        checkEqual(fs.statSync(p).size, good, 'zero tail trimmed');
+        db.close();
+    } finally { cleanup(dir); }
+}
+
+function testOpenReportsInteriorDamage() {
+    test('open refuses damage that has records after it');
+    const dir = tmpDir();
+    try {
+        const p = seed(dir, 'interior.bson');
+        const good = fs.statSync(p).size;
+        clobber(p, Math.floor(good / 3), 20);
+
+        let threw = false;
+        try { new Collection(p); } catch (e) {
+            threw = e instanceof MooFileError && /corrupt record/.test(e.message);
+        }
+        check(threw, 'must throw MooFileError mentioning corrupt record');
+        checkEqual(fs.statSync(p).size, good, 'must not silently truncate');
+    } finally { cleanup(dir); }
+}
+
+function testRepairSalvagesInteriorDamage() {
+    test('repair salvages a file open refuses');
+    const dir = tmpDir();
+    try {
+        const p = seed(dir, 'salvage.bson');
+        clobber(p, Math.floor(fs.statSync(p).size / 3), 20);
+
+        const report = repair(p);
+        check(report.rewritten === true, 'rewritten');
+        checkEqual(report.records_kept, 2, 'records kept');
+        checkEqual(report.gaps.length, 1, 'one gap');
+        check(report.gaps[0].to_end_of_file === false, 'resynced, not truncated');
+        check(report.bytes_dropped > 0, 'dropped bytes reported');
+
+        const db = new Collection(p);
+        checkEqual(db.count(), 2, 'reopens after repair');
+        db.close();
+    } finally { cleanup(dir); }
+}
+
+function testRepairOnOpenConfig() {
+    test('config repair:true salvages on open');
+    const dir = tmpDir();
+    try {
+        const p = seed(dir, 'repaircfg.bson');
+        clobber(p, Math.floor(fs.statSync(p).size / 3), 20);
+
+        const db = new Collection(p, { repair: true });
+        checkEqual(db.count(), 2, 'opened and salvaged');
+        db.close();
+    } finally { cleanup(dir); }
+}
+
+function testRepairIntactFileIsNoOp() {
+    test('repair leaves an intact file untouched');
+    const dir = tmpDir();
+    try {
+        const p = seed(dir, 'clean.bson', 5);
+        const before = fs.readFileSync(p);
+
+        const report = repair(p);
+        check(report.rewritten === false, 'not rewritten');
+        checkEqual(report.records_kept, 5, 'records counted');
+        checkEqual(report.gaps, [], 'no gaps');
+        check(before.equals(fs.readFileSync(p)), 'bytes unchanged');
+    } finally { cleanup(dir); }
+}
+
 const tests = [
     testOpenDefault,
     testInsertAndFind,
@@ -530,6 +634,11 @@ const tests = [
     testGroupAgg,
     testCursorIteration,
     testUseAfterClose,
+    testOpenSelfHealsZeroTail,
+    testOpenReportsInteriorDamage,
+    testRepairSalvagesInteriorDamage,
+    testRepairOnOpenConfig,
+    testRepairIntactFileIsNoOp,
 ];
 
 console.log('MooFile Node.js Test Suite');

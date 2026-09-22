@@ -48,7 +48,7 @@ mod text;
 pub use embed::{AutoEmbedConfig, EmbeddingPrecision, DEFAULT_MODEL, DEFAULT_QUERY_PREFIX};
 pub use errors::MooFileError;
 pub use query::{AggFunc, HybridQuery, Query, TextQuery, VectorQuery};
-pub use storage::Durability;
+pub use storage::{Durability, RepairGap, RepairReport, MAX_BINARY_SIZE, MAX_DOCUMENT_SIZE};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -60,6 +60,13 @@ use bson::{doc, Bson, Document};
 use crate::embed::EmbeddingEngine;
 use crate::index::IndexManager;
 use crate::storage::{StorageEngine, RECORD_LIVE, RECORD_REPLACEMENT, RECORD_TOMBSTONE};
+
+/// Path of the advisory lock file guarding writes to `path`.
+pub(crate) fn lock_path_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".lock");
+    PathBuf::from(s)
+}
 
 /// Default cache directory for auto-downloaded models.
 pub(crate) fn default_model_cache_dir() -> PathBuf {
@@ -130,6 +137,7 @@ pub struct CollectionBuilder {
     model_cache_dir: Option<PathBuf>,
     readonly: bool,
     durability: Durability,
+    repair: bool,
 }
 
 impl CollectionBuilder {
@@ -143,6 +151,7 @@ impl CollectionBuilder {
             model_cache_dir: None,
             readonly: false,
             durability: Durability::Os,
+            repair: false,
         }
     }
 
@@ -194,6 +203,28 @@ impl CollectionBuilder {
         self
     }
 
+    /// Salvage the data file instead of failing if it turns out to be
+    /// corrupt.
+    ///
+    /// Without this, [`open`](Self::open) on a file with a damaged record
+    /// returns [`MooFileError::CorruptRecord`] and there is nothing the
+    /// caller can do about it through an open collection, because it never
+    /// gets one — which is how a corrupt file becomes a service that cannot
+    /// start.  With it, `open` runs [`Collection::repair`] once and retries,
+    /// logging what was dropped at `warn` level.
+    ///
+    /// This deliberately is not the default: a repair drops data, and for a
+    /// caller that keeps backups or wants to look at the file first, failing
+    /// loudly is the better answer.  Long-running unattended services are the
+    /// case this exists for.
+    ///
+    /// A cleanly truncated tail (an interrupted write) is repaired on open
+    /// regardless of this flag — that path has never needed it.
+    pub fn repair(mut self) -> Self {
+        self.repair = true;
+        self
+    }
+
     pub fn open(self) -> Result<Collection, MooFileError> {
         Collection::open_inner(
             &self.path,
@@ -204,6 +235,7 @@ impl CollectionBuilder {
             self.model_cache_dir.unwrap_or_else(default_model_cache_dir),
             self.readonly,
             self.durability,
+            self.repair,
         )
     }
 }
@@ -349,6 +381,73 @@ impl Collection {
         b.open()
     }
 
+    /// Salvage a damaged data file, without needing to open it first.
+    ///
+    /// Keeps every record that decodes and drops the byte spans that do not,
+    /// resynchronising past damage where an intact record follows it and
+    /// truncating where none does.  Surviving records are copied verbatim and
+    /// in order, so the repaired log replays to exactly the state its intact
+    /// part describes.
+    ///
+    /// This is an associated function rather than a method because the case
+    /// it exists for is a file that [`open`](Self::open) refuses — at which
+    /// point there is no `Collection` to call a method on.  Nothing else in
+    /// the public API can reach the file.
+    ///
+    /// The rewrite is staged through a temp file and renamed into place, under
+    /// the same exclusive lock writes take, so it is safe against other
+    /// processes holding the file open: they see the inode change and reload.
+    /// A file with nothing wrong is left untouched and reported as such.
+    ///
+    /// ```no_run
+    /// # use moofile::Collection;
+    /// let report = Collection::repair("mydata.bson").unwrap();
+    /// if report.is_damaged() {
+    ///     eprintln!(
+    ///         "dropped {} byte(s) across {} span(s); kept {} record(s)",
+    ///         report.bytes_dropped, report.gaps.len(), report.records_kept,
+    ///     );
+    /// }
+    /// ```
+    pub fn repair(path: impl AsRef<Path>) -> Result<RepairReport, MooFileError> {
+        use fs4::fs_std::FileExt;
+
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(RepairReport::default());
+        }
+
+        // Take the lock writes take: a repair rewrites the file wholesale, so
+        // interleaving it with another process's append would drop that
+        // append.  Best-effort, like every other lock acquisition here.
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path_for(path))
+            .ok();
+        let locked = lock_file
+            .as_ref()
+            .map(|lf| lf.lock_exclusive().is_ok())
+            .unwrap_or(false);
+
+        let result = storage::repair_file(path);
+
+        // The cache describes the pre-repair file; it is wrong now, and its
+        // (length, mtime) stamp would not catch that on its own.
+        if matches!(&result, Ok(r) if r.rewritten) {
+            cache::delete_cache(path);
+        }
+
+        if locked {
+            if let Some(lf) = &lock_file {
+                let _ = lf.unlock();
+            }
+        }
+
+        result
+    }
+
     fn open_inner(
         path: &Path,
         indexes: &[String],
@@ -358,6 +457,7 @@ impl Collection {
         model_cache_dir: PathBuf,
         readonly: bool,
         durability: Durability,
+        auto_repair: bool,
     ) -> Result<Self, MooFileError> {
         let meta_path = path.with_extension("bson.meta");
 
@@ -365,11 +465,7 @@ impl Collection {
         //     No lock is held here — this allows multiple processes to open
         //     the same file simultaneously. An exclusive lock is acquired
         //     only briefly during write operations (see `with_write_lock`). ---
-        let lock_path = {
-            let mut s = path.as_os_str().to_owned();
-            s.push(".lock");
-            PathBuf::from(s)
-        };
+        let lock_path = lock_path_for(path);
         let lock_file = {
             // Open the lock file with create+read+write so it can be
             // created if it doesn't exist yet.  No lock is acquired here.
@@ -418,7 +514,33 @@ impl Collection {
                 cache::CacheLoad::Miss => {
                     log::debug!("moofile: cache miss — rebuilding from BSON scan");
                     let mut im = IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
-                    let total = load_from_file(path, readonly, &mut storage, &mut im)?;
+                    let total = match load_from_file(path, readonly, &mut storage, &mut im) {
+                        Ok(total) => total,
+                        // A damaged record mid-file is unrecoverable by the
+                        // scanner alone.  With `.repair()` the caller has said
+                        // they would rather lose the damaged span than not
+                        // start; salvage the file and replay it once more.
+                        Err(e @ MooFileError::CorruptRecord { .. })
+                            if auto_repair && !readonly =>
+                        {
+                            log::warn!("moofile: {} — repairing {}", e, path.display());
+                            storage.close();
+                            let report = storage::repair_file(path)?;
+                            storage.reopen()?;
+                            cache::delete_cache(path);
+                            log::warn!(
+                                "moofile: repaired {} — kept {} record(s), dropped {} byte(s) \
+                                 across {} damaged span(s)",
+                                path.display(),
+                                report.records_kept,
+                                report.bytes_dropped,
+                                report.gaps.len(),
+                            );
+                            im = IndexManager::new(&merged_indexes, &merged_vector, &merged_text);
+                            load_from_file(path, readonly, &mut storage, &mut im)?
+                        }
+                        Err(e) => return Err(e),
+                    };
                     (im, total, false)
                 }
             };
@@ -579,6 +701,12 @@ impl Collection {
             // Auto-embed before buffering
             let doc = inner.apply_auto_embed(doc)?;
 
+            // Reject an unstorable document here rather than at commit: the
+            // caller gets the error from the call that caused it, and the
+            // document never enters a buffer whose own return value could not
+            // be encoded either.
+            storage::validate_doc(&doc)?;
+
             let batch = inner.batch.as_mut().unwrap();
             batch.records.push((RECORD_LIVE, doc.clone()));
             batch.index_ops.push(BatchIndexOp::Add(doc.clone()));
@@ -680,6 +808,7 @@ impl Collection {
             let mut new_doc = apply_update(&old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
             new_doc = inner.apply_auto_embed(new_doc)?;
             let batch = inner.batch.as_mut().unwrap();
+            storage::validate_doc(&new_doc)?;
             batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
             batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
             batch.index_ops.push(BatchIndexOp::Add(new_doc.clone()));
@@ -731,7 +860,8 @@ impl Collection {
                 let mut new_doc = apply_update(old_doc, set.as_ref(), unset.as_ref(), inc.as_ref());
                 new_doc = inner.apply_auto_embed(new_doc)?;
                 let batch = inner.batch.as_mut().unwrap();
-                batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
+                storage::validate_doc(&new_doc)?;
+            batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
                 batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
                 batch.index_ops.push(BatchIndexOp::Add(new_doc.clone()));
                 batch.overlay.insert(old_id, Some(new_doc));
@@ -790,6 +920,7 @@ impl Collection {
             new_doc.insert("_id", old_id.clone());
             new_doc = inner.apply_auto_embed(new_doc)?;
             let batch = inner.batch.as_mut().unwrap();
+            storage::validate_doc(&new_doc)?;
             batch.records.push((RECORD_REPLACEMENT, new_doc.clone()));
             batch.index_ops.push(BatchIndexOp::Remove(old_id.clone()));
             batch.index_ops.push(BatchIndexOp::Add(new_doc.clone()));
@@ -1197,6 +1328,18 @@ impl Collection {
     // Cache
     // ------------------------------------------------------------------
 
+    /// Whether this handle's index came from the `.cache` snapshot rather
+    /// than a scan of the data file.
+    ///
+    /// Purely diagnostic — the cache is disposable and either path yields the
+    /// same results.  Exposed so tests can assert that the fingerprint checks
+    /// reject a stale cache *and* that they still accept a good one: a
+    /// fingerprint that never matches is indistinguishable from a correct one
+    /// by results alone, and would silently cost every open a full rescan.
+    pub fn loaded_from_cache(&self) -> bool {
+        self.inner.read().expect("lock poisoned").loaded_from_cache
+    }
+
     pub fn save_cache(&self) -> Result<(), MooFileError> {
         let inner = self.inner.write().expect("lock poisoned");
         inner.require_open()?;
@@ -1204,7 +1347,7 @@ impl Collection {
             &inner.path,
             &inner.index_manager,
             inner.total_records,
-            (inner.known_len, inner.known_mtime_ns),
+            (inner.known_len, inner.known_mtime_ns, inner.known_ino),
         )
     }
 
@@ -1222,7 +1365,7 @@ impl Collection {
                     &inner.path,
                     &inner.index_manager,
                     inner.total_records,
-                    (inner.known_len, inner.known_mtime_ns),
+                    (inner.known_len, inner.known_mtime_ns, inner.known_ino),
                 ) {
                     log::warn!("moofile: failed to save cache: {e}");
                 }
@@ -1678,7 +1821,7 @@ fn insert_locked_embedded(
     // whole `Document` for `index_manager.add`. Both `bson::to_vec` and
     // `RawDocumentBuf::from_bytes` are infallible on bytes/a Document we
     // just built ourselves — matches `encode_record`'s existing assumption.
-    let payload = bson::to_vec(&doc).expect("BSON serialisation is infallible for Document");
+    let payload = storage::encode_doc(&doc)?;
     inner.storage.append_bytes(RECORD_LIVE, &payload)?;
     let raw = bson::raw::RawDocumentBuf::from_bytes(payload)
         .expect("bytes we just encoded are well-formed BSON");
@@ -1831,6 +1974,144 @@ mod tests {
         let found = db.find_one(doc! { "email": "a@example.com" }).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().get_str("name").unwrap(), "Alice");
+    }
+
+    // -----------------------------------------------------------------
+    // Recovery
+    // -----------------------------------------------------------------
+
+    /// The TheWatcher incident, end to end: a collection whose file grew an
+    /// all-zero tail when the machine died mid-write.  Every restart used to
+    /// fail identically, forever, because `open` returned `CorruptRecord`
+    /// before it could reach its own truncate-the-tail path.
+    #[test]
+    fn open_self_heals_a_zero_filled_tail() {
+        let (_dir, path) = setup();
+        {
+            let db = Collection::builder(&path).index("v").open().unwrap();
+            for i in 0..50 {
+                db.insert(doc! { "_id": i.to_string(), "v": i as i64 }).unwrap();
+            }
+            db.close().unwrap();
+        }
+        let good_len = std::fs::metadata(&path).unwrap().len();
+
+        // Blocks the filesystem journalled the size for but never wrote.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&vec![0u8; 1814]).unwrap();
+        }
+        cache::delete_cache(&path);
+
+        let db = Collection::builder(&path).index("v").open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 50);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            good_len,
+            "the zero tail should have been truncated away"
+        );
+
+        // And the handle is usable afterwards, appending at the right offset.
+        db.insert(doc! { "_id": "50", "v": 50i64 }).unwrap();
+        drop(db);
+        let db = Collection::builder(&path).index("v").open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 51);
+    }
+
+    #[test]
+    fn open_still_fails_loudly_on_mid_file_corruption_by_default() {
+        let (_dir, path) = setup();
+        write_damaged_collection(&path);
+
+        match Collection::builder(&path).open() {
+            Err(MooFileError::CorruptRecord { .. }) => {}
+            other => panic!("expected CorruptRecord, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn open_with_repair_salvages_mid_file_corruption() {
+        let (_dir, path) = setup();
+        write_damaged_collection(&path);
+
+        let db = Collection::builder(&path).repair().open().unwrap();
+        // 20 inserted, one record's bytes clobbered.
+        assert_eq!(db.count(doc! {}).unwrap(), 19);
+        assert!(db.find_one(doc! { "_id": "9" }).unwrap().is_none());
+        assert!(db.find_one(doc! { "_id": "8" }).unwrap().is_some());
+        assert!(db.find_one(doc! { "_id": "10" }).unwrap().is_some());
+
+        // Repaired in place: a plain open now works too.
+        drop(db);
+        let db = Collection::builder(&path).open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 19);
+    }
+
+    #[test]
+    fn repair_is_callable_without_opening_and_reports_what_it_dropped() {
+        let (_dir, path) = setup();
+        write_damaged_collection(&path);
+
+        let report = Collection::repair(&path).unwrap();
+        assert!(report.rewritten);
+        assert!(report.is_damaged());
+        assert_eq!(report.records_kept, 19);
+        assert_eq!(report.gaps.len(), 1);
+        assert!(!report.gaps[0].to_end_of_file);
+
+        let db = Collection::builder(&path).open().unwrap();
+        assert_eq!(db.count(doc! {}).unwrap(), 19);
+    }
+
+    #[test]
+    fn repair_of_an_intact_collection_changes_nothing() {
+        let (_dir, path) = setup();
+        {
+            let db = Collection::builder(&path).open().unwrap();
+            for i in 0..10 {
+                db.insert(doc! { "_id": i.to_string() }).unwrap();
+            }
+            db.close().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        let report = Collection::repair(&path).unwrap();
+        assert!(!report.rewritten);
+        assert!(!report.is_damaged());
+        assert_eq!(report.records_kept, 10);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn repair_of_a_missing_file_is_a_no_op() {
+        let (_dir, path) = setup();
+        let report = Collection::repair(&path).unwrap();
+        assert!(!report.rewritten);
+        assert_eq!(report.records_kept, 0);
+    }
+
+    /// 20 documents with record #9's bytes overwritten in place — a lost
+    /// block in the middle of the file, not at the tail.
+    fn write_damaged_collection(path: &Path) {
+        {
+            let db = Collection::builder(path).open().unwrap();
+            for i in 0..20 {
+                db.insert(doc! { "_id": i.to_string(), "v": i as i64 }).unwrap();
+            }
+            db.close().unwrap();
+        }
+        cache::delete_cache(path);
+
+        let mut bytes = std::fs::read(path).unwrap();
+        let (offset, len) = {
+            let (records, _) = storage::scan_from(path, 0).unwrap();
+            let start = records[9].offset as usize;
+            let end = records[10].offset as usize;
+            (start, end - start)
+        };
+        bytes[offset..offset + len].fill(0xCD);
+        std::fs::write(path, &bytes).unwrap();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Disposable index snapshot cache.
 //!
-//! On open, if the cache matches the data file exactly (length + mtime),
-//! load the pre-built indexes directly — skipping the BSON scan, decode,
+//! On open, if the cache matches the data file exactly (inode + length +
+//! mtime), load the pre-built indexes directly — skipping the BSON scan, decode,
 //! tokenisation, stemming, and vector normalisation that a cold rebuild
 //! requires.
 //!
@@ -32,7 +32,8 @@ use crate::text::TextIndex;
 ///           identical, so a stale cache would load happily and keep serving
 ///           the old token set; only the version bump forces the rebuild that
 ///           makes the new analyzer take effect.
-const CACHE_VERSION: u32 = 3;
+///   3 -> 4: the fingerprint gained the data file's inode.
+const CACHE_VERSION: u32 = 4;
 
 /// Magic bytes at the start of every cache file, so we can quickly reject
 /// non-cache files (e.g. a pickle written by the Python implementation).
@@ -49,6 +50,26 @@ pub(crate) struct CacheFile {
     data_file_length: u64,
     /// Data file mtime (nanoseconds since UNIX_EPOCH) when cache was written.
     data_file_mtime_ns: u64,
+    /// Data file inode when the cache was written.  Length and mtime alone
+    /// cannot see a `compact()`: it renames a freshly written file over the
+    /// path, and rewriting the same live set at the same moment reproduces
+    /// the same length — not by coincidence but by construction, since that
+    /// is exactly what compaction does when there is nothing dead to drop.
+    /// The inode is the only part of the fingerprint that always changes when
+    /// the file is replaced.
+    ///
+    /// **0 means "this platform did not supply one"**, which off Unix is
+    /// always: `std::os::windows::fs::MetadataExt` has no stable accessor for
+    /// the NTFS file index, so a Windows build stamps and compares 0 and the
+    /// check is inert — the same limitation `catch_up` has carried since
+    /// v0.5.2, where a replaced file is caught only if it also shrank.  The
+    /// pure-Python backend *is* live there, because `os.stat` populates
+    /// `st_ino` on Windows.
+    ///
+    /// A strict `!=` is still the right comparison across that asymmetry: a
+    /// known value meeting an unknown one is a miss, and a miss only ever
+    /// costs a rebuild.
+    data_file_ino: u64,
     /// Total record count (live + dead) from the BSON scan.
     total_records: u64,
     /// Index configuration that was used to build this cache.
@@ -75,9 +96,12 @@ fn cache_path(data_path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Get (length, mtime_ns) for a file.  Returns `None` if metadata can't
-/// be read (e.g. file doesn't exist).
-fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
+/// Get (length, mtime_ns, inode) for a file.  Returns `None` if metadata
+/// can't be read (e.g. file doesn't exist).
+///
+/// The inode is 0 where the platform does not supply one — see
+/// `CacheFile::data_file_ino`.
+fn file_fingerprint(path: &Path) -> Option<(u64, u64, u64)> {
     let meta = fs::metadata(path).ok()?;
     let len = meta.len();
     let mtime_ns = meta
@@ -86,7 +110,14 @@ fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    Some((len, mtime_ns))
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    Some((len, mtime_ns, ino))
 }
 
 /// Result of a cache load attempt.
@@ -105,7 +136,8 @@ pub(crate) enum CacheLoad {
 ///   3. Version matches
 ///   4. Data file length matches
 ///   5. Data file mtime matches
-///   6. Index configuration matches the expected fields
+///   6. Data file inode matches
+///   7. Index configuration matches the expected fields
 ///
 /// On any failure, returns `CacheLoad::Miss` — the caller rebuilds normally.
 pub(crate) fn try_load_cache(
@@ -149,12 +181,15 @@ pub(crate) fn try_load_cache(
         return CacheLoad::Miss;
     }
 
-    // 5. Validate data file fingerprint (length + mtime)
-    let (actual_len, actual_mtime) = match file_fingerprint(data_path) {
+    // 5. Validate data file fingerprint (length + mtime + inode)
+    let (actual_len, actual_mtime, actual_ino) = match file_fingerprint(data_path) {
         Some(fp) => fp,
         None => return CacheLoad::Miss,
     };
-    if cache.data_file_length != actual_len || cache.data_file_mtime_ns != actual_mtime {
+    if cache.data_file_length != actual_len
+        || cache.data_file_mtime_ns != actual_mtime
+        || cache.data_file_ino != actual_ino
+    {
         return CacheLoad::Miss;
     }
 
@@ -229,17 +264,18 @@ pub(crate) fn try_load_cache(
 ///
 /// Writes to a `.tmp` file first, then atomically renames — safe to
 /// interrupt (a partial cache file is simply rejected on next open).
-/// `basis` is the (length, mtime_ns) of the data file that `index_manager`
-/// actually describes — **not** the file's current state.  With multiple
-/// processes those differ: another writer may have appended since this handle
-/// last read.  Stamping the current state would produce a cache that passes
-/// validation while silently omitting the other writer's records; stamping the
-/// basis makes the next open see a mismatch and rescan instead.
+/// `basis` is the (length, mtime_ns, inode) of the data file that
+/// `index_manager` actually describes — **not** the file's current state.
+/// With multiple processes those differ: another writer may have appended, or
+/// compacted, since this handle last read.  Stamping the current state would
+/// produce a cache that passes validation while silently omitting the other
+/// writer's records; stamping the basis makes the next open see a mismatch
+/// and rescan instead.
 pub(crate) fn save_cache(
     data_path: &Path,
     index_manager: &IndexManager,
     total_records: u64,
-    basis: (u64, u64),
+    basis: (u64, u64, u64),
 ) -> Result<(), MooFileError> {
     let cache_path = cache_path(data_path);
     let tmp_path = {
@@ -248,7 +284,7 @@ pub(crate) fn save_cache(
         p
     };
 
-    let (data_len, data_mtime_ns) = basis;
+    let (data_len, data_mtime_ns, data_ino) = basis;
 
     // Extract the field lists directly from the IndexManager (not derived
     // from data) so configured-but-empty indexes are preserved.
@@ -297,6 +333,7 @@ pub(crate) fn save_cache(
         version: CACHE_VERSION,
         data_file_length: data_len,
         data_file_mtime_ns: data_mtime_ns,
+        data_file_ino: data_ino,
         total_records,
         regular_fields,
         vector_fields,
@@ -386,6 +423,65 @@ mod tests {
         match try_load_cache(&data_path, &[], &[], &[]) {
             CacheLoad::Miss => {} // expected
             CacheLoad::Hit { .. } => panic!("should be a miss when no cache file exists"),
+        }
+    }
+
+    /// The inode is the only part of the fingerprint that always changes when
+    /// `compact()` renames a new file over the path.  Length matches by
+    /// construction when compaction has nothing dead to drop, and mtime can
+    /// match too — here both are forced to match so the inode is the only
+    /// thing left to catch it.
+    #[test]
+    fn cache_miss_when_the_file_was_replaced_at_the_same_length_and_mtime() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("test.bson");
+
+        let original = doc! { "_id": "a", "v": 1 };
+        let replacement = doc! { "_id": "b", "v": 2 };
+        let encode = |d: &bson::Document| {
+            crate::storage::encode_record(crate::storage::RECORD_LIVE, d)
+        };
+        let original_bytes = encode(&original);
+        let replacement_bytes = encode(&replacement);
+        assert_eq!(
+            original_bytes.len(),
+            replacement_bytes.len(),
+            "the two documents must encode to the same length for this test to mean anything"
+        );
+
+        fs::write(&data_path, &original_bytes).unwrap();
+        let fp = file_fingerprint(&data_path).unwrap();
+
+        let mut im = IndexManager::new(&["v".into()], &[], &[]);
+        im.add(original.clone());
+        save_cache(&data_path, &im, 1, fp).unwrap();
+        assert!(
+            matches!(try_load_cache(&data_path, &["v".into()], &[], &[]), CacheLoad::Hit { .. }),
+            "the cache must hit before the file is replaced"
+        );
+
+        // Replace via rename, the way compact() does — new inode, same length.
+        let tmp = dir.path().join("test.bson.tmp");
+        fs::write(&tmp, &replacement_bytes).unwrap();
+        fs::rename(&tmp, &data_path).unwrap();
+
+        // Force the mtime back so length and mtime both match the stamp, and
+        // the inode is the only difference left.
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(fp.1);
+        let f = fs::OpenOptions::new().write(true).open(&data_path).unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(mtime)).unwrap();
+        drop(f);
+
+        let after = file_fingerprint(&data_path).unwrap();
+        assert_eq!(after.0, fp.0, "length must match for the test to be meaningful");
+        assert_eq!(after.1, fp.1, "mtime must match for the test to be meaningful");
+        assert_ne!(after.2, fp.2, "the rename must have changed the inode");
+
+        match try_load_cache(&data_path, &["v".into()], &[], &[]) {
+            CacheLoad::Miss => {} // expected — the inode caught it
+            CacheLoad::Hit { .. } => {
+                panic!("a replaced file must not serve the old file's cached index")
+            }
         }
     }
 

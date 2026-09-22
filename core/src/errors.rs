@@ -38,6 +38,35 @@ pub enum MooFileError {
         source: std::io::Error,
     },
 
+    /// A document's encoded size exceeds the largest record the scanner will
+    /// read back (`MAX_DOCUMENT_SIZE`).
+    ///
+    /// The cap exists in the reader to stop a corrupt length field causing a
+    /// wild allocation; without the matching check on write, a caller could
+    /// append a document that every later `open` refuses — a file broken by
+    /// its own writer, which is a worse outcome than a rejected insert.
+    #[error("document is {size} bytes, over the {max}-byte limit — a record \
+             this large cannot be read back, so it is rejected rather than \
+             written to a file that would then fail to open")]
+    DocumentTooLarge { size: usize, max: usize },
+
+    /// A binary field exceeds `MAX_BINARY_SIZE`, the largest BSON binary
+    /// value the encoder will produce.
+    ///
+    /// This is a lower limit than `MAX_DOCUMENT_SIZE` and it belongs to the
+    /// BSON layer rather than to moofile.  It is checked on write because the
+    /// alternatives are all silent: encoding one fails, and a document that
+    /// reaches the index without being encodable is dropped from it — so a
+    /// record like this sits on disk and reads back as nothing at all.
+    #[error("binary field '{field}' is {size} bytes, over the {max}-byte \
+             limit for a BSON binary value — a document containing it cannot \
+             be encoded, and would be silently absent from the collection")]
+    BinaryFieldTooLarge {
+        field: String,
+        size: usize,
+        max: usize,
+    },
+
     /// Corrupt or truncated record in the BSON file.
     #[error("corrupt record at byte {offset}: {reason}")]
     CorruptRecord { offset: u64, reason: String },

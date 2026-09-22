@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
@@ -547,6 +548,107 @@ static void test_reindex() {
     ASSERT(db.exists({{"email", "a@test.com"}}));
 }
 
+/* ---------------------------------------------------------------------------
+ * Recovery
+ * ------------------------------------------------------------------------ */
+
+static void append_bytes(const std::string& path, unsigned char byte, size_t n) {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    std::vector<char> buf(n, static_cast<char>(byte));
+    f.write(buf.data(), static_cast<std::streamsize>(n));
+}
+
+static std::streamoff file_size(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) return -1;
+    return static_cast<std::streamoff>(f.tellg());
+}
+
+static void clobber(const std::string& path, std::streamoff at, size_t n) {
+    std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+    f.seekp(at);
+    std::vector<char> buf(n, '\xCD');
+    f.write(buf.data(), static_cast<std::streamsize>(n));
+}
+
+static void test_open_self_heals_zero_tail() {
+    TEST("open trims an all-zero tail instead of throwing");
+    auto path = make_path("cxx_zerotail.bson");
+    {
+        moofile::Collection db(path);
+        db.insert_many({{{"x", 1}}, {{"x", 2}}, {{"x", 3}}});
+    }
+    auto good = file_size(path);
+    append_bytes(path, 0x00, 1814);
+
+    moofile::Collection db(path);
+    ASSERT(db.count({}) == 3);
+    ASSERT(file_size(path) == good);
+}
+
+static void test_repair_salvages_interior_damage() {
+    TEST("moofile::repair salvages a file open() refuses");
+    auto path = make_path("cxx_interior.bson");
+    {
+        moofile::Collection db(path);
+        db.insert_many({{{"x", 1}}, {{"x", 2}}, {{"x", 3}}});
+    }
+    auto good = file_size(path);
+    clobber(path, good / 3, 20);
+    std::remove((path + ".cache").c_str());
+
+    bool threw = false;
+    try {
+        moofile::Collection db(path);
+    } catch (const moofile::error&) {
+        threw = true;
+    }
+    ASSERT(threw);
+    ASSERT(file_size(path) == good);  /* must not silently truncate */
+
+    auto report = moofile::repair(path);
+    ASSERT(report.rewritten);
+    ASSERT(report.is_damaged());
+    ASSERT(report.records_kept == 2);
+    ASSERT(report.gaps.size() == 1);
+    ASSERT(!report.gaps[0].to_end_of_file);
+    ASSERT(report.bytes_dropped > 0);
+
+    moofile::Collection db(path);
+    ASSERT(db.count({}) == 2);
+}
+
+static void test_config_set_repair() {
+    TEST("Config::set_repair() salvages on open");
+    auto path = make_path("cxx_repaircfg.bson");
+    {
+        moofile::Collection db(path);
+        db.insert_many({{{"x", 1}}, {{"x", 2}}, {{"x", 3}}});
+    }
+    clobber(path, file_size(path) / 3, 20);
+    std::remove((path + ".cache").c_str());
+
+    moofile::Collection db(path, moofile::Config{}.set_repair());
+    ASSERT(db.count({}) == 2);
+}
+
+static void test_repair_intact_file_is_a_no_op() {
+    TEST("moofile::repair leaves an intact file untouched");
+    auto path = make_path("cxx_repairclean.bson");
+    {
+        moofile::Collection db(path);
+        db.insert_many({{{"x", 1}}, {{"x", 2}}});
+    }
+    auto before = file_size(path);
+
+    auto report = moofile::repair(path);
+    ASSERT(!report.rewritten);
+    ASSERT(!report.is_damaged());
+    ASSERT(report.records_kept == 2);
+    ASSERT(report.gaps.empty());
+    ASSERT(file_size(path) == before);
+}
+
 static void test_error_on_readonly_write() {
     TEST("write on readonly throws moofile::error");
     try {
@@ -662,6 +764,12 @@ int main() {
     test_compact();
     test_sync();
     test_reindex();
+
+    /* Recovery */
+    test_open_self_heals_zero_tail();
+    test_repair_salvages_interior_damage();
+    test_config_set_repair();
+    test_repair_intact_file_is_a_no_op();
 
     /* Error handling */
     test_error_on_readonly_write();
