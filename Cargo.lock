@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-c"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "bson",
  "moofile-core",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-core"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "bincode",
  "bson",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "moofile-py"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "bson",
  "moofile-core",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "v4nano-embed"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "ort",
  "thiserror",
