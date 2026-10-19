@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### BM25 ranked common terms backwards
+
+Both backends computed IDF as `ln((N - df + 0.5) / (df + 0.5))`, which is
+negative once a term is in more than half the documents. Scores are sorted
+descending, so for a common term every extra occurrence pushed a document
+**down**: `"redis redis redis"` ranked below `"redis cache broke"` in a
+three-document collection. The same two documents then swapped places once a
+few unrelated documents were added, because "redis" stopped being common.
+The corpora this hits are ordinary ones for an embedded store: small
+collections, and topical ones (a `#deploys` channel says "deploy" in most
+messages). `hybrid_search` inherited the inverted lexical ranks through RRF.
+
+Both backends now use the Lucene form, `ln(1 + (N - df + 0.5) / (df + 0.5))`,
+which is always positive.
+
+- **Scores change.** Every BM25 score is now `> 0`, and the values differ
+  from before. Ranking changes wherever a query term was in more than half
+  the documents, which is the point. Code that thresholded or normalised raw
+  scores should be re-checked. Code that assumed scores could be negative
+  can drop that handling.
+- **No file or cache change.** Only document frequencies and lengths are
+  stored; IDF is computed per query. Existing files rank correctly on open.
+- `text.rs::add_and_search` had been loosened to accept either order for its
+  two ML documents, because the correct one lost under the old IDF. It now
+  requires the right order. New cross-backend tests
+  (`tests-cross/test_bm25_scoring_parity.py`) pin positivity, tf
+  monotonicity, independence from unrelated documents, and the exact formula.
+
 ## v1.2.5 (2026-09-22)
 
 Recovery fixes, from the TheWatcher incident of 2026-09-18: `granular.bson`

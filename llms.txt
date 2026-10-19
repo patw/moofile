@@ -249,8 +249,9 @@ maintained incrementally (`add` appends, `remove` swap-removes). Scores in `[-1,
 closer. Wrong-dimension or non-numeric vectors are ignored, not errors. `.find(filter)` pre-filters.
 
 **Text** — BM25 with `k1=1.2`, `b=0.75`, Porter stemming (`rust-stemmers` / `snowballstemmer`),
-tokenised on word boundaries, punctuation dropped, non-string fields ignored. Scores are unbounded
-and can be negative when a term appears in >50% of docs. Searches one field per call.
+tokenised on word boundaries, punctuation dropped, non-string fields ignored. IDF is the Lucene form
+`ln(1 + (N - df + 0.5) / (df + 0.5))`, so scores are always positive (but unbounded). Searches one
+field per call.
 
 **Hybrid (RRF)** — fuses rank positions, not scores: `score(d) = Σ 1/(k + rank + 1)`, `k = 60`,
 `rank` 0-based per ranker. Candidate pool is `max(limit*5, 50)` from each leg, so docs appearing in

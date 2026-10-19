@@ -546,7 +546,7 @@ where `k = 60` (the canonical RRF constant) and `rank` is the document's 0-based
 
 MooFile pulls a wider candidate pool (`max(limit × 5, 50)`) from each ranker to ensure enough overlap for meaningful fusion.
 
-**Why RRF over weighted score fusion?** BM25 scores are unbounded and can even be negative (when a term appears in >50% of documents). Cosine similarity is bounded in [-1, 1]. Naively combining them with weights requires score normalization, which is fragile. RRF uses only rank positions, making it robust to any score distribution.
+**Why RRF over weighted score fusion?** BM25 scores are positive but unbounded, and their scale depends on the corpus. Cosine similarity is bounded in [-1, 1]. Naively combining them with weights requires score normalization, which is fragile. RRF uses only rank positions, making it robust to any score distribution.
 
 No other embedded single-file document store offers BM25 + cosine + RRF fusion behind a single method call.
 

@@ -169,7 +169,12 @@ impl TextIndex {
             };
 
             let df = self.doc_frequencies.get(stem).copied().unwrap_or(0) as f32;
-            let idf = ((n_docs as f32 - df + 0.5) / (df + 0.5)).ln();
+            // The Lucene form, always positive. The unsmoothed
+            // ln((N - df + 0.5) / (df + 0.5)) goes negative once a term is in
+            // more than half the documents, and a negative IDF inverts the
+            // ranking: every extra occurrence of the term pushes a document
+            // *down*.  Must match moofile/text_search.py.
+            let idf = (1.0 + (n_docs as f32 - df + 0.5) / (df + 0.5)).ln();
 
             for (doc_id, tf) in docs {
                 let dl = *self.doc_lengths.get(doc_id).unwrap_or(&1) as f32;
@@ -321,14 +326,26 @@ mod tests {
         ti.add_document("3".into(), "cooking recipes for dinner");
 
         let results = ti.search("machine learning", 10);
-        assert!(!results.is_empty());
 
-        // Both docs are about ML; doc 2 has an extra "learning".
-        // Due to BM25 length normalization the ordering depends on
-        // the exact tf-idf balance.  Either "1" or "2" is valid.
+        // Both docs are about ML; doc 2 has an extra "learning", which must
+        // win.  "learning" is in 2 of 3 docs, and under the old unsmoothed
+        // IDF that made its weight negative, so the extra occurrence *lost* --
+        // this test used to accept either order to paper over it.
         let top_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(top_ids.contains(&"1"));
-        assert!(top_ids.contains(&"2"));
+        assert_eq!(top_ids, vec!["2", "1"]);
+        assert!(results.iter().all(|(_, score)| *score > 0.0));
+    }
+
+    #[test]
+    fn idf_stays_positive_for_a_term_in_every_doc() {
+        let mut ti = TextIndex::new();
+        ti.add_document("short".into(), "deploy redis");
+        ti.add_document("long".into(), "deploy notes from the long meeting today");
+
+        let results = ti.search("deploy", 10);
+        assert!(results.iter().all(|(_, score)| *score > 0.0), "{results:?}");
+        // Same tf; the shorter document is the more focused match.
+        assert_eq!(results[0].0, "short");
     }
 
     #[test]

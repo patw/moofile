@@ -480,7 +480,7 @@ db.find({"published": True})
 
 ### Hybrid Search (RRF)
 
-Reciprocal Rank Fusion combines BM25 text search and vector cosine similarity by fusing their **rank positions** rather than their raw scores. This avoids the score-normalization problem (BM25 scores are unbounded and can be negative; cosine similarity is in [-1, 1]) and produces a single ranked list that benefits from both lexical and semantic matching.
+Reciprocal Rank Fusion combines BM25 text search and vector cosine similarity by fusing their **rank positions** rather than their raw scores. This avoids the score-normalization problem (BM25 scores are positive but unbounded; cosine similarity is in [-1, 1]) and produces a single ranked list that benefits from both lexical and semantic matching.
 
 ```python
 db.find({"category": "research"})

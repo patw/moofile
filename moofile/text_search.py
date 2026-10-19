@@ -129,8 +129,12 @@ class TextIndex:
             # Document frequency for this stem
             df = self._doc_frequencies[stem]
             
-            # IDF calculation: log((N - df + 0.5) / (df + 0.5))
-            idf = math.log((self._doc_count - df + 0.5) / (df + 0.5))
+            # IDF: log(1 + (N - df + 0.5) / (df + 0.5)), the Lucene form.
+            # Always positive. The unsmoothed log((N - df + 0.5) / (df + 0.5))
+            # goes negative once a term is in more than half the documents,
+            # and a negative IDF inverts the ranking: every extra occurrence
+            # of the term pushes a document *down*. Must match core/src/text.rs.
+            idf = math.log(1.0 + (self._doc_count - df + 0.5) / (df + 0.5))
             
             # Score each document containing this stem
             for doc_id, tf in self._inverted_index[stem].items():

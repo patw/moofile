@@ -85,11 +85,12 @@ def test_text_search_basic(temp_collection):
     scores = [score for doc, score in results]
     assert scores == sorted(scores, reverse=True)  # Descending order
     
-    # Documents containing "machine learning" should be found
-    # Note: BM25 scores can be negative for very common terms
+    # Documents containing "machine learning" should be found, and every
+    # score is positive, common terms included (the IDF is smoothed).
     for doc, score in results:
         content = doc["content"].lower()
         assert "machine" in content or "learning" in content
+        assert score > 0
 
 
 def test_text_search_stemming(temp_collection):
