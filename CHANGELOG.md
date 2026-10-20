@@ -1,6 +1,203 @@
 # Changelog
 
-## Unreleased
+## v1.3.0 (2026-10-19)
+
+Performance and correctness work from a benchmark sweep against SQLite used
+as a JSON document store (JSON `body` column, `json_extract` expression
+indexes, FTS5, WAL), 10k–1M documents of ~270 bytes, four regular indexes plus
+BM25. Every result where moofile was more than 10× slower than SQLite traced
+to something the append-only design does not require — `_id` lookups that
+scanned, query stages run after decoding every match — and those are gone.
+Along the way the in-memory indexes stopped storing a copy of every `_id`, the
+`.cache` stopped storing a copy of every document, and autoembedded vectors
+started being stored at the precision they were configured for.
+
+1M documents, Ryzen 7 5800H, ext4 on NVMe, native backend via Python:
+
+| | v1.2.5 | v1.3.0 | SQLite |
+|---|---|---|---|
+| `find_one` / `update_one` / `delete_one` by `_id` | 1.12 s | 17 / 73 / 54 µs | 296 / 62 / 272 µs |
+| indexed range + `limit(10)` | 593 ms | 128 µs | 32 µs |
+| filter + `sort` + `limit(10)` | 647 ms | 44 ms | 138 ms |
+| `group` + `agg` | 5.6 s (6.4 GB peak) | 1.2 s (1.6 GB) | 1.8 s |
+| `count` (low cardinality) | 36 ms | 0.33 ms | 12 ms |
+| BM25 top 10 | 2.7 ms | 0.29 ms | 15 ms |
+| update / delete by indexed field | 444 / 400 µs | 67 / 41 µs | 45 / 182 µs |
+| bulk insert | 18.1k docs/s | 29.4k docs/s | 26.2k docs/s |
+| bulk-load peak RSS | 5.1 GB | 1.6 GB | 37 MB |
+| steady RSS after open | 2.23 GB | 0.77 GB | <1 MB |
+| open with cache / by replay | 4.9 s / 30 s | 2.2 s / 22 s | <10 ms |
+| `.cache` / total on disk | 692 / 952 MB | 197 / 448 MB | 581 MB |
+| `write()` calls: bulk load / `compact()` | 1,000,003 / 998,996 | 103 / 33 | — |
+
+The unindexed full scan (~1.1 s at 1M) is unchanged; RAM and open time remain
+proportional to the data, which is the design.
+
+### Upgrading: behaviour changes
+
+Rust is the system of record. Where the two backends disagreed, the Rust
+core's semantics now hold everywhere — every binding, and the pure-Python
+fallback, which was changed to match.
+
+- **Sort order is a total order** (MongoDB's): null/missing < numbers <
+  strings < objects < arrays < binary < ObjectId < bool < date < timestamp <
+  regex; numbers by value regardless of type, NaN lowest. **Missing and null
+  values now sort first ascending, last descending** — the Python backends
+  used to put them last ascending (and so first descending). Mixed-type
+  columns sort instead of raising (pure Python) or coming back in an
+  input-dependent order (Rust, which treated incomparable values as equal —
+  not transitive, so not a sort).
+- **Aggregations:** `sum` of integers is an integer (the non-Python bindings
+  used to get a double); `sum` and `mean` skip non-numbers and bools (Python
+  used to raise on a string and count `True` as 1); `min`/`max` use the sort
+  order, so they work across types, first of equals winning; **`first`/`last`
+  read the group's first/last document** and give `None` if it lacks the field
+  (Python used to return the first/last value *present*). Group keys compare
+  by value — `1` and `1.0` share a group — but in Python `True` no longer
+  merges with `1`, and list/dict keys group by content instead of raising.
+- **Autoembedded vectors are stored as BSON Binary subtype 9** (see below).
+  Python reads the target field back as `bson.Binary` — `.as_vector()`
+  decodes it, and `len()` is its *byte* length (dims + 2 for INT8) — where it
+  used to be a list of floats. Through the C ABI it is still a JSON number
+  array, but `int8` vectors now come out as their integer codes (−127..127)
+  rather than dequantised floats, and `binary` as 0/1 rather than ±1. Files
+  written by older versions load and search unchanged.
+- **Mixed versions on one file:** versions before 1.3.0 cannot index subtype-9
+  vectors. A document autoembedded by 1.3.0 is readable by an older process
+  but **absent from its vector and semantic search**. Upgrade every process
+  that opens a file together; to roll back after 1.3.0 has written vectors,
+  run `reembed()` under the old version.
+- **`insert_many` is all-or-nothing on duplicate `_id`s**, including the same
+  `_id` twice in one call. Rust already rejected an `_id` present in the
+  collection before writing anything, but on an `_id` repeated within the call
+  it wrote and indexed every document before the repeat, then raised; pure
+  Python did that for both kinds.
+- **Unsorted results** from an indexed query (Rust core) come back in internal
+  row order within equal index values, not `_id` order. Unsorted order was never
+  specified; chain `.sort()` where it matters.
+- **Vector arrays containing a non-number are not indexed.** Rust used to drop
+  the bad elements — silently shifting every later dimension — and pure
+  Python converted numeric strings and bools; both now skip the document,
+  as they always did for a wrong-length vector.
+- **BM25 scores change** (see "BM25 ranked common terms backwards" below).
+- **The `.cache` format changed** (version 5). The first open of each
+  collection after upgrading rebuilds from the data file once.
+
+### `_id` lookups were full scans
+
+Neither planner consulted the `_id`-keyed document map, so `find`, `update`
+and `delete` by `_id` decoded and matched every document: ~1.1 µs per
+document, 1.1 s per call at 1M. Equality, `$eq`, `$in` (all-string operands)
+and — in Rust — string ranges on `_id` are now answered from the map, alone or
+competing with other indexed fields for the smallest candidate set. Non-string
+operands still fall back to the scan, which cannot be wrong.
+
+### Query stages ran in Python, after every match was decoded
+
+The Python adapter called `find_raw(filter)` and applied `group`, `sort`,
+`skip` and `limit` to the decoded list, so `find(range).limit(10)` cost as
+much as returning every match. `find_raw` now takes every stage and the core
+runs them before anything crosses the boundary — which also gave the Python
+binding the same sort and aggregation semantics as every other binding. An
+`AggFunc` built by hand (it has no `kind`) still works, grouped in Python with
+the same semantics.
+
+In the core:
+
+- An unsorted, ungrouped `limit` stops scanning once it has `skip + limit`
+  matches; `first()`, `find_one()`, `update_one`, `replace_one` and
+  `delete_one` fetch and decode one document instead of every match.
+- `group` decodes only the group field and the aggregated fields of each
+  document, and groups them without cloning. It used to decode whole
+  documents and then clone each into its group.
+- A `text_search` with a pre-filter filters before ranking; it used to rank
+  and decode every text match in the collection, then drop the disallowed
+  ones.
+
+### Indexes refer to documents by row, not by `_id`
+
+Every regular-index entry held its own heap copy of the document's `_id`
+(~170 B per entry all told), and every text posting another (~1.2 KB per
+document for one text field), so the indexes outweighed the documents several
+times over: 2.2 GB of RSS for a 260 MB data file. Documents now live in
+numbered slots and the indexes hold 4-byte row numbers; `_id` is stored once,
+in an ordered map that keeps scans in `_id` order. A value held by a single
+document is stored inline rather than in a one-element set. The text index
+also drops a per-term document-frequency map that duplicated its posting
+counts.
+
+### Update and delete slowed as the text vocabulary grew
+
+Removing a document from a text index walked every term in the vocabulary.
+It now re-tokenises the document's stored text and visits only its own terms,
+checking that the term counts it removes add up to the length recorded at
+insert (and falling back to the full walk if they ever do not). Removing a
+document from a vector index found its matrix row by linear search over every
+id; there is now a row → position map. Indexed update at 1M: 444 → 67 µs.
+
+The pure-Python text index had the same vocabulary walk, fixed the same way,
+and its `add_document` carried a dead membership check that rebuilt a list of
+every document containing each term — O(n) per add on common terms. Removed.
+
+### The `.cache` no longer stores the documents
+
+The snapshot embedded every document as well as the indexes, making it 2.7×
+the size of the data it described, and most of a cached open went to
+deserialising it. It now stores the indexes and the row → `_id` assignment; a
+hit reads the documents back from the data file in one sequential raw pass,
+with no decode or re-indexing. If the file's live documents do not match the
+snapshot's rows exactly, the cache is a miss and the normal rebuild runs.
+
+### Vectors are stored as BSON Binary subtype 9
+
+`precision: "int8"` quantised each embedding and then dequantised it straight
+back into an array of doubles: 13+ bytes per dimension whatever the
+precision, 6.6 KB for a 512-dimensional `int8` vector (stored twice, counting
+the cache). Autoembedding now writes the BSON spec's packed vector type at
+the configured precision — `f32` as FLOAT32 (4 B/dim), `int8` as INT8
+(1 B/dim, 514 B at 512 dims), `uint8` as INT8 re-centred (`code − 128`, which
+is exactly what search used to see), `binary` as PACKED_BIT. Every vector index
+accepts subtype 9 as well as number arrays, from autoembedding or written by
+hand (`Binary.from_vector(...)`); packed bits score as ±1. The C ABI renders
+subtype 9 as a JSON number array, so JSON bindings see the shape they always
+did; `moofile::vector_numbers` exposes the same decoding to Rust callers.
+
+### One `write()` per document on bulk paths
+
+`insert_many` and `compact()` issued a `write()` per document — a million
+syscalls to bulk-load or compact a million documents. Multi-record writes
+(including batch commit) are now coalesced into ~8 MB chunks with a single
+flush/fsync. Bulk load also wrote 1.6 GB for 273 MB of data, nearly all of it
+the `.cache` written at close; with the smaller cache it writes 635 MB.
+
+### Writes inside a `batch()` decoded the whole collection
+
+Each buffered `update`/`delete`/`replace` inside a batch built its view by
+decoding every committed document. Committed documents now go through the
+planner like any other query; the batch's own buffered changes are always
+re-checked, since one may have moved a document into the filter's range.
+
+### Fixed along the way
+
+- **A legal filter could permanently break a Rust handle.** An inverted or
+  empty range on an indexed field (`{age: {$gt: 5, $lt: 2}}`, or `$gt` and
+  `$lt` on the same value) panicked inside `BTreeMap::range`. Under the write
+  lock in `update_many`/`delete_many` that poisoned the collection's lock, so
+  every later call on the handle failed. Such ranges now match nothing.
+- **`$gt` with `$gte` (or `$lt` with `$lte`) on an indexed field returned
+  extra rows.** The single-field path built one inclusive bound from the two
+  and labelled it an exact answer, so `{age: {$gt: 5, $gte: 3}}` included
+  `age == 5`. It is now treated as a candidate set and filtered.
+
+### Tests
+
+New cross-backend suites: `tests-cross/test_planner_parity.py` (every planned
+query checked against the full-scan answer to the same filter, batch writes,
+`insert_many` atomicity, skip/limit, text index maintenance),
+`test_sort_group_parity.py` (the sort order and aggregation semantics, pinned
+to exact answers) and `test_vector_binary_parity.py`. Rust unit tests cover
+the vector codec, row reuse, postings, tie-breaking, cache round-trips with
+free slots, and the C ABI's vector rendering.
 
 ### BM25 ranked common terms backwards
 
