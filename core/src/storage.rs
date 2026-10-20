@@ -114,13 +114,22 @@ pub(crate) fn encode_record(record_type: u8, doc: &Document) -> Vec<u8> {
 /// the same bytes to build the in-memory raw-document index entry, instead
 /// of encoding twice.
 pub(crate) fn encode_record_bytes(record_type: u8, payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u32;
     let mut buf = Vec::with_capacity(HEADER_SIZE + payload.len());
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.push(record_type);
-    buf.extend_from_slice(payload);
+    push_record(&mut buf, record_type, payload);
     buf
 }
+
+fn push_record(buf: &mut Vec<u8>, record_type: u8, payload: &[u8]) {
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.push(record_type);
+    buf.extend_from_slice(payload);
+}
+
+/// Multi-record writes are coalesced into `write()` calls of about this
+/// size.  One call per record cost a syscall per document — a million of
+/// them to bulk-load or compact a million documents — while one call for
+/// everything would hold a second copy of the whole batch in memory.
+const WRITE_CHUNK: usize = 8 * 1024 * 1024;
 
 /// Scan a BSON file from start to finish.
 ///
@@ -318,6 +327,44 @@ where
     Ok(None)
 }
 
+/// The live documents in the first `len` bytes of the data file, as raw
+/// BSON payloads keyed by `_id`: the last live/replacement record per `_id`
+/// wins and a tombstone removes it — the same rules as a replay, but with no
+/// decode and no indexing.  Records whose `_id` is not a non-empty string are
+/// skipped, as the loader skips them.
+///
+/// Used by a cache hit, which stores only the indexes and needs the
+/// documents back.  Anything irregular — an unreadable or implausible
+/// record, a file that does not end exactly at `len` — returns `None`, and
+/// the caller falls back to the full load, which knows how to report or
+/// repair damage.
+pub(crate) fn read_live_payloads(path: &Path, len: u64) -> Option<std::collections::HashMap<String, Vec<u8>>> {
+    let mut r = std::io::BufReader::with_capacity(1 << 20, File::open(path).ok()?);
+    let mut live = std::collections::HashMap::new();
+    let mut header = [0u8; HEADER_SIZE];
+    let mut pos = 0u64;
+    while pos < len {
+        r.read_exact(&mut header).ok()?;
+        let payload_len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        if !(MIN_BSON_DOC..=MAX_PAYLOAD).contains(&payload_len) {
+            return None;
+        }
+        let mut payload = vec![0u8; payload_len];
+        r.read_exact(&mut payload).ok()?;
+        pos += (HEADER_SIZE + payload_len) as u64;
+        let id = match bson::RawDocument::from_bytes(&payload).ok()?.get_str("_id") {
+            Ok(id) if !id.is_empty() => id.to_string(),
+            _ => continue,
+        };
+        match header[4] {
+            RECORD_LIVE | RECORD_REPLACEMENT => { live.insert(id, payload); }
+            RECORD_TOMBSTONE => { live.remove(&id); }
+            _ => {}
+        }
+    }
+    (pos == len).then_some(live)
+}
+
 /// Rewrite the BSON file keeping only `live_docs`.
 ///
 /// Writes to a `.tmp` file first, then atomically renames — if the process
@@ -349,11 +396,15 @@ fn compact_raw_bytes<'a>(
 
     let mut f = File::create(&tmp_path).map_err(|e| errors::io_err(&tmp_path, e))?;
 
+    let mut buf = Vec::with_capacity(WRITE_CHUNK);
     for payload in live_docs {
-        let record = encode_record_bytes(RECORD_LIVE, payload);
-        f.write_all(&record)
-            .map_err(|e| errors::io_err(&tmp_path, e))?;
+        push_record(&mut buf, RECORD_LIVE, payload);
+        if buf.len() >= WRITE_CHUNK {
+            f.write_all(&buf).map_err(|e| errors::io_err(&tmp_path, e))?;
+            buf.clear();
+        }
     }
+    f.write_all(&buf).map_err(|e| errors::io_err(&tmp_path, e))?;
 
     f.flush().map_err(|e| errors::io_err(&tmp_path, e))?;
     // fsync the tmp file so its contents are durable on disk before the
@@ -800,17 +851,37 @@ impl StorageEngine {
 
         // Encode and size-check the whole batch before writing any of it, so
         // one oversized document fails the batch instead of half-applying it.
-        let mut buf = Vec::new();
         let mut encoded = Vec::with_capacity(records.len());
         for (rt, doc) in records {
             encoded.push((*rt, encode_doc(doc)?));
         }
-        for (rt, payload) in &encoded {
-            buf.extend_from_slice(&encode_record_bytes(*rt, payload));
+        let refs: Vec<(u8, &[u8])> = encoded.iter().map(|(rt, p)| (*rt, p.as_slice())).collect();
+        self.append_many_bytes(&refs)
+    }
+
+    /// Append already-encoded records with chunked writes and a single
+    /// flush/fsync.  Every payload is size-checked before anything is
+    /// written.
+    pub fn append_many_bytes(&mut self, records: &[(u8, &[u8])]) -> Result<(), MooFileError> {
+        if self.readonly {
+            return Err(MooFileError::ReadOnly);
+        }
+        for (_, payload) in records {
+            check_size(payload)?;
         }
         let f = self.file.as_mut().expect("StorageEngine: file handle missing");
-        f.write_all(&buf)
-            .map_err(|e| errors::io_err(&self.path, e))?;
+        let total: usize = records.iter().map(|(_, p)| HEADER_SIZE + p.len()).sum();
+        let mut buf = Vec::with_capacity(total.min(WRITE_CHUNK));
+        for (rt, payload) in records {
+            push_record(&mut buf, *rt, payload);
+            if buf.len() >= WRITE_CHUNK {
+                f.write_all(&buf).map_err(|e| errors::io_err(&self.path, e))?;
+                buf.clear();
+            }
+        }
+        if !buf.is_empty() {
+            f.write_all(&buf).map_err(|e| errors::io_err(&self.path, e))?;
+        }
         match self.durability {
             Durability::None => {}
             Durability::Os => {

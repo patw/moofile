@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use rust_stemmers::{Algorithm, Stemmer};
 
+use crate::index::Row;
+
 // ---------------------------------------------------------------------------
 // TextIndex
 // ---------------------------------------------------------------------------
@@ -15,7 +17,8 @@ use rust_stemmers::{Algorithm, Stemmer};
 /// In-memory inverted index for full-text search.
 ///
 /// Tokenizes documents with a simple regex (`[a-zA-Z]+`), lowercases,
-/// stems with Porter, and scores with BM25.
+/// stems with Porter, and scores with BM25.  Documents are identified by
+/// their [`Row`]; see `index.rs`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct TextIndex {
     k1: f32,
@@ -23,15 +26,16 @@ pub(crate) struct TextIndex {
     #[serde(skip, default = "default_stemmer")]
     stemmer: Stemmer,
 
-    /// Inverted index: stem → (doc_id → term_frequency)
-    inverted: HashMap<String, HashMap<String, u32>>,
+    /// Inverted index: stem → (row → term frequency).  A stem's document
+    /// frequency is its posting count; it used to be duplicated in a second
+    /// map keyed by stem.
+    inverted: HashMap<String, HashMap<Row, u32>>,
 
-    /// Document metadata
-    doc_lengths: HashMap<String, u32>, // doc_id → total terms
+    /// Row → total terms in the document; 0 means "not indexed" (an indexed
+    /// document always has at least one term).
+    lengths: Vec<u32>,
+    n_docs: usize,
     total_length: u64,
-
-    /// Document frequency: stem → number of documents containing it
-    doc_frequencies: HashMap<String, u32>,
 }
 
 impl Clone for TextIndex {
@@ -41,9 +45,9 @@ impl Clone for TextIndex {
             b: self.b,
             stemmer: Stemmer::create(Algorithm::English),
             inverted: self.inverted.clone(),
-            doc_lengths: self.doc_lengths.clone(),
+            lengths: self.lengths.clone(),
+            n_docs: self.n_docs,
             total_length: self.total_length,
-            doc_frequencies: self.doc_frequencies.clone(),
         }
     }
 }
@@ -59,7 +63,7 @@ impl std::fmt::Debug for TextIndex {
         f.debug_struct("TextIndex")
             .field("k1", &self.k1)
             .field("b", &self.b)
-            .field("ndocs", &self.doc_lengths.len())
+            .field("ndocs", &self.n_docs)
             .field("nterms", &self.inverted.len())
             .finish()
     }
@@ -72,83 +76,109 @@ impl TextIndex {
             b: 0.75,
             stemmer: Stemmer::create(Algorithm::English),
             inverted: HashMap::new(),
-            doc_lengths: HashMap::new(),
+            lengths: Vec::new(),
+            n_docs: 0,
             total_length: 0,
-            doc_frequencies: HashMap::new(),
         }
+    }
+
+    fn length(&self, row: Row) -> u32 {
+        self.lengths.get(row as usize).copied().unwrap_or(0)
     }
 
     // ---------------------------------------------------------------
     // Document management
     // ---------------------------------------------------------------
 
-    pub fn add_document(&mut self, doc_id: String, text: &str) {
-        // Remove old version if present
-        self.remove_document(&doc_id);
+    pub fn add_document(&mut self, row: Row, text: &str) {
+        // Rows are only reused after removal, so this is a guard, not a path.
+        if self.length(row) != 0 {
+            self.purge(row);
+        }
 
         let stems = tokenize_and_stem(&self.stemmer, text);
         if stems.is_empty() {
             return;
         }
 
-        // Count term frequencies
         let mut term_freqs: HashMap<String, u32> = HashMap::new();
-        for stem in &stems {
+        for stem in stems.iter() {
             *term_freqs.entry(stem.clone()).or_default() += 1;
         }
-
-        // Add to inverted index
-        for (stem, freq) in &term_freqs {
-            self.inverted
-                .entry(stem.clone())
-                .or_default()
-                .insert(doc_id.clone(), *freq);
+        for (stem, freq) in term_freqs {
+            self.inverted.entry(stem).or_default().insert(row, freq);
         }
 
-        // Update document metadata
         let len = stems.len() as u32;
-        self.doc_lengths.insert(doc_id.clone(), len);
-        self.total_length += len as u64;
-
-        // Update document frequencies
-        for stem in term_freqs.keys() {
-            let df = self.inverted.get(stem).map(|m| m.len() as u32).unwrap_or(0);
-            self.doc_frequencies.insert(stem.clone(), df);
+        if self.lengths.len() <= row as usize {
+            self.lengths.resize(row as usize + 1, 0);
         }
+        self.lengths[row as usize] = len;
+        self.n_docs += 1;
+        self.total_length += len as u64;
     }
 
-    pub fn remove_document(&mut self, doc_id: &str) {
-        let len = match self.doc_lengths.remove(doc_id) {
-            Some(l) => l,
-            None => return,
-        };
-
-        self.total_length -= len as u64;
-
-        // Remove from inverted index
-        let mut empty_stems = Vec::new();
-        for (stem, docs) in self.inverted.iter_mut() {
-            if docs.remove(doc_id).is_some() {
-                self.doc_frequencies.insert(stem.clone(), docs.len() as u32);
-                if docs.is_empty() {
-                    empty_stems.push(stem.clone());
+    /// Remove a document, given the text it was indexed from.
+    ///
+    /// Re-tokenising that text names exactly the stems holding a posting for
+    /// this row, so removal costs O(terms in the document).  It used to walk
+    /// every stem in the vocabulary — the reason update and delete slowed as
+    /// a collection's vocabulary grew.  If the text does not account for
+    /// every term recorded at add time (it always should: the caller passes
+    /// the same stored bytes) the full walk still runs, so a stale posting
+    /// can never survive.
+    pub fn remove_document(&mut self, row: Row, text: Option<&str>) {
+        let len = self.length(row);
+        if len == 0 {
+            return;
+        }
+        let mut removed: u64 = 0;
+        if let Some(text) = text {
+            let mut stems = tokenize_and_stem(&self.stemmer, text);
+            stems.sort_unstable();
+            stems.dedup();
+            for stem in &stems {
+                if let Some(docs) = self.inverted.get_mut(stem) {
+                    if let Some(tf) = docs.remove(&row) {
+                        removed += tf as u64;
+                        if docs.is_empty() {
+                            self.inverted.remove(stem);
+                        }
+                    }
                 }
             }
         }
-
-        for stem in &empty_stems {
-            self.inverted.remove(stem);
-            self.doc_frequencies.remove(stem);
+        if removed != len as u64 {
+            self.purge_postings(row);
         }
+        self.lengths[row as usize] = 0;
+        self.n_docs -= 1;
+        self.total_length -= len as u64;
+    }
+
+    fn purge(&mut self, row: Row) {
+        let len = self.length(row);
+        self.purge_postings(row);
+        self.lengths[row as usize] = 0;
+        self.n_docs -= 1;
+        self.total_length -= len as u64;
+    }
+
+    fn purge_postings(&mut self, row: Row) {
+        self.inverted.retain(|_, docs| {
+            docs.remove(&row);
+            !docs.is_empty()
+        });
     }
 
     // ---------------------------------------------------------------
     // Search
     // ---------------------------------------------------------------
 
-    /// BM25 search.  Returns `(doc_id, score)` pairs sorted descending.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<(String, f32)> {
-        let n_docs = self.doc_lengths.len();
+    /// BM25 score of every document matching `query`, unordered.  Ranking
+    /// and the `_id` tie-break happen in `IndexManager`, which can see ids.
+    pub fn scores(&self, query: &str) -> Vec<(Row, f32)> {
+        let n_docs = self.n_docs;
         if n_docs == 0 {
             return Vec::new();
         }
@@ -160,7 +190,7 @@ impl TextIndex {
 
         let avgdl = self.total_length as f32 / n_docs as f32;
 
-        let mut doc_scores: HashMap<String, f32> = HashMap::new();
+        let mut doc_scores: HashMap<Row, f32> = HashMap::new();
 
         for stem in &query_stems {
             let docs = match self.inverted.get(stem) {
@@ -168,7 +198,7 @@ impl TextIndex {
                 None => continue,
             };
 
-            let df = self.doc_frequencies.get(stem).copied().unwrap_or(0) as f32;
+            let df = docs.len() as f32;
             // The Lucene form, always positive. The unsmoothed
             // ln((N - df + 0.5) / (df + 0.5)) goes negative once a term is in
             // more than half the documents, and a negative IDF inverts the
@@ -176,30 +206,23 @@ impl TextIndex {
             // *down*.  Must match moofile/text_search.py.
             let idf = (1.0 + (n_docs as f32 - df + 0.5) / (df + 0.5)).ln();
 
-            for (doc_id, tf) in docs {
-                let dl = *self.doc_lengths.get(doc_id).unwrap_or(&1) as f32;
+            for (&row, tf) in docs {
+                let dl = self.length(row).max(1) as f32;
                 let tf_component =
                     (*tf as f32 * (self.k1 + 1.0))
                         / (*tf as f32 + self.k1 * (1.0 - self.b + self.b * (dl / avgdl)));
 
-                *doc_scores.entry(doc_id.clone()).or_default() += idf * tf_component;
+                *doc_scores.entry(row).or_default() += idf * tf_component;
             }
         }
 
-        let mut scored: Vec<(String, f32)> = doc_scores.into_iter().collect();
-        // Break ties on doc_id so the ranking is a total order.  Scores come
-        // out of a HashMap, whose iteration order is randomised per process,
-        // so equal-scoring documents otherwise came back in a different order
-        // on every run -- and in a different order from the Python impl.
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        scored.truncate(limit);
-        scored
+        doc_scores.into_iter().collect()
     }
 
     pub fn clear(&mut self) {
         self.inverted.clear();
-        self.doc_lengths.clear();
-        self.doc_frequencies.clear();
+        self.lengths.clear();
+        self.n_docs = 0;
         self.total_length = 0;
     }
 }
@@ -263,34 +286,41 @@ fn stem_term(stemmer: &Stemmer, term: &str) -> String {
 mod tests {
     use super::*;
 
+    /// All matches, best first, ties by row.
+    fn search(ti: &TextIndex, q: &str) -> Vec<(Row, f32)> {
+        let mut s = ti.scores(q);
+        s.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        s
+    }
+
     #[test]
     fn digits_are_indexed_and_discriminate() {
         let mut ti = TextIndex::new();
-        ti.add_document("a".into(), "moofile v1.2.0 released with voyage-4-nano as the default");
-        ti.add_document("b".into(), "moofile v0.3.0 rust core rewrite monorepo pyo3");
-        ti.add_document("c".into(), "behopc upgraded to the Intel 14900K arrow lake cpu");
-        ti.add_document("d".into(), "nvidia driver 595.71.05 suspend resume monitors stay black");
+        ti.add_document(0, "moofile v1.2.0 released with voyage-4-nano as the default");
+        ti.add_document(1, "moofile v0.3.0 rust core rewrite monorepo pyo3");
+        ti.add_document(2, "behopc upgraded to the Intel 14900K arrow lake cpu");
+        ti.add_document(3, "nvidia driver 595.71.05 suspend resume monitors stay black");
 
         // Bare identifiers used to tokenize to nothing at all.
-        assert_eq!(ti.search("14900K", 5)[0].0, "c");
-        assert_eq!(ti.search("595.71.05", 5)[0].0, "d");
+        assert_eq!(search(&ti, "14900K")[0].0, 2);
+        assert_eq!(search(&ti, "595.71.05")[0].0, 3);
 
         // Two versions of the same product must not rank identically.
-        assert_eq!(ti.search("moofile v1.2.0", 5)[0].0, "a");
-        assert_eq!(ti.search("moofile v0.3.0", 5)[0].0, "b");
+        assert_eq!(search(&ti, "moofile v1.2.0")[0].0, 0);
+        assert_eq!(search(&ti, "moofile v0.3.0")[0].0, 1);
     }
 
     #[test]
     fn compounds_are_reachable_by_their_parts() {
         let mut ti = TextIndex::new();
-        ti.add_document("a".into(), "built llama.cpp with CUDA on behoserver");
-        ti.add_document("b".into(), "behothinkpad is x86-64-v3 compatible, not v4");
+        ti.add_document(0, "built llama.cpp with CUDA on behoserver");
+        ti.add_document(1, "behothinkpad is x86-64-v3 compatible, not v4");
 
         // The whole compound, and each part of it.
-        assert_eq!(ti.search("llama.cpp", 5)[0].0, "a");
-        assert_eq!(ti.search("llama", 5)[0].0, "a");
-        assert_eq!(ti.search("x86-64-v3", 5)[0].0, "b");
-        assert_eq!(ti.search("x86", 5)[0].0, "b");
+        assert_eq!(search(&ti, "llama.cpp")[0].0, 0);
+        assert_eq!(search(&ti, "llama")[0].0, 0);
+        assert_eq!(search(&ti, "x86-64-v3")[0].0, 1);
+        assert_eq!(search(&ti, "x86")[0].0, 1);
     }
 
     #[test]
@@ -321,49 +351,75 @@ mod tests {
     #[test]
     fn add_and_search() {
         let mut ti = TextIndex::new();
-        ti.add_document("1".into(), "machine learning is great");
-        ti.add_document("2".into(), "deep learning and machine learning");
-        ti.add_document("3".into(), "cooking recipes for dinner");
+        ti.add_document(1, "machine learning is great");
+        ti.add_document(2, "deep learning and machine learning");
+        ti.add_document(3, "cooking recipes for dinner");
 
-        let results = ti.search("machine learning", 10);
+        let results = search(&ti, "machine learning");
 
         // Both docs are about ML; doc 2 has an extra "learning", which must
         // win.  "learning" is in 2 of 3 docs, and under the old unsmoothed
         // IDF that made its weight negative, so the extra occurrence *lost* --
         // this test used to accept either order to paper over it.
-        let top_ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(top_ids, vec!["2", "1"]);
+        let top: Vec<Row> = results.iter().map(|(row, _)| *row).collect();
+        assert_eq!(top, vec![2, 1]);
         assert!(results.iter().all(|(_, score)| *score > 0.0));
     }
 
     #[test]
     fn idf_stays_positive_for_a_term_in_every_doc() {
         let mut ti = TextIndex::new();
-        ti.add_document("short".into(), "deploy redis");
-        ti.add_document("long".into(), "deploy notes from the long meeting today");
+        ti.add_document(0, "deploy redis");
+        ti.add_document(1, "deploy notes from the long meeting today");
 
-        let results = ti.search("deploy", 10);
+        let results = search(&ti, "deploy");
         assert!(results.iter().all(|(_, score)| *score > 0.0), "{results:?}");
         // Same tf; the shorter document is the more focused match.
-        assert_eq!(results[0].0, "short");
+        assert_eq!(results[0].0, 0);
     }
 
     #[test]
     fn remove_document() {
         let mut ti = TextIndex::new();
-        ti.add_document("a".into(), "hello world");
-        ti.add_document("b".into(), "hello rust");
-        assert_eq!(ti.search("hello", 10).len(), 2);
+        ti.add_document(0, "hello world");
+        ti.add_document(1, "hello rust");
+        assert_eq!(search(&ti, "hello").len(), 2);
 
-        ti.remove_document("a");
-        let results = ti.search("hello", 10);
+        ti.remove_document(0, Some("hello world"));
+        let results = search(&ti, "hello");
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "b");
+        assert_eq!(results[0].0, 1);
+        assert!(search(&ti, "world").is_empty(), "a stem only row 0 had must be gone");
+        assert_eq!((ti.n_docs, ti.total_length), (1, 2));
+    }
+
+    /// Removal is driven by the document's text; if that text is missing or
+    /// does not account for the indexed terms, the full walk still runs.
+    #[test]
+    fn remove_falls_back_when_the_text_disagrees() {
+        for text in [None, Some("something else entirely"), Some("hello")] {
+            let mut ti = TextIndex::new();
+            ti.add_document(0, "hello world");
+            ti.add_document(1, "hello rust");
+            ti.remove_document(0, text);
+            assert_eq!(search(&ti, "hello").iter().map(|r| r.0).collect::<Vec<_>>(), [1]);
+            assert!(search(&ti, "world").is_empty(), "text {text:?} left a posting behind");
+            assert_eq!((ti.n_docs, ti.total_length), (1, 2));
+        }
+    }
+
+    #[test]
+    fn repeated_terms_are_removed_with_their_full_count() {
+        let mut ti = TextIndex::new();
+        ti.add_document(4, "deploy deploy deploy redis");
+        ti.remove_document(4, Some("deploy deploy deploy redis"));
+        assert!(ti.inverted.is_empty());
+        assert_eq!((ti.n_docs, ti.total_length), (0, 0));
     }
 
     #[test]
     fn empty_index() {
         let ti = TextIndex::new();
-        assert!(ti.search("anything", 10).is_empty());
+        assert!(search(&ti, "anything").is_empty());
     }
 }

@@ -1,9 +1,16 @@
 //! Disposable index snapshot cache.
 //!
 //! On open, if the cache matches the data file exactly (inode + length +
-//! mtime), load the pre-built indexes directly — skipping the BSON scan, decode,
+//! mtime), load the pre-built indexes directly — skipping the BSON decode,
 //! tokenisation, stemming, and vector normalisation that a cold rebuild
 //! requires.
+//!
+//! The snapshot holds the indexes and the row → `_id` assignment, **not the
+//! documents**: those are already in the data file, and a hit reads them
+//! back with one sequential raw pass (`storage::read_live_payloads`).
+//! Embedding a second copy of every document made the cache 2.7× the size of
+//! the data it described, and most of a cached open was spent deserialising
+//! it.
 //!
 //! On any mismatch (file modified, cache corrupt, version change, index
 //! configuration change) the cache is silently ignored and the normal
@@ -19,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use crate::index::{IndexManager, Value};
+use crate::index::{IndexManager, Postings, Row, Value, VectorMatrix};
 use crate::text::TextIndex;
 
 /// Cache format version — bump when the serialised layout **or the meaning of
@@ -33,7 +40,9 @@ use crate::text::TextIndex;
 ///           the old token set; only the version bump forces the rebuild that
 ///           makes the new analyzer take effect.
 ///   3 -> 4: the fingerprint gained the data file's inode.
-const CACHE_VERSION: u32 = 4;
+///   4 -> 5: indexes refer to documents by row; documents are no longer
+///           stored (they are read back from the data file).
+const CACHE_VERSION: u32 = 5;
 
 /// Magic bytes at the start of every cache file, so we can quickly reject
 /// non-cache files (e.g. a pickle written by the Python implementation).
@@ -76,14 +85,13 @@ pub(crate) struct CacheFile {
     regular_fields: Vec<String>,
     vector_fields: Vec<(String, usize)>,
     text_fields: Vec<String>,
-    /// The live documents (final, replayed — last-wins already applied).
-    /// Stored as raw BSON bytes because `bson::Document` uses
-    /// `deserialize_any` which bincode 1.x does not support.
-    documents: Vec<(String, Vec<u8>)>,
-    /// Regular BTreeMap indexes: field → (value → [_ids]).
-    regular: Vec<(String, Vec<(Value, Vec<String>)>)>,
-    /// Vector data: field → (ids, flat normalised matrix, dim).
-    vector_data: Vec<(String, Vec<String>, Vec<f32>, usize)>,
+    /// Row → `_id` (`None` for a free slot).  The documents themselves are
+    /// read back from the data file on load.
+    rows: Vec<Option<String>>,
+    /// Regular BTreeMap indexes: field → (value → [rows]).
+    regular: Vec<(String, Vec<(Value, Vec<Row>)>)>,
+    /// Vector data: field → (rows, flat normalised matrix, dim).
+    vector_data: Vec<(String, Vec<Row>, Vec<f32>, usize)>,
     /// Text indexes: field → TextIndex.
     text_indexes: Vec<(String, TextIndex)>,
 }
@@ -202,25 +210,28 @@ pub(crate) fn try_load_cache(
     }
 
     // --- All checks passed: reconstruct the IndexManager ---
-    // Wrap the raw BSON bytes directly — no decode. `RawDocumentBuf::
-    // from_bytes` only validates BSON framing (length prefix, trailing
-    // NUL), it doesn't walk the document's fields, so this is strictly
-    // cheaper than the full `bson::from_slice::<Document>` decode this
-    // replaced.
-    let documents: std::collections::BTreeMap<String, Arc<bson::raw::RawDocumentBuf>> = cache
-        .documents
-        .into_iter()
-        .filter_map(|(k, bytes)| {
-            bson::raw::RawDocumentBuf::from_bytes(bytes).ok().map(|d| (k, Arc::new(d)))
-        })
-        .collect();
+    // Documents come back from the data file, which the fingerprint has
+    // just confirmed is byte-for-byte the one this snapshot describes.  The
+    // row map must account for every live document exactly; anything else
+    // is a miss and a normal rebuild.
+    let Some(mut live) = crate::storage::read_live_payloads(data_path, cache.data_file_length) else {
+        return CacheLoad::Miss;
+    };
+    let mut docs = Vec::with_capacity(cache.rows.len());
+    for slot in cache.rows {
+        docs.push(match slot {
+            None => None,
+            Some(id) => match live.remove(&id).map(bson::raw::RawDocumentBuf::from_bytes) {
+                Some(Ok(raw)) => Some(Arc::new(raw)),
+                _ => return CacheLoad::Miss,
+            },
+        });
+    }
+    if !live.is_empty() {
+        return CacheLoad::Miss;
+    }
 
-    // Posting lists are serialised as Vec (stable on-disk layout) and
-    // rebuilt as BTreeSet in memory, where removal is O(log k) not O(k).
-    let regular: std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<Value, std::collections::BTreeSet<String>>,
-    > = cache
+    let regular: std::collections::BTreeMap<String, std::collections::BTreeMap<Value, Postings>> = cache
         .regular
         .into_iter()
         .map(|(field, entries)| {
@@ -228,31 +239,32 @@ pub(crate) fn try_load_cache(
                 field,
                 entries
                     .into_iter()
-                    .map(|(v, ids)| (v, ids.into_iter().collect()))
+                    .filter_map(|(v, rows)| Some((v, Postings::from_rows(rows)?)))
                     .collect::<std::collections::BTreeMap<_, _>>(),
             )
         })
         .collect();
 
-    let vector_data: std::collections::BTreeMap<String, (Vec<String>, Vec<f32>, usize)> =
-        cache
-            .vector_data
-            .into_iter()
-            .map(|(field, ids, data, dim)| (field, (ids, data, dim)))
-            .collect();
+    let vector_data: std::collections::BTreeMap<String, VectorMatrix> = cache
+        .vector_data
+        .into_iter()
+        .map(|(field, rows, data, dim)| (field, VectorMatrix::from_parts(rows, data, dim)))
+        .collect();
 
     let text_indexes: std::collections::BTreeMap<String, TextIndex> =
         cache.text_indexes.into_iter().collect();
 
-    let index_manager = IndexManager::from_cache(
+    let Some(index_manager) = IndexManager::from_cache(
         regular,
         cache.regular_fields,
         cache.vector_fields,
         vector_data,
         cache.text_fields,
         text_indexes,
-        documents,
-    );
+        docs,
+    ) else {
+        return CacheLoad::Miss;
+    };
 
     CacheLoad::Hit {
         index_manager,
@@ -293,33 +305,29 @@ pub(crate) fn save_cache(
     let text_fields = index_manager.text_fields.clone();
 
     // Flatten BTreeMaps into Vecs for bincode (slightly more compact).
-    // Documents are stored as raw BSON bytes (bincode can't handle
-    // bson::Document's deserialize_any — and now that the in-memory
-    // representation already *is* raw BSON bytes, this is a byte copy,
-    // not a re-encode).
-    let documents: Vec<(String, Vec<u8>)> = index_manager
-        .documents
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
-        .collect();
+    let rows = index_manager.row_ids();
 
-    let regular: Vec<(String, Vec<(Value, Vec<String>)>)> = index_manager
+    let regular: Vec<(String, Vec<(Value, Vec<Row>)>)> = index_manager
         .regular
         .iter()
         .map(|(field, map)| {
             (
                 field.clone(),
                 map.iter()
-                    .map(|(k, v)| (k.clone(), v.iter().cloned().collect::<Vec<_>>()))
+                    .map(|(k, p)| {
+                        let mut rows = Vec::with_capacity(p.len());
+                        p.extend_into(&mut rows);
+                        (k.clone(), rows)
+                    })
                     .collect(),
             )
         })
         .collect();
 
-    let vector_data: Vec<(String, Vec<String>, Vec<f32>, usize)> = index_manager
+    let vector_data: Vec<(String, Vec<Row>, Vec<f32>, usize)> = index_manager
         .vector_data
         .iter()
-        .map(|(field, (ids, data, dim))| (field.clone(), ids.clone(), data.clone(), *dim))
+        .map(|(field, m)| (field.clone(), m.rows.clone(), m.data.clone(), m.dim))
         .collect();
 
     let text_indexes: Vec<(String, TextIndex)> = index_manager
@@ -338,7 +346,7 @@ pub(crate) fn save_cache(
         regular_fields,
         vector_fields,
         text_fields,
-        documents,
+        rows,
         regular,
         vector_data,
         text_indexes,
@@ -527,14 +535,73 @@ mod tests {
                 assert!(index_manager.get("a").is_some());
                 assert!(index_manager.get("b").is_some());
                 // Verify regular index works
-                let results = index_manager.lookup_exact_ids(
-                    "email",
-                    &bson::Bson::String("a@x.com".into()),
-                );
-                assert_eq!(results, Some(vec!["a".into()]));
+                let rows = index_manager
+                    .lookup_exact_rows("email", &bson::Bson::String("a@x.com".into()))
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(index_manager.id_of(rows[0]), Some("a"));
             }
             CacheLoad::Miss => panic!("cache should hit after save"),
         }
+    }
+
+    /// Free slots and replaced documents must round-trip: the cache keeps
+    /// rows, and reads each row's current document back from the log.
+    #[test]
+    fn cache_roundtrip_with_free_slots_and_replacements() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("test.bson");
+        let a1 = doc! { "_id": "a", "age": 1 };
+        let b = doc! { "_id": "b", "age": 2 };
+        let a2 = doc! { "_id": "a", "age": 3 };
+        let c = doc! { "_id": "c", "age": 4 };
+        let mut buf = Vec::new();
+        use crate::storage::{encode_record, RECORD_LIVE, RECORD_REPLACEMENT, RECORD_TOMBSTONE};
+        buf.extend(encode_record(RECORD_LIVE, &a1));
+        buf.extend(encode_record(RECORD_LIVE, &b));
+        buf.extend(encode_record(RECORD_REPLACEMENT, &a2));
+        buf.extend(encode_record(RECORD_TOMBSTONE, &doc! { "_id": "b" }));
+        buf.extend(encode_record(RECORD_LIVE, &c));
+        buf.extend(encode_record(RECORD_TOMBSTONE, &doc! { "_id": "c" }));
+        fs::write(&data_path, &buf).unwrap();
+
+        let mut im = IndexManager::new(&["age".into()], &[], &[]);
+        im.add(a1);
+        im.add(b);
+        im.remove("a");
+        im.add(a2);
+        im.remove("b");
+        im.add(c);
+        im.remove("c");
+        save_cache(&data_path, &im, 6, file_fingerprint(&data_path).unwrap()).unwrap();
+
+        match try_load_cache(&data_path, &["age".into()], &[], &[]) {
+            CacheLoad::Hit { index_manager, .. } => {
+                assert_eq!(index_manager.doc_count(), 1);
+                assert_eq!(index_manager.get("a").unwrap().get_i32("age").unwrap(), 3);
+                let rows = index_manager.lookup_exact_rows("age", &bson::Bson::Int32(3)).unwrap();
+                assert_eq!(index_manager.id_of(rows[0]), Some("a"));
+                assert!(index_manager.lookup_exact_rows("age", &bson::Bson::Int32(1)).unwrap().is_empty());
+            }
+            CacheLoad::Miss => panic!("cache should hit"),
+        }
+    }
+
+    /// A snapshot whose rows disagree with the log's live set is a miss,
+    /// never a partial load.
+    #[test]
+    fn cache_miss_when_rows_and_log_disagree() {
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("test.bson");
+        let mut buf = Vec::new();
+        buf.extend(crate::storage::encode_record(crate::storage::RECORD_LIVE, &doc! { "_id": "a" }));
+        buf.extend(crate::storage::encode_record(crate::storage::RECORD_LIVE, &doc! { "_id": "b" }));
+        fs::write(&data_path, &buf).unwrap();
+
+        let mut im = IndexManager::new(&[], &[], &[]);
+        im.add(doc! { "_id": "a" });
+        save_cache(&data_path, &im, 2, file_fingerprint(&data_path).unwrap()).unwrap();
+        assert!(matches!(try_load_cache(&data_path, &[], &[], &[]), CacheLoad::Miss));
     }
 
     #[test]

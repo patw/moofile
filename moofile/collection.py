@@ -308,17 +308,21 @@ class Collection:
             _check_id(doc["_id"])
             prepared.append(_normalize(doc))
 
-        out = []
         with self._with_write_lock():
+            # All-or-nothing: a duplicate -- already present, or twice in
+            # this call -- fails before anything is written.
+            seen = set()
             for doc in prepared:
-                if self._index_manager.get(doc["_id"]) is not None:
-                    raise DuplicateKeyError(f"Duplicate _id: {doc['_id']!r}")
-                self._storage.append(RECORD_LIVE, doc)
+                _id = doc["_id"]
+                if _id in seen or self._index_manager.get(_id) is not None:
+                    raise DuplicateKeyError(f"Duplicate _id: {_id!r}")
+                seen.add(_id)
+            self._storage.append_batch([(RECORD_LIVE, doc) for doc in prepared])
+            for doc in prepared:
                 self._index_manager.add(doc)
-                self._total_records += 1
-                out.append(doc)
+            self._total_records += len(prepared)
         self._dirty = True
-        return out
+        return prepared
 
     # -----------------------------------------------------------------------
     # Update
@@ -679,6 +683,14 @@ class Collection:
             if key.startswith("$"):
                 return None
 
+        # `_id` needs no declared index: `_documents` is keyed by it.  Without
+        # this, find/update/delete by `_id` was a full scan.
+        if "_id" in filter_dict:
+            ids = self._id_candidates(filter_dict["_id"])
+            if ids is not None:
+                docs = self._index_manager._documents
+                return [docs[i] for i in ids if i in docs]
+
         # Look for the first top-level field that is indexed
         for field, condition in filter_dict.items():
             if field not in self._index_manager._indexes:
@@ -712,6 +724,25 @@ class Collection:
                 )
 
         return None  # no usable index found
+
+    @staticmethod
+    def _id_candidates(condition) -> list | None:
+        """The `_id`s an `_id` condition can match, or None to scan.
+
+        Only string operands are planned: `_id` is always a string, so
+        anything else is left to the scan, which is slow but cannot be wrong.
+        """
+        if isinstance(condition, str):
+            return [condition]
+        if not isinstance(condition, dict):
+            return None
+        if "$eq" in condition:
+            value = condition["$eq"]
+            return [value] if isinstance(value, str) else None
+        values = condition.get("$in")
+        if isinstance(values, list) and all(isinstance(v, str) for v in values):
+            return list(dict.fromkeys(values))
+        return None
 
     # -----------------------------------------------------------------------
     # File management helpers
@@ -1128,9 +1159,14 @@ class BatchContext:
 
     def _get_docs(self, filter_dict: dict) -> list:
         """Get docs matching filter from current view (pre-batch + batch changes)."""
-        # Build current view: start with all live docs
+        # Committed docs go through the planner; the overlay is always a
+        # candidate, since a buffered write may have moved a document into
+        # the filter's range and the index only describes committed state.
+        candidates = self._collection._try_index(filter_dict) if filter_dict else None
+        if candidates is None:
+            candidates = self._collection._index_manager.all_docs()
         docs = {}
-        for doc in self._collection._index_manager.all_docs():
+        for doc in candidates:
             docs[doc["_id"]] = doc
         # Apply overlay
         for _id, doc in self._overlay.items():

@@ -5,8 +5,9 @@ Used by moofile/__init__.py when the native extension is available.
 """
 
 import bson as _bson
-from collections import defaultdict
 from typing import Optional
+
+from .query import apply_group_agg, sort_key
 
 _NativeCollection = None
 
@@ -431,21 +432,35 @@ class _NativeQuery:
         )
 
     def to_list(self) -> list:
+        # Every stage runs in the core, which owns sort and aggregation
+        # semantics.  The one exception is a hand-built AggFunc with no
+        # `kind`: the core cannot run an arbitrary Python callable, so that
+        # query is grouped here (with the same semantics, see
+        # moofile.query.sort_key / group_key).  Negative skip/limit keep
+        # Python's slice semantics on that path too.
+        aggs = None
+        native = self._skip_n >= 0 and (self._limit_n is None or self._limit_n >= 0)
+        if self._group_field is not None:
+            funcs = self._agg_funcs or []
+            native = native and all(getattr(f, "kind", None) for f in funcs)
+            aggs = [(f.kind, f.field) for f in funcs] if native else None
         try:
+            if native:
+                raw_docs = self._native.find_raw(
+                    self._filter, self._skip_n, self._limit_n,
+                    self._sort_key, self._sort_desc, self._group_field, aggs,
+                )
+                return [_decode_native_document(raw) for raw in raw_docs]
             raw_docs = self._native.find_raw(self._filter)
         except RuntimeError as e:
             _map_errors(e)
         results = [_decode_native_document(raw) for raw in raw_docs]
 
-        # Group + aggregate (done in Python, same as pure-Python impl)
         if self._group_field is not None:
-            results = self._apply_group_agg(results)
+            results = apply_group_agg(results, self._group_field, self._agg_funcs)
 
         if self._sort_key is not None:
-            results.sort(
-                key=lambda d: (d.get(self._sort_key) is None, d.get(self._sort_key)),
-                reverse=self._sort_desc,
-            )
+            results.sort(key=lambda d: sort_key(d.get(self._sort_key)), reverse=self._sort_desc)
 
         if self._skip_n:
             results = results[self._skip_n:]
@@ -455,23 +470,15 @@ class _NativeQuery:
 
         return results
 
-    def _apply_group_agg(self, docs: list) -> list:
-        groups: dict = defaultdict(list)
-        for doc in docs:
-            key = doc.get(self._group_field)
-            groups[key].append(doc)
-
-        result = []
-        for key, group_docs in groups.items():
-            row = {self._group_field: key}
-            if self._agg_funcs:
-                for func in self._agg_funcs:
-                    row[func.output_name] = func.compute(group_docs)
-            result.append(row)
-        return result
-
     def first(self):
-        results = self.to_list()
+        # Ask the core for one row rather than materialising every match.
+        saved = self._limit_n
+        if saved is None or saved > 1:
+            self._limit_n = 1
+        try:
+            results = self.to_list()
+        finally:
+            self._limit_n = saved
         return results[0] if results else None
 
     def count(self) -> int:

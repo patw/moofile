@@ -44,13 +44,22 @@ mod cache;
 mod index;
 mod query;
 mod text;
+mod vector;
 
 pub use embed::{AutoEmbedConfig, EmbeddingPrecision, DEFAULT_MODEL, DEFAULT_QUERY_PREFIX};
 pub use errors::MooFileError;
 pub use query::{AggFunc, HybridQuery, Query, TextQuery, VectorQuery};
 pub use storage::{Durability, RepairGap, RepairReport, MAX_BINARY_SIZE, MAX_DOCUMENT_SIZE};
 
-use std::collections::BTreeMap;
+/// Decode a BSON Binary subtype-9 (vector) payload into the numbers it
+/// encodes: doubles for FLOAT32, integers for INT8, 0/1 for packed bits.
+/// `None` if the payload is malformed.  For bindings that render documents
+/// as JSON, where an opaque binary would hide what autoembedding stored.
+pub fn vector_numbers(bytes: &[u8]) -> Option<Vec<Bson>> {
+    vector::PackedVector::parse(bytes).map(|v| v.to_bson_numbers())
+}
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -315,9 +324,8 @@ fn detect_vector_dim_mismatches(
 
         let with_field = || {
             index_manager
-                .documents
-                .values()
-                .filter(|d| matches!(d.get(field), Ok(Some(bson::raw::RawBsonRef::Array(_)))))
+                .iter_docs()
+                .filter(|(_, d)| matches!(d.get(field), Ok(Some(v)) if crate::vector::raw_vector_len(v).is_some()))
                 .count()
         };
 
@@ -332,13 +340,9 @@ fn detect_vector_dim_mismatches(
 
         // Case 2: config and index agree, but documents on disk do not —
         // a collection written before the config was corrected.
-        for doc in index_manager.documents.values() {
-            if let Ok(Some(bson::raw::RawBsonRef::Array(arr))) = doc.get(field) {
-                // RawArray has no O(1) len() (arrays share BSON's document
-                // wire format — no built-in count), so this walks the raw
-                // bytes once to count elements. Only runs at collection
-                // open, not a hot path.
-                let len = arr.into_iter().count();
+        for (_, doc) in index_manager.iter_docs() {
+            // Only runs at collection open, not a hot path.
+            if let Some(len) = doc.get(field).ok().flatten().and_then(crate::vector::raw_vector_len) {
                 if len != *declared {
                     let e = out
                         .entry(field.clone())
@@ -760,24 +764,36 @@ impl Collection {
             .collect::<Result<_, _>>()?;
 
         let out = inner.with_write_lock(|inner| {
-            // Fail on an already-present _id before doing any embedding work,
-            // so a bad id in a 10k batch does not cost 10k forward passes
-            // before erroring.  Duplicates *within* the batch are still caught
-            // per document, by the running index.
+            // Fail on a duplicate _id — already present, or twice in this
+            // call — before doing any embedding work, so a bad id in a 10k
+            // batch does not cost 10k forward passes before erroring.  It also
+            // makes the call all-or-nothing: nothing is written unless every
+            // document can be.
+            let mut seen = std::collections::HashSet::with_capacity(prepared.len());
             for (_, id) in &prepared {
-                if inner.index_manager.contains(id) {
+                if inner.index_manager.contains(id) || !seen.insert(id.as_str()) {
                     return Err(MooFileError::DuplicateKey(id.clone()));
                 }
             }
 
-            let (docs, ids): (Vec<Document>, Vec<String>) = prepared.into_iter().unzip();
+            let docs: Vec<Document> = prepared.into_iter().map(|(doc, _)| doc).collect();
             let docs = inner.apply_auto_embed_batch(docs)?;
 
-            let mut out = Vec::with_capacity(docs.len());
-            for (doc, id) in docs.into_iter().zip(ids) {
-                out.push(insert_locked_embedded(inner, doc, &id)?);
+            // Encode everything (which also enforces both size caps), write it
+            // in chunked `write()`s rather than one per document, then index
+            // the same bytes.
+            let payloads: Vec<Vec<u8>> =
+                docs.iter().map(storage::encode_doc).collect::<Result<_, _>>()?;
+            let records: Vec<(u8, &[u8])> =
+                payloads.iter().map(|p| (RECORD_LIVE, p.as_slice())).collect();
+            inner.storage.append_many_bytes(&records)?;
+            for payload in payloads {
+                let raw = bson::raw::RawDocumentBuf::from_bytes(payload)
+                    .expect("bytes we just encoded are well-formed BSON");
+                inner.index_manager.add_raw(raw);
+                inner.total_records += 1;
             }
-            Ok(out)
+            Ok(docs)
         })?;
         inner.dirty = true;
         Ok(out)
@@ -820,7 +836,8 @@ impl Collection {
         // Match and write under a single lock hold, so the document we picked
         // is still the one we update.
         inner.with_write_lock(|inner| {
-            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            // Only the first match is used, so only it is fetched and decoded.
+            let docs_arc = inner.index_manager.get_matching_first(&where_clause, 1);
             let docs: Vec<Document> = docs_arc.iter().filter_map(|d| d.to_document().ok()).collect();
             if docs.is_empty() {
                 return Err(MooFileError::DocumentNotFound);
@@ -930,7 +947,8 @@ impl Collection {
         }
 
         inner.with_write_lock(|inner| {
-            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            // Only the first match is used, so only it is fetched and decoded.
+            let docs_arc = inner.index_manager.get_matching_first(&where_clause, 1);
             let docs: Vec<Document> = docs_arc.iter().filter_map(|d| d.to_document().ok()).collect();
             if docs.is_empty() {
                 return Err(MooFileError::DocumentNotFound);
@@ -976,7 +994,7 @@ impl Collection {
         }
 
         let deleted = inner.with_write_lock(|inner| {
-            let docs_arc = inner.index_manager.get_matching(&where_clause);
+            let docs_arc = inner.index_manager.get_matching_first(&where_clause, 1);
             // Only `_id` is needed here — `get_str` reads it straight off
             // the raw bytes (same cost as before: RawDocumentBuf's Deref
             // gives it the identical `ValueAccessResult<&str>` signature
@@ -1200,9 +1218,8 @@ impl Collection {
         let count = inner.with_write_lock(|inner| {
             let targets: Vec<(String, String)> = inner
                 .index_manager
-                .documents
-                .values()
-                .filter_map(|d| match (d.get_str("_id"), d.get(source_field)) {
+                .iter_docs()
+                .filter_map(|(_, d)| match (d.get_str("_id"), d.get(source_field)) {
                     (Ok(id), Ok(Some(bson::raw::RawBsonRef::String(text)))) => {
                         Some((id.to_string(), text.to_string()))
                     }
@@ -1233,7 +1250,7 @@ impl Collection {
                     let Some(mut new_doc) = inner.index_manager.get(id) else { continue };
 
                     let emb = finalize_embedding(raw, width, &config);
-                    new_doc.insert(&config.target_field, Bson::Array(emb));
+                    new_doc.insert(&config.target_field, emb);
 
                     inner.storage.append(RECORD_REPLACEMENT, &new_doc)?;
                     inner.index_manager.remove(id);
@@ -1392,7 +1409,7 @@ fn finalize_embedding(
     raw: Vec<f32>,
     width: usize,
     config: &AutoEmbedConfig,
-) -> Vec<Bson> {
+) -> Bson {
     let emb: Vec<f32> = if raw.len() > width {
         raw[..width].to_vec()
     } else {
@@ -1410,9 +1427,11 @@ fn finalize_embedding(
         emb
     };
 
-    let quantized = crate::embed::quantize(&emb, config.precision);
-    let dequantized = crate::embed::dequantize(&quantized, config.precision, emb.len());
-    dequantized.iter().map(|&v| Bson::Double(v as f64)).collect()
+    // Stored as a BSON subtype-9 vector at the configured precision.  This
+    // used to quantize and then dequantize straight back into an array of
+    // doubles — 13+ bytes per dimension whatever the precision, so `int8`
+    // saved nothing on disk.
+    crate::vector::encode_embedding(&emb, config.precision)
 }
 
 impl CollectionInner {
@@ -1459,7 +1478,7 @@ impl CollectionInner {
                 let embeddings = engine.embed_batch(texts)?;
                 for (&pi, raw) in chunk.iter().zip(embeddings) {
                     let arr = finalize_embedding(raw, width, config);
-                    docs[positions[pi]].insert(&config.target_field, Bson::Array(arr));
+                    docs[positions[pi]].insert(&config.target_field, arr);
                 }
             }
         }
@@ -1482,7 +1501,7 @@ impl CollectionInner {
                 let width = config.dims.min(engine.dims());
                 let bson_array = finalize_embedding(raw_emb, width, config);
 
-                doc.insert(&config.target_field, Bson::Array(bson_array));
+                doc.insert(&config.target_field, bson_array);
             }
         }
         Ok(doc)
@@ -1799,22 +1818,6 @@ fn insert_locked(
         return Err(MooFileError::DuplicateKey(_id.to_string()));
     }
     let doc = inner.apply_auto_embed(doc)?;
-    insert_locked_embedded(inner, doc, _id)
-}
-
-/// As [`insert_locked`], but for documents whose vector fields are already
-/// populated — the bulk path embeds the whole batch up front.
-///
-/// The duplicate check is repeated here rather than hoisted: a batch can
-/// contain the same `_id` twice, and only the running index catches that.
-fn insert_locked_embedded(
-    inner: &mut CollectionInner,
-    doc: Document,
-    _id: &str,
-) -> Result<Document, MooFileError> {
-    if inner.index_manager.contains(_id) {
-        return Err(MooFileError::DuplicateKey(_id.to_string()));
-    }
     // Encode once, share the bytes between the disk write and the raw-
     // document index entry — previously this encoded via `storage.append`
     // (its own internal `bson::to_vec`) and then separately deep-cloned the
@@ -1899,28 +1902,51 @@ fn batch_get_matching(inner: &CollectionInner, filter: &Document) -> Vec<Documen
         Some(b) => b,
         None => return Vec::new(),
     };
+    let im = &inner.index_manager;
 
-    let mut view: Vec<Document> = Vec::new();
+    // Committed documents go through the planner like any other query — this
+    // used to decode every document in the collection for each buffered
+    // update/delete.  The overlay is always a candidate set of its own: a
+    // buffered write may have moved a document into the filter's range, and
+    // the index only describes committed state.
+    let planned: Option<BTreeSet<&str>> = if filter.is_empty() {
+        None
+    } else {
+        im.try_index(filter).map(|r| {
+            r.rows()
+                .iter()
+                .filter_map(|&row| im.id_of(row))
+                .chain(batch.overlay.keys().map(String::as_str).filter(|id| im.contains(id)))
+                .collect()
+        })
+    };
+    let committed: Box<dyn Iterator<Item = &str>> = match &planned {
+        Some(ids) => Box::new(ids.iter().copied()),
+        None => Box::new(im.iter_docs().map(|(id, _)| id)),
+    };
 
-    for (id, doc) in &inner.index_manager.documents {
-        match batch.overlay.get(id) {
-            Some(Some(replacement)) => view.push(replacement.clone()),
-            Some(None) => {}
-            None => {
-                if let Ok(d) = doc.to_document() {
-                    view.push(d);
-                }
+    let mut out: Vec<Document> = Vec::new();
+    for id in committed {
+        let doc = match batch.overlay.get(id) {
+            Some(Some(replacement)) => replacement.clone(),
+            Some(None) => continue,
+            None => match im.get(id) {
+                Some(d) => d,
+                None => continue,
+            },
+        };
+        if crate::query::matches(&doc, filter) {
+            out.push(doc);
+        }
+    }
+    for (id, opt) in &batch.overlay {
+        if let Some(doc) = opt {
+            if !im.contains(id) && crate::query::matches(doc, filter) {
+                out.push(doc.clone());
             }
         }
     }
-
-    for (id, opt) in &batch.overlay {
-        if opt.is_some() && !inner.index_manager.documents.contains_key(id) {
-            view.push(opt.as_ref().unwrap().clone());
-        }
-    }
-
-    view.into_iter().filter(|d| crate::query::matches(d, filter)).collect()
+    out
 }
 
 // ---------------------------------------------------------------------------

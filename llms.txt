@@ -21,7 +21,7 @@ Last record wins per `_id`. Deletes/updates append; space is reclaimed only by e
 users.bson        data, append-only, THE source of truth
 users.bson.meta   JSON index declarations {version, indexes, vector_indexes, text_indexes}
 users.bson.lock   advisory flock target; held only during a write. Deletable.
-users.bson.cache  index snapshot; disposable, deletable, never authoritative
+users.bson.cache  index snapshot (no documents: re-read from .bson); disposable, never authoritative
 ```
 
 Record framing: `[u32 LE payload_len][u8 type][BSON payload]`
@@ -60,8 +60,8 @@ Collection(path, indexes=None, vector_indexes=None, text_indexes=None,
 - `durability` — `"none" | "os" | "fsync"`.
 - `auto_embed: dict[str, dict]` — source field → config; **native backend only** (the pure-Python
   backend raises `NotImplementedError`). See §7.
-- `model_cache_dir: str` — accepted, but **currently ignored by the core in every binding**;
-  models land in `~/.cache/llama-rs/models/`.
+- `model_cache_dir: str` — where the embedding model is downloaded (default
+  `~/.cache/moofile/models/`). See §7.
 - Context manager: `with Collection(...) as db:` → calls `close()`.
 - Declaring more indexes later is free: just reopen with the new list (they merge into `.meta`).
 
@@ -106,11 +106,27 @@ db.find({"status": "active"}).sort("age", descending=True).skip(20).limit(10).to
 db.find({}).group("city").agg(count(), mean("age"), sum("rev")).sort("count", descending=True).to_list()
 ```
 
+Every stage runs in the Rust core, whichever binding calls it (the Python adapter used to slice,
+sort and group in Python, after decoding every match). The pure-Python backend reproduces the
+same semantics.
+
+**Sort order is total** (MongoDB's): null/missing < numbers < strings < objects < arrays <
+binary < ObjectId < bool < date < timestamp < regex. Numbers compare by value whatever their type,
+NaN below every other number. Descending is the exact reverse, so missing values sort **first
+ascending, last descending**. The sort is stable: ties keep scan order.
+
 Aggregations and output field names:
 `count()`→`count` · `sum(f)`→`sum_f` · `mean(f)`→`mean_f` (C ABI alias `avg`) · `min(f)`→`min_f` ·
 `max(f)`→`max_f` · `collect(f)`→`collect_f` · `first(f)`→`first_f` · `last(f)`→`last_f`.
-Group rows are `{group_field: key, <agg outputs>...}`. Docs missing the aggregated field are skipped
-by the aggregate but still counted by `count()`. No docs → `[]`.
+Group rows are `{group_field: key, <agg outputs>...}`, in first-seen order. Group keys compare by
+value: `1` and `1.0` share a group, `True` does not; list/dict keys group by content.
+- `sum`/`mean` read numbers only, skipping anything else (bools included). Integers sum to an
+  integer; any double, or overflow, makes the sum a double.
+- `min`/`max` use the sort order above, so they work across mixed types (first of equals wins).
+- `first`/`last` read the group's first/last **document**: `None` if that document lacks the field.
+- `collect` skips documents missing the field; `count()` counts every document.
+- No docs → `[]`. An `AggFunc` built by hand (no `kind`) still works; the native backend then
+  groups in Python, with the same semantics.
 
 Search entry points on a Query (each replaces the terminal set with `(doc, score)` tuples):
 ```python
@@ -245,8 +261,12 @@ with db.batch():                       # nested batches are an error
 ## 6. SEARCH
 
 **Vector** — brute-force cosine over a dense `[n × dim]` matrix; rows are normalised on insert and
-maintained incrementally (`add` appends, `remove` swap-removes). Scores in `[-1, 1]`, higher is
-closer. Wrong-dimension or non-numeric vectors are ignored, not errors. `.find(filter)` pre-filters.
+maintained incrementally (`add` appends, `remove` swap-removes in O(1)). Scores in `[-1, 1]`, higher
+is closer; ties rank by `_id`. A vector field may hold an array of numbers **or a BSON Binary
+subtype 9 vector** (`Binary.from_vector(...)`: FLOAT32, INT8, or PACKED_BIT, whose bits score as
+±1). Subtype 9 is 4 B/dim for FLOAT32 and 1 B/dim for INT8, against 13+ B/dim for an array of
+doubles. Wrong-dimension or malformed vectors (an array with any non-number, bools included) are
+ignored, not errors. `.find(filter)` pre-filters.
 
 **Text** — BM25 with `k1=1.2`, `b=0.75`, Porter stemming (`rust-stemmers` / `snowballstemmer`),
 tokenised on word boundaries, punctuation dropped, non-string fields ignored. IDF is the Lucene form
@@ -262,46 +282,58 @@ Passing `query_vector=None` makes the vector leg auto-embed `query_text` (needs 
 **Semantic** — `.semantic(source_field, query_text, limit)` embeds the query with the model
 configured for `source_field` (prefixed with `query_prefix`) and runs a vector search on its target.
 Raises "no autoembed configured for source field '<f>'" otherwise. **Pure-Python backend raises
-`NotImplementedError`** — it cannot run GGUF models; the method exists only to keep the two API
+`NotImplementedError`** — it cannot run the ONNX model; the method exists only to keep the two API
 surfaces identical.
 
 All four return `list[tuple[dict, float]]` from `.to_list()`, not bare documents.
 
 ---
 
-## 7. AUTOEMBEDDING (on-device GGUF)
+## 7. AUTOEMBEDDING (on-device, ONNX)
 
-Config lives on the collection builder (Rust), the `auto_embed=` kwarg (Python, native backend
-only), or `config_json` at open (C ABI and every binding built on it). It is **not** stored in
-`.meta` — it must be supplied on every open.
+The built-in model is **voyage-4-nano** (2048-dim, 32k context), run through ONNX Runtime by the
+`v4nano-embed` crate (statically linked). Config lives on the collection builder (Rust), the
+`auto_embed=` kwarg (Python, native backend only), or `config_json` at open (C ABI and every
+binding built on it). It is **not** stored in `.meta` — it must be supplied on every open.
 
 ```jsonc
 "auto_embed": {
   "content": {                                     // source text field
-    "model": "hf:user/repo:file.gguf",             // required
+    "model": "voyage-4-nano",                      // default; or a path to a local model dir
     "target": "embedding",                         // target vector field
-    "dims": 1024,                                  // MRL truncation
-    "precision": "int8",                           // "f32"|"int8"|"uint8"|"binary"
+    "dims": 512,                                   // MRL truncation, <= 2048 (default 2048)
+    "precision": "int8",                           // "f32"|"int8"|"uint8"|"binary" (default f32)
     "normalize": true,
-    "query_prefix": "Represent the query: ",
-    "doc_prefix": "Represent the document: "
+    "query_prefix": "Represent the query for retrieving supporting documents: ",  // default
+    "doc_prefix": "",                              // default
+    "max_length": 1024,                            // tokenizer truncation (cap 32768)
+    "batch_size": 32,                              // docs per forward pass, at most
+    "max_batch_tokens": 8192                       // padded-token budget per pass (bounds RAM)
   }
 },
 "model_cache_dir": "/path"                         // default ~/.cache/moofile/models/
 ```
-Model URIs: `hf:user/repo:file.gguf` (downloaded and cached on first use, ~355 MB for Q8_0),
-`./relative.gguf`, `/absolute.gguf`. Missing file → `ModelNotFound`. Unknown config keys and
-unknown `precision` values are rejected, not ignored. `model_cache_dir` is accepted everywhere but
-`ModelUri::resolve()` ignores it (`core/src/embed.rs`, param is `_cache_dir`) — downloads always go
-to llama-gguf's own `~/.cache/llama-rs/models/`, not the documented `~/.cache/moofile/models/`.
+`"voyage-4-nano"` downloads `onnx-community/voyage-4-nano-ONNX` from HuggingFace into
+`model_cache_dir` on first use; a local directory must hold `model_quantized.onnx` (+ its
+`.onnx_data`) and `tokenizer.json`. The GGUF-era `hf:user/repo:file.gguf` syntax is rejected
+with a migration message. Unknown config keys and unknown `precision` values are rejected, not
+ignored.
 
-On insert/update/replace, if the source field is present its text is embedded into the target field
-automatically. Precision at 1024 dims: `f32` 4.0 KB · `int8`/`uint8` 1.0 KB (~1.0000 cosine sim
-retained) · `binary` 128 B (~0.9999). Multiple source→target pairs per collection are allowed.
+On insert/update/replace, if the source field holds a string, it is embedded into the target field
+automatically. **The target is stored as a BSON Binary subtype 9 vector** at the configured
+precision — `f32` → FLOAT32 (4 B/dim), `int8` → INT8 (1 B/dim), `uint8` → INT8 re-centred
+(`code − 128`), `binary` → PACKED_BIT (1 bit/dim). Python reads it back as `bson.Binary`
+(`.as_vector()` decodes it); the C ABI renders it as a JSON number array (floats, ints, or 0/1
+bits), so JSON bindings see an array as before. Earlier versions stored an array of doubles
+whatever the precision; those files still load and search normally. Multiple source→target pairs
+per collection are allowed.
 
-The `embed` cargo feature is **on by default**. `--no-default-features` drops `llama-gguf` and
-~300 transitive crates (libmoofile ~8.3 MB → ~2.8 MB); `auto_embed` and `semantic` then return
-`MooFileError::EmbedDisabled` and everything else is unchanged.
+Cost on CPU (Ryzen 7 5800H): ~14 docs/s bulk, ~116 ms per single insert, ~90 ms per `semantic()`
+query — the model, not moofile. Inputs are not padded to `max_length`.
+
+The `embed` cargo feature is **on by default**. `--no-default-features` drops it along with the
+statically linked ONNX Runtime (libmoofile ~38 MB → ~2.8 MB); `auto_embed` and `semantic` then
+return `MooFileError::EmbedDisabled` and everything else is unchanged.
 
 ---
 
@@ -486,14 +518,15 @@ pymongo's encoder, so their bytes match each other and `bson.encode()`.
   BTreeMap/SortedDict, no `matches()` pass. O(log n + k).
 - **Candidates** — multiple fields or mixed operators → index pre-filter, then `matches()` per candidate.
 - **Full scan** — no applicable index.
-- `_id` is always indexed regardless of declaration.
-- Posting lists are **sets**, not lists: removal from a list is O(k) over every id sharing that value,
-  making writes to a low-cardinality indexed field O(n) and bulk operations quadratic. Python uses a
-  dict as an insertion-ordered set so result ordering is unaffected.
-- Unsorted result order is unspecified (index/dict order) — chain `.sort()` if you need determinism.
-- `sort()` on a missing field: pure Python places missing/None last ascending; the Rust core compares
-  against `Null` and treats incomparable pairs as equal. Do not depend on the placement of missing
-  values or on cross-type ordering.
+- `_id` is always indexed regardless of declaration: equality, `$eq`, `$in` (all-string operands)
+  and string ranges are answered from the `_id` map, alone or combined with other fields.
+- Rust indexes refer to documents by 4-byte **row** numbers, not `_id` strings; `_id` is stored once.
+  Posting lists are sets (removal O(log k)), so writes to a low-cardinality field stay cheap.
+- An unsorted `limit`/`skip` stops scanning once it has enough rows; `first()`/`find_one()` fetch
+  one. Unsorted result order is unspecified (index order: value, then row) — chain `.sort()` if you
+  need determinism. See §2 for the sort order.
+- Inside a `batch()`, writes plan committed documents through the indexes too; buffered changes
+  are always re-checked.
 
 ---
 

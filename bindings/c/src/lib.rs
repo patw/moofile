@@ -197,6 +197,15 @@ fn bson_to_json_value(bson: &Bson) -> serde_json::Value {
         Bson::Document(d) => bson_document_to_json_value(d),
         Bson::DateTime(dt) => serde_json::json!(dt.timestamp_millis()),
         Bson::ObjectId(oid) => serde_json::Value::String(oid.to_hex()),
+        // A subtype-9 vector (what autoembedding stores) renders as the
+        // number array it encodes, so JSON consumers see the same shape an
+        // array-of-doubles embedding always had rather than opaque base64.
+        Bson::Binary(bin) if bin.subtype == bson::spec::BinarySubtype::Vector => {
+            match moofile::vector_numbers(&bin.bytes) {
+                Some(nums) => serde_json::Value::Array(nums.iter().map(bson_to_json_value).collect()),
+                None => serde_json::Value::String(base64_encode(&bin.bytes)),
+            }
+        }
         Bson::Binary(bin) => serde_json::Value::String(base64_encode(&bin.bytes)),
         Bson::RegularExpression(re) => serde_json::Value::String(format!("/{}/{}", re.pattern, re.options)),
         Bson::JavaScriptCode(code) => serde_json::Value::String(code.clone()),
@@ -1174,4 +1183,33 @@ pub extern "C" fn moofile_reembed(
 #[no_mangle]
 pub extern "C" fn moofile_free_string(s: *mut i8) {
     if !s.is_null() { unsafe { drop(CString::from_raw(s.cast())); } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bson::spec::BinarySubtype;
+
+    fn vector(bytes: Vec<u8>) -> Bson {
+        Bson::Binary(bson::Binary { subtype: BinarySubtype::Vector, bytes })
+    }
+
+    /// Autoembedding stores subtype-9 vectors; JSON consumers must still see
+    /// a number array, not base64.
+    #[test]
+    fn subtype_9_vectors_render_as_number_arrays() {
+        let f32s: Vec<u8> = [0.5f32, -1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut float32 = vec![0x27, 0];
+        float32.extend(f32s);
+        assert_eq!(bson_to_json_value(&vector(float32)), serde_json::json!([0.5, -1.0]));
+        assert_eq!(bson_to_json_value(&vector(vec![0x03, 0, 127, 0x81])), serde_json::json!([127, -127]));
+        assert_eq!(bson_to_json_value(&vector(vec![0x10, 5, 0b1010_0000])), serde_json::json!([1, 0, 1]));
+    }
+
+    #[test]
+    fn other_binaries_stay_base64() {
+        assert_eq!(bson_to_json_value(&vector(vec![0x99, 0, 1])), serde_json::json!("mQAB"));
+        let generic = Bson::Binary(bson::Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2, 3] });
+        assert_eq!(bson_to_json_value(&generic), serde_json::json!("AQID"));
+    }
 }

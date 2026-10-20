@@ -294,15 +294,75 @@ impl NativeCollection {
     // ObjectIds, etc.
 
     /// Find all matching documents and return as a list of raw BSON bytes.
-    fn find_raw(&self, py: Python<'_>, filter: Option<&Bound<PyDict>>) -> PyResult<PyObject> {
+    ///
+    /// Every stage — group/agg, sort, skip, limit — runs in the core, before
+    /// any document is decoded or crosses the boundary.  Doing them in Python
+    /// afterwards made `find(range).limit(10)` cost as much as returning every
+    /// match, and gave the Python binding different sort and aggregation
+    /// semantics from every other binding.
+    ///
+    /// `aggs` is a list of `(func, field)` pairs, `field` being `None` for
+    /// `count` — the same names `moofile_find_query` accepts.
+    #[pyo3(signature = (filter, skip=0, limit=None, sort=None, desc=false, group=None, aggs=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn find_raw(
+        &self,
+        py: Python<'_>,
+        filter: Option<&Bound<PyDict>>,
+        skip: usize,
+        limit: Option<usize>,
+        sort: Option<String>,
+        desc: bool,
+        group: Option<String>,
+        aggs: Option<Vec<(String, Option<String>)>>,
+    ) -> PyResult<PyObject> {
         let f = match filter {
             Some(d) => py_document_via_pymongo(d)?,
             None => Document::new(),
         };
-        let results = self
+        let mut query = self
             .inner
             .find(f)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .skip(skip);
+        if let Some(n) = limit {
+            query = query.limit(n);
+        }
+        if let Some(field) = sort {
+            query = query.sort(field, desc);
+        }
+        if let Some(field) = group {
+            let funcs = aggs
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(func, field)| {
+                    let field = || {
+                        field.clone().ok_or_else(|| {
+                            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                                "aggregation '{func}' needs a field"
+                            ))
+                        })
+                    };
+                    Ok(match func.as_str() {
+                        "count" => moofile_core::AggFunc::Count,
+                        "sum" => moofile_core::AggFunc::Sum(field()?),
+                        "mean" => moofile_core::AggFunc::Mean(field()?),
+                        "min" => moofile_core::AggFunc::Min(field()?),
+                        "max" => moofile_core::AggFunc::Max(field()?),
+                        "collect" => moofile_core::AggFunc::Collect(field()?),
+                        "first" => moofile_core::AggFunc::First(field()?),
+                        "last" => moofile_core::AggFunc::Last(field()?),
+                        other => {
+                            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                                format!("unknown aggregation '{other}'"),
+                            ))
+                        }
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            query = query.group(field).agg(funcs);
+        }
+        let results = query
             .to_list()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         let encoded = results

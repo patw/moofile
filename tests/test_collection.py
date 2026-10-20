@@ -285,9 +285,12 @@ class TestQueryChain:
             {"_id": "n2"},              # missing field
             {"_id": "n3", "score": 3},
         ])
-        result = col.find().sort("score").to_list()
-        # Docs with None sort key should appear last
-        assert result[-1]["_id"] == "n2"
+        # MongoDB's order, which the Rust core defines: a missing (or null)
+        # sort key sorts before every number ascending, after descending.
+        asc = [d["_id"] for d in col.find().sort("score").to_list()]
+        desc = [d["_id"] for d in col.find().sort("score", descending=True).to_list()]
+        assert asc == ["n2", "n3", "n1"]
+        assert desc == ["n1", "n3", "n2"]
 
 
 # ---------------------------------------------------------------------------

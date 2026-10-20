@@ -4,6 +4,40 @@ import numpy as np
 from sortedcontainers import SortedDict
 from .text_search import TextIndex
 
+# BSON Binary subtype 9 (vector) dtypes -- mirrors core/src/vector.rs.
+_DTYPE_INT8 = 0x03
+_DTYPE_FLOAT32 = 0x27
+_DTYPE_PACKED_BIT = 0x10
+
+
+def vector_values(value):
+    """A stored vector field as a float32 array, or None if it is not one.
+
+    Accepts an array of numbers or a BSON Binary subtype 9 vector (what
+    autoembedding writes).  Packed bits map to +/-1, as in the Rust core.
+    """
+    from bson.binary import Binary
+
+    if isinstance(value, Binary) and value.subtype == 9:
+        raw = bytes(value)
+        if len(raw) < 2:
+            return None
+        dtype, padding, data = raw[0], raw[1], raw[2:]
+        if dtype == _DTYPE_FLOAT32 and padding == 0 and len(data) % 4 == 0:
+            return np.frombuffer(data, dtype="<f4").astype(np.float32)
+        if dtype == _DTYPE_INT8 and padding == 0:
+            return np.frombuffer(data, dtype=np.int8).astype(np.float32)
+        if dtype == _DTYPE_PACKED_BIT and padding < 8 and (padding == 0 or data):
+            bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))[: len(data) * 8 - padding]
+            return bits.astype(np.float32) * 2 - 1
+        return None
+    # Numbers only, as in Rust: np.array would happily convert "2" or True.
+    if not isinstance(value, list) or not all(
+        isinstance(x, (int, float)) and not isinstance(x, bool) for x in value
+    ):
+        return None
+    return np.array(value, dtype=np.float32)
+
 
 class IndexManager:
     """
@@ -81,7 +115,10 @@ class IndexManager:
         # Text indexes
         for field in self._text_fields:
             if field in self._text_indexes:
-                self._text_indexes[field].remove_document(_id)
+                text = doc.get(field)
+                self._text_indexes[field].remove_document(
+                    _id, text if isinstance(text, str) else None
+                )
         
         # Vector indexes - mark dirty for rebuild
         self._vectors_dirty = True
@@ -154,13 +191,10 @@ class IndexManager:
             for _id, doc in self._documents.items():
                 embedding = doc.get(field)
                 if embedding is not None:
-                    try:
-                        vec = np.array(embedding, dtype=np.float32)
-                        if vec.shape == (expected_dim,):
-                            vectors.append(vec)
-                            doc_ids.append(_id)
-                    except (ValueError, TypeError):
-                        continue  # Skip invalid vectors
+                    vec = vector_values(embedding)
+                    if vec is not None and vec.shape == (expected_dim,):
+                        vectors.append(vec)
+                        doc_ids.append(_id)
             
             if vectors:
                 embeddings = np.array(vectors)

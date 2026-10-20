@@ -459,26 +459,30 @@ impl Query {
         let inner = self.inner.read().expect("lock poisoned");
         inner.require_open()?;
 
-        let matched: Vec<Arc<bson::raw::RawDocumentBuf>> = if self.filter.is_empty() {
-            inner.index_manager.all_docs_arc()
-        } else {
-            inner.index_manager.get_matching(&self.filter)
+        // Unsorted and ungrouped, only the first `skip + limit` matches can
+        // survive truncation, so the index needn't produce the rest.
+        let wanted = match self.limit_n {
+            Some(n) if self.sort_key.is_none() && self.group_field.is_none() => self.skip_n.saturating_add(n),
+            _ => usize::MAX,
         };
+        let matched: Vec<Arc<bson::raw::RawDocumentBuf>> =
+            inner.index_manager.get_matching_first(&self.filter, wanted);
 
         if let Some(ref field) = self.group_field {
-            // Aggregation reads every input's fields regardless of the
-            // eventual limit, so there's no clone to defer here — group
-            // first (the one path that still needs owned Documents up
-            // front, since it synthesizes new output docs unrelated to the
-            // originals), then sort/skip/limit the synthesized output.
-            let owned: Vec<Document> = matched.iter().filter_map(|d| d.to_document().ok()).collect();
-            let mut docs = apply_group_agg(&owned, field, &self.agg_funcs);
+            // Aggregation reads every input regardless of the eventual
+            // limit, but only the group field and the aggregated fields of
+            // each: decode just those.  Decoding whole documents (and then
+            // cloning each into its group) peaked at ~6 GB for a 1M-document
+            // group-by over 270-byte documents.
+            let mut wanted: Vec<&str> = vec![field.as_str()];
+            wanted.extend(self.agg_funcs.iter().filter_map(AggFunc::field));
+            let projected: Vec<Document> = matched.iter().map(|raw| project(raw, &wanted)).collect();
+            let mut docs = apply_group_agg(projected, field, &self.agg_funcs);
             if let Some(ref key) = self.sort_key {
                 docs.sort_by(|a, b| {
                     let va = a.get(key);
                     let vb = b.get(key);
-                    let ord = bson_cmp(va.unwrap_or(&Bson::Null), vb.unwrap_or(&Bson::Null))
-                        .unwrap_or(std::cmp::Ordering::Equal);
+                    let ord = sort_cmp(va.unwrap_or(&Bson::Null), vb.unwrap_or(&Bson::Null));
                     if self.sort_desc { ord.reverse() } else { ord }
                 });
             }
@@ -514,8 +518,7 @@ impl Query {
                 })
                 .collect();
             keyed.sort_by(|(ka, _), (kb, _)| {
-                let ord = bson_cmp(ka.as_ref().unwrap_or(&Bson::Null), kb.as_ref().unwrap_or(&Bson::Null))
-                    .unwrap_or(std::cmp::Ordering::Equal);
+                let ord = sort_cmp(ka.as_ref().unwrap_or(&Bson::Null), kb.as_ref().unwrap_or(&Bson::Null));
                 if self.sort_desc { ord.reverse() } else { ord }
             });
             docs = keyed.into_iter().map(|(_, d)| d).collect();
@@ -608,17 +611,14 @@ impl VectorQuery {
                 self.limit,
             ))
         } else {
-            let matching_docs = inner.index_manager.get_matching(&self.pre_filter);
-            let allowed_ids: HashSet<String> = matching_docs
-                .iter()
-                .filter_map(|d| d.get_str("_id").ok().map(String::from))
-                .collect();
+            let allowed: HashSet<crate::index::Row> =
+                inner.index_manager.matching_rows(&self.pre_filter).into_iter().collect();
 
             Ok(inner.index_manager.vector_search_filtered(
                 &self.field,
                 &query_vector,
                 self.limit,
-                &allowed_ids,
+                &allowed,
             ))
         }
     }
@@ -652,23 +652,11 @@ impl TextQuery {
             return Ok(inner.index_manager.text_search(&self.field, &self.query, self.limit));
         }
 
-        let matching_docs = inner.index_manager.get_matching(&self.pre_filter);
-        let allowed_ids: HashSet<String> = matching_docs
-            .iter()
-            .filter_map(|d| d.get_str("_id").ok().map(String::from))
-            .collect();
-
-        let all_results = inner.index_manager.text_search(&self.field, &self.query, usize::MAX);
-
-        Ok(all_results
-            .into_iter()
-            .filter(|(doc, _)| {
-                doc.get_str("_id")
-                    .map(|id| allowed_ids.contains(id))
-                    .unwrap_or(false)
-            })
-            .take(self.limit)
-            .collect())
+        // Filter on rows before ranking: this used to rank and decode every
+        // text match in the collection, then drop the disallowed ones.
+        let allowed: HashSet<crate::index::Row> =
+            inner.index_manager.matching_rows(&self.pre_filter).into_iter().collect();
+        Ok(inner.index_manager.text_search_filtered(&self.field, &self.query, self.limit, &allowed))
     }
 
     pub fn first(self) -> Result<Option<(Document, f32)>, MooFileError> {
@@ -841,6 +829,15 @@ pub enum AggFunc {
 }
 
 impl AggFunc {
+    /// The input field this aggregation reads, if any.
+    fn field(&self) -> Option<&str> {
+        match self {
+            AggFunc::Count => None,
+            AggFunc::Sum(f) | AggFunc::Mean(f) | AggFunc::Min(f) | AggFunc::Max(f)
+            | AggFunc::Collect(f) | AggFunc::First(f) | AggFunc::Last(f) => Some(f),
+        }
+    }
+
     pub fn output_name(&self) -> String {
         match self {
             AggFunc::Count => "count".into(),
@@ -858,11 +855,23 @@ impl AggFunc {
         match self {
             AggFunc::Count => Bson::Int32(docs.len() as i32),
             AggFunc::Sum(field) => {
-                let total: f64 = docs.iter()
+                // Integers sum to an integer, as in MongoDB's `$sum` (and as
+                // Python's `sum` gave before grouping moved into the core);
+                // any double, or overflow, makes the result a double.
+                let vals: Vec<&Bson> = docs.iter()
                     .filter_map(|d| d.get(field))
-                    .filter_map(|v| bson_number(v))
-                    .sum();
-                Bson::Double(total)
+                    .filter(|v| bson_number(v).is_some())
+                    .collect();
+                let int_sum = vals.iter().try_fold((0i64, true), |(acc, all32), v| match v {
+                    Bson::Int32(i) => acc.checked_add(*i as i64).map(|t| (t, all32)),
+                    Bson::Int64(i) => acc.checked_add(*i).map(|t| (t, false)),
+                    _ => None,
+                });
+                match int_sum {
+                    Some((t, true)) if i32::try_from(t).is_ok() => Bson::Int32(t as i32),
+                    Some((t, _)) => Bson::Int64(t),
+                    None => Bson::Double(vals.iter().filter_map(|v| bson_number(v)).sum()),
+                }
             }
             AggFunc::Mean(field) => {
                 let vals: Vec<f64> = docs.iter()
@@ -871,13 +880,17 @@ impl AggFunc {
                     .collect();
                 if vals.is_empty() { Bson::Null } else { Bson::Double(vals.iter().sum::<f64>() / vals.len() as f64) }
             }
+            // The first of equally-ranked values wins in both directions
+            // (`Iterator::max_by` would keep the last).
             AggFunc::Min(field) => docs.iter()
-                .filter_map(|d| d.get(field).cloned())
-                .min_by(|a, b| bson_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                .filter_map(|d| d.get(field))
+                .reduce(|best, v| if sort_cmp(v, best).is_lt() { v } else { best })
+                .cloned()
                 .unwrap_or(Bson::Null),
             AggFunc::Max(field) => docs.iter()
-                .filter_map(|d| d.get(field).cloned())
-                .max_by(|a, b| bson_cmp(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                .filter_map(|d| d.get(field))
+                .reduce(|best, v| if sort_cmp(v, best).is_gt() { v } else { best })
+                .cloned()
                 .unwrap_or(Bson::Null),
             AggFunc::Collect(field) => Bson::Array(
                 docs.iter().filter_map(|d| d.get(field).cloned()).collect(),
@@ -892,6 +905,98 @@ impl AggFunc {
     }
 }
 
+/// Rank of a BSON type in the cross-type sort order — MongoDB's: a value of
+/// a lower-ranked type sorts before any value of a higher-ranked one.
+/// Missing fields sort as `Null`.
+fn type_rank(v: &Bson) -> u8 {
+    match v {
+        Bson::MinKey => 0,
+        Bson::Null | Bson::Undefined => 1,
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => 2,
+        Bson::Symbol(_) | Bson::String(_) => 3,
+        Bson::Document(_) => 4,
+        Bson::Array(_) => 5,
+        Bson::Binary(_) => 6,
+        Bson::ObjectId(_) => 7,
+        Bson::Boolean(_) => 8,
+        Bson::DateTime(_) => 9,
+        Bson::Timestamp(_) => 10,
+        Bson::RegularExpression(_) => 11,
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) | Bson::DbPointer(_) => 12,
+        Bson::MaxKey => 13,
+    }
+}
+
+/// Total order used by `sort()` and by the `min`/`max` aggregations.
+///
+/// Unlike [`bson_cmp`] — which answers "is this range operator satisfied"
+/// and so refuses to compare across types — this must order *every* pair,
+/// or the sort is not a sort: treating incomparable values as equal is not
+/// transitive, and a column mixing nulls and numbers came back in an order
+/// that depended on the input.  Across types it follows [`type_rank`];
+/// numbers compare by value whatever their width, with NaN below every
+/// other number.  `moofile/query.py` (`sort_key`) mirrors this exactly.
+pub(crate) fn sort_cmp(a: &Bson, b: &Bson) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (ra, rb) = (type_rank(a), type_rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (Bson::Int32(_) | Bson::Int64(_), Bson::Int32(_) | Bson::Int64(_)) => {
+            bson_int(a).cmp(&bson_int(b))
+        }
+        (Bson::Decimal128(x), Bson::Decimal128(y)) => x.bytes().cmp(&y.bytes()),
+        (Bson::Decimal128(_), _) => Ordering::Greater,
+        (_, Bson::Decimal128(_)) => Ordering::Less,
+        _ if ra == 2 => {
+            let (x, y) = (bson_number(a).unwrap_or(f64::NAN), bson_number(b).unwrap_or(f64::NAN));
+            match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Less,
+                (false, true) => Ordering::Greater,
+                (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            }
+        }
+        (Bson::String(x) | Bson::Symbol(x), Bson::String(y) | Bson::Symbol(y)) => x.cmp(y),
+        (Bson::Document(x), Bson::Document(y)) => {
+            for ((ka, va), (kb, vb)) in x.iter().zip(y.iter()) {
+                let ord = ka.cmp(kb).then_with(|| sort_cmp(va, vb));
+                if ord.is_ne() {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Bson::Array(x), Bson::Array(y)) => {
+            for (va, vb) in x.iter().zip(y.iter()) {
+                let ord = sort_cmp(va, vb);
+                if ord.is_ne() {
+                    return ord;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Bson::Binary(x), Bson::Binary(y)) => x.bytes.cmp(&y.bytes),
+        (Bson::ObjectId(x), Bson::ObjectId(y)) => x.bytes().cmp(&y.bytes()),
+        (Bson::Boolean(x), Bson::Boolean(y)) => x.cmp(y),
+        (Bson::DateTime(x), Bson::DateTime(y)) => x.cmp(y),
+        (Bson::Timestamp(x), Bson::Timestamp(y)) => (x.time, x.increment).cmp(&(y.time, y.increment)),
+        (Bson::RegularExpression(x), Bson::RegularExpression(y)) => {
+            (&x.pattern, &x.options).cmp(&(&y.pattern, &y.options))
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+fn bson_int(v: &Bson) -> i64 {
+    match v {
+        Bson::Int32(i) => *i as i64,
+        Bson::Int64(i) => *i,
+        _ => 0,
+    }
+}
+
 fn bson_number(v: &Bson) -> Option<f64> {
     match v {
         Bson::Int32(i) => Some(*i as f64),
@@ -901,8 +1006,23 @@ fn bson_number(v: &Bson) -> Option<f64> {
     }
 }
 
+/// The named top-level fields of a stored document, decoded; the rest of
+/// the document is never touched.
+fn project(raw: &bson::raw::RawDocumentBuf, fields: &[&str]) -> Document {
+    let mut out = Document::new();
+    for &f in fields {
+        if out.contains_key(f) {
+            continue;
+        }
+        if let Some(v) = raw.get(f).ok().flatten().and_then(|v| Bson::try_from(v).ok()) {
+            out.insert(f, v);
+        }
+    }
+    out
+}
+
 fn apply_group_agg(
-    docs: &[Document],
+    docs: Vec<Document>,
     group_field: &str,
     agg_funcs: &[AggFunc],
 ) -> Vec<Document> {
@@ -921,10 +1041,10 @@ fn apply_group_agg(
         let value = doc.get(group_field).cloned().unwrap_or(Bson::Null);
         let key = value.to_string();
         match index.get(&key) {
-            Some(&i) => groups[i].1.push(doc.clone()),
+            Some(&i) => groups[i].1.push(doc),
             None => {
                 index.insert(key, groups.len());
-                groups.push((value, vec![doc.clone()]));
+                groups.push((value, vec![doc]));
             }
         }
     }

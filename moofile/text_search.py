@@ -63,8 +63,6 @@ class TextIndex:
         # Add to inverted index
         for stem, freq in term_freqs.items():
             self._inverted_index[stem][doc_id] = freq
-            if doc_id not in [d for d in self._inverted_index[stem].keys()]:
-                self._doc_frequencies[stem] += 1
         
         # Update document metadata
         self._doc_lengths[doc_id] = len(stems)
@@ -79,29 +77,41 @@ class TextIndex:
             docs_with_stem = len(self._inverted_index[stem])
             self._doc_frequencies[stem] = docs_with_stem
     
-    def remove_document(self, doc_id: str) -> None:
-        """Remove a document from the text index."""
+    def remove_document(self, doc_id: str, text: str = None) -> None:
+        """Remove a document from the text index.
+
+        Given the text the document was indexed from, only that text's stems
+        are visited -- O(terms in the document) instead of a walk over the
+        whole vocabulary.  If the text does not account for every indexed
+        term (or is not given), the full walk still runs, so a stale posting
+        can never survive.  Mirrors core/src/text.rs.
+        """
         if doc_id not in self._doc_lengths:
             return
-        
+
         doc_length = self._doc_lengths.pop(doc_id)
         self._doc_count -= 1
         self._total_length -= doc_length
-        
-        # Remove from inverted index and update doc frequencies
-        stems_to_remove = []
-        for stem, doc_freqs in self._inverted_index.items():
-            if doc_id in doc_freqs:
-                del doc_freqs[doc_id]
-                self._doc_frequencies[stem] = len(doc_freqs)
-                if not doc_freqs:
-                    stems_to_remove.append(stem)
-        
-        # Clean up empty stems
-        for stem in stems_to_remove:
+
+        removed = 0
+        if text is not None:
+            for stem in set(self._tokenize_and_stem(text)):
+                doc_freqs = self._inverted_index.get(stem)
+                if doc_freqs is not None and doc_id in doc_freqs:
+                    removed += doc_freqs.pop(doc_id)
+                    self._drop_if_empty(stem, doc_freqs)
+        if removed != doc_length:
+            for stem, doc_freqs in list(self._inverted_index.items()):
+                if doc_freqs.pop(doc_id, None) is not None:
+                    self._drop_if_empty(stem, doc_freqs)
+
+    def _drop_if_empty(self, stem, doc_freqs) -> None:
+        if doc_freqs:
+            self._doc_frequencies[stem] = len(doc_freqs)
+        else:
             del self._inverted_index[stem]
             del self._doc_frequencies[stem]
-    
+
     def search(self, query: str, limit: int = 10) -> List[Tuple[str, float]]:
         """
         Search for documents matching the query using BM25 scoring.

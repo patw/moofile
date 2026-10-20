@@ -30,6 +30,85 @@ def copy_doc(value):
     return value
 
 
+def sort_key(value):
+    """Key giving the total order used by sort() and the min/max aggregations.
+
+    Mirrors ``sort_cmp`` in core/src/query.rs, which is the system of record:
+    MongoDB's cross-type order (null/missing < numbers < strings < objects <
+    arrays < binary < ObjectId < bool < date < timestamp < regex), numbers by
+    value whatever their type, NaN below every other number.  Python's own
+    comparison raised on a column mixing types, and the ``(is None, value)``
+    key this replaced put nulls last ascending where the Rust core puts them
+    first.
+    """
+    if value is None:
+        return (1,)
+    if isinstance(value, bool):
+        return (8, value)
+    if isinstance(value, (int, float)):
+        if value != value:  # NaN
+            return (2, 0)
+        return (2, 1, value)
+    if isinstance(value, str):
+        return (3, value)
+    if isinstance(value, dict):
+        return (4, tuple((k, sort_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return (5, tuple(sort_key(v) for v in value))
+    if isinstance(value, (bytes, bytearray)):
+        return (6, bytes(value))
+    return _bson_sort_key(value)
+
+
+def _bson_sort_key(value):
+    import datetime
+    import re
+
+    from bson import Decimal128, MaxKey, MinKey, ObjectId, Regex, Timestamp
+    from bson.datetime_ms import DatetimeMS
+
+    if isinstance(value, Decimal128):
+        return (2, 2, value.bid)
+    if isinstance(value, ObjectId):
+        return (7, value.binary)
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        delta = value - datetime.datetime(1970, 1, 1)
+        return (9, delta // datetime.timedelta(milliseconds=1))
+    if isinstance(value, DatetimeMS):
+        return (9, int(value))
+    if isinstance(value, Timestamp):
+        return (10, value.time, value.inc)
+    if isinstance(value, (Regex, re.Pattern)):
+        return (11, value.pattern, str(value.flags))
+    if isinstance(value, MinKey):
+        return (0,)
+    if isinstance(value, MaxKey):
+        return (13,)
+    return (12,)
+
+
+def group_key(value):
+    """Hashable key deciding which group a value falls in.
+
+    Mirrors the Rust core, which groups on each value's display form: numbers
+    group by value (``1`` and ``1.0`` together), but ``True`` is not ``1``,
+    and lists and documents group by content rather than raising.
+    """
+    if isinstance(value, bool):
+        return ("bool", value)
+    if isinstance(value, dict):
+        return ("doc", tuple((k, group_key(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return ("list", tuple(group_key(v) for v in value))
+    try:
+        hash(value)
+    except TypeError:
+        return ("repr", repr(value))
+    return value
+
+
 def validate_filter(filter_dict: dict) -> None:
     """Raise InvalidFilterError if *filter_dict* is structurally malformed.
 
@@ -300,7 +379,7 @@ class Query:
         if self._sort_key is not None:
             docs = sorted(
                 docs,
-                key=lambda d: (d.get(self._sort_key) is None, d.get(self._sort_key)),
+                key=lambda d: sort_key(d.get(self._sort_key)),
                 reverse=self._sort_desc,
             )
 
@@ -316,21 +395,31 @@ class Query:
         return [copy_doc(d) for d in docs]
 
     def _apply_group_agg(self, docs: list) -> list:
-        from collections import defaultdict
+        return apply_group_agg(docs, self._group_field, self._agg_funcs)
 
-        groups: dict = defaultdict(list)
-        for doc in docs:
-            key = doc.get(self._group_field)
-            groups[key].append(doc)
 
-        result = []
-        for key, group_docs in groups.items():
-            row = {self._group_field: key}
-            if self._agg_funcs:
-                for func in self._agg_funcs:
-                    row[func.output_name] = func.compute(group_docs)
-            result.append(row)
-        return result
+def apply_group_agg(docs: list, group_field: str, agg_funcs) -> list:
+    """Group *docs* on *group_field* and compute *agg_funcs* per group.
+
+    Groups come out in first-seen order, each row carrying the first-seen
+    value of the group field.
+    """
+    groups: dict = {}
+    for doc in docs:
+        value = doc.get(group_field)
+        entry = groups.get(group_key(value))
+        if entry is None:
+            groups[group_key(value)] = (value, [doc])
+        else:
+            entry[1].append(doc)
+
+    result = []
+    for value, group_docs in groups.values():
+        row = {group_field: value}
+        for func in agg_funcs or ():
+            row[func.output_name] = func.compute(group_docs)
+        result.append(row)
+    return result
 
 
 class VectorQuery:
