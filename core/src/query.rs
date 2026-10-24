@@ -388,11 +388,19 @@ impl Query {
                 emb
             };
 
-            // Quantize and dequantize to match stored format, then convert to f32
+            // Quantize to match the stored format.  Int8 and uint8 queries go
+            // out as the stored codes themselves (uint8 re-centred, as
+            // `encode_embedding` stores it) rather than dequantized: cosine
+            // is scale-free, so the ranking is the same, and an integer query
+            // lets an int8 matrix score with an exact integer dot product.
             let quantized = embed::quantize(&emb, config.precision);
-            let dequantized = embed::dequantize(&quantized, config.precision, config.dims);
+            let query = match config.precision {
+                embed::EmbeddingPrecision::Int8 => quantized.iter().map(|&b| b as i8 as f32).collect(),
+                embed::EmbeddingPrecision::Uint8 => quantized.iter().map(|&b| b as f32 - 128.0).collect(),
+                _ => embed::dequantize(&quantized, config.precision, config.dims),
+            };
 
-            (config.target_field.clone(), dequantized)
+            (config.target_field.clone(), query)
         };
 
         Ok(VectorQuery {

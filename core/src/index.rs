@@ -25,6 +25,7 @@ use bson::Document;
 use rayon::prelude::*;
 
 use crate::text::TextIndex;
+use crate::vector::StoredVector;
 
 /// Threshold for switching from sequential to parallel scoring.
 /// Below this, rayon's thread-pool overhead isn't worth it.
@@ -126,13 +127,12 @@ impl Postings {
     }
 }
 
-/// One vector index: a dense matrix of L2-normalised rows.
+/// One vector index: a dense matrix with one row per vector.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VectorMatrix {
     /// Matrix position → document row.
     pub(crate) rows: Vec<Row>,
-    /// `rows.len() × dim` floats, row-major, each row normalised.
-    pub(crate) data: Vec<f32>,
+    pub(crate) data: MatrixData,
     pub(crate) dim: usize,
     /// Document row → matrix position (`ABSENT` if the row has none).
     /// Removing a document used to find its matrix row with a linear search
@@ -141,25 +141,120 @@ pub(crate) struct VectorMatrix {
     pos: Vec<u32>,
 }
 
+/// A vector matrix's storage, row-major.
+///
+/// A field whose vectors are all INT8 or all PACKED_BIT keeps them that way.
+/// The matrix used to widen everything to normalised `f32`, which for the
+/// common int8 field made it 4× the size it needed to be (32× for binary),
+/// in memory, in the `.cache`, and in the bytes every search has to stream.
+/// The quantised forms score identically, because the widened values were
+/// exactly the codes or ±1.
+///
+/// The kind follows the vectors: an empty matrix adopts the kind of the first
+/// vector pushed into it, and a vector of another kind turns the matrix into
+/// `F32`.  A rebuild sees every vector at once, so a field that has gone back
+/// to a single kind returns to it on the next open.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) enum MatrixData {
+    /// L2-normalised rows, so cosine is a plain dot product.
+    F32(Vec<f32>),
+    /// Raw codes and each row's 1/‖v‖ (0 for a zero vector).
+    Int8 { codes: Vec<i8>, inv_norm: Vec<f32> },
+    /// ±1 elements as bits, `dim.div_ceil(64)` words per row, packed as by
+    /// [`crate::vector::pack_bits`].  Every row's norm is √dim.
+    Bits(Vec<u64>),
+}
+
+impl Default for MatrixData {
+    fn default() -> Self { Self::F32(Vec::new()) }
+}
+
 const ABSENT: u32 = u32::MAX;
 
 impl VectorMatrix {
     fn new(dim: usize) -> Self { Self { dim, ..Default::default() } }
 
-    pub(crate) fn from_parts(rows: Vec<Row>, data: Vec<f32>, dim: usize) -> Self {
+    /// `None` if `data` does not hold exactly one row per entry of `rows`.
+    pub(crate) fn from_parts(rows: Vec<Row>, data: MatrixData, dim: usize) -> Option<Self> {
         let mut m = Self { rows, data, dim, pos: Vec::new() };
+        if !m.is_consistent() { return None; }
         for (i, &row) in m.rows.iter().enumerate() {
             set_pos(&mut m.pos, row, i as u32);
         }
-        m
+        Some(m)
     }
 
     pub(crate) fn len(&self) -> usize { self.rows.len() }
 
-    fn push(&mut self, row: Row, normalized: &[f32]) {
+    /// Elements of `data` per row (words, for `Bits`).
+    fn stride(&self) -> usize {
+        match self.data {
+            MatrixData::Bits(_) => self.dim.div_ceil(64),
+            _ => self.dim,
+        }
+    }
+
+    pub(crate) fn is_consistent(&self) -> bool {
+        let n = self.rows.len() * self.stride();
+        match &self.data {
+            MatrixData::F32(d) => d.len() == n,
+            MatrixData::Int8 { codes, inv_norm } => codes.len() == n && inv_norm.len() == self.rows.len(),
+            MatrixData::Bits(w) => w.len() == n,
+        }
+    }
+
+    /// `v.len()` must equal `dim`.
+    fn push(&mut self, row: Row, v: StoredVector) {
+        let same_kind = matches!(
+            (&self.data, &v),
+            (MatrixData::F32(_), StoredVector::F32(_))
+                | (MatrixData::Int8 { .. }, StoredVector::Int8(_))
+                | (MatrixData::Bits(_), StoredVector::Bits(..))
+        );
+        if !same_kind {
+            if self.rows.is_empty() {
+                self.data = match v {
+                    StoredVector::F32(_) => MatrixData::F32(Vec::new()),
+                    StoredVector::Int8(_) => MatrixData::Int8 { codes: Vec::new(), inv_norm: Vec::new() },
+                    StoredVector::Bits(..) => MatrixData::Bits(Vec::new()),
+                };
+            } else {
+                self.widen_to_f32();
+            }
+        }
+        match (&mut self.data, v) {
+            (MatrixData::Int8 { codes, inv_norm }, StoredVector::Int8(c)) => {
+                let norm = (c.iter().map(|&x| x as i32 * x as i32).sum::<i32>() as f32).sqrt();
+                inv_norm.push(if norm > 0.0 { 1.0 / norm } else { 0.0 });
+                codes.extend_from_slice(&c);
+            }
+            (MatrixData::Bits(w), StoredVector::Bits(b, _)) => w.extend_from_slice(&b),
+            (MatrixData::F32(d), v) => d.extend_from_slice(&normalized(widen(v, self.dim))),
+            _ => unreachable!("matrix kind was matched to the vector above"),
+        }
         set_pos(&mut self.pos, row, self.rows.len() as u32);
         self.rows.push(row);
-        self.data.extend_from_slice(normalized);
+    }
+
+    /// Convert a quantised matrix to normalised `f32`, for a field that now
+    /// holds vectors of more than one kind.
+    fn widen_to_f32(&mut self) {
+        let dim = self.dim;
+        let data = match &self.data {
+            MatrixData::F32(_) => return,
+            MatrixData::Int8 { codes, inv_norm } => codes
+                .chunks_exact(dim)
+                .zip(inv_norm)
+                .flat_map(|(c, &s)| c.iter().map(move |&x| x as f32 * s))
+                .collect(),
+            MatrixData::Bits(w) => {
+                let e = 1.0 / (dim as f32).sqrt();
+                w.chunks_exact(dim.div_ceil(64))
+                    .flat_map(|r| (0..dim).map(move |i| if r[i / 64] >> (i % 64) & 1 == 1 { e } else { -e }))
+                    .collect()
+            }
+        };
+        self.data = MatrixData::F32(data);
     }
 
     /// swap_remove keeps rows, data and pos in lockstep: the trailing row
@@ -167,18 +262,32 @@ impl VectorMatrix {
     fn remove(&mut self, row: Row) {
         let Some(&p) = self.pos.get(row as usize) else { return };
         if p == ABSENT { return; }
-        let (p, last, dim) = (p as usize, self.rows.len() - 1, self.dim);
+        let (p, last, stride) = (p as usize, self.rows.len() - 1, self.stride());
+        match &mut self.data {
+            MatrixData::F32(d) => swap_remove_chunk(d, p, last, stride),
+            MatrixData::Int8 { codes, inv_norm } => {
+                swap_remove_chunk(codes, p, last, stride);
+                inv_norm.swap_remove(p);
+            }
+            MatrixData::Bits(w) => swap_remove_chunk(w, p, last, stride),
+        }
         if p != last {
             let moved = self.rows[last];
             self.rows[p] = moved;
             self.pos[moved as usize] = p as u32;
-            let (head, tail) = self.data.split_at_mut(last * dim);
-            head[p * dim..(p + 1) * dim].copy_from_slice(&tail[..dim]);
         }
         self.rows.pop();
-        self.data.truncate(last * dim);
         self.pos[row as usize] = ABSENT;
     }
+}
+
+/// Move row `last` into row `p`, then drop the last row.
+fn swap_remove_chunk<T: Copy>(v: &mut Vec<T>, p: usize, last: usize, stride: usize) {
+    if p != last {
+        let (head, tail) = v.split_at_mut(last * stride);
+        head[p * stride..(p + 1) * stride].copy_from_slice(&tail[..stride]);
+    }
+    v.truncate(last * stride);
 }
 
 fn set_pos(pos: &mut Vec<u32>, row: Row, p: u32) {
@@ -190,6 +299,133 @@ fn set_pos(pos: &mut Vec<u32>, row: Row, p: u32) {
 fn normalized(vec: Vec<f32>) -> Vec<f32> {
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 { vec.iter().map(|x| x / norm).collect() } else { vec } // zero vector — cosine is 0 regardless
+}
+
+/// A stored vector's elements as `f32` (packed bits as ±1).
+fn widen(v: StoredVector, dim: usize) -> Vec<f32> {
+    match v {
+        StoredVector::F32(f) => f,
+        StoredVector::Int8(c) => c.iter().map(|&x| x as f32).collect(),
+        StoredVector::Bits(w, _) => (0..dim).map(|i| if w[i / 64] >> (i % 64) & 1 == 1 { 1.0 } else { -1.0 }).collect(),
+    }
+}
+
+/// How a query is scored against one matrix, prepared once per search.
+enum Probe {
+    /// Normalised query against normalised rows.
+    F32(Vec<f32>),
+    /// An integer query against int8 codes: an exact integer dot product.
+    /// Autoembedded queries on int8 fields arrive in this form.
+    Int8Exact { q: Vec<i8>, inv_qn: f32 },
+    /// A normalised `f32` query against int8 codes.
+    Int8(Vec<f32>),
+    /// A query whose elements are all ±c against packed bits: the score is
+    /// `1 − 2·hamming/dim`.  Autoembedded queries on binary fields are ±1.
+    BitsExact(Vec<u64>),
+    /// Any other query against packed bits: per byte of a row, the sum of
+    /// ±q over its eight elements, looked up by the byte's value.
+    BitsTable(Vec<f32>),
+}
+
+impl Probe {
+    /// `None` for a zero query.
+    ///
+    /// A query of the wrong length is not rejected (it never has been): it
+    /// scores as if cut or zero-padded to `dim`, normalised by its full norm.
+    fn new(data: &MatrixData, query: &[f32], dim: usize) -> Option<Self> {
+        let qn: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if qn == 0.0 { return None; }
+        let padded;
+        let query = if query.len() == dim { query } else {
+            padded = (0..dim).map(|i| query.get(i).copied().unwrap_or(0.0)).collect::<Vec<f32>>();
+            &padded[..]
+        };
+        let unit = || query.iter().map(|x| x / qn).collect::<Vec<f32>>();
+        Some(match data {
+            MatrixData::F32(_) => Self::F32(unit()),
+            MatrixData::Int8 { .. } => {
+                if query.iter().all(|&x| x.fract() == 0.0 && (-128.0..=127.0).contains(&x)) {
+                    Self::Int8Exact { q: query.iter().map(|&x| x as i8).collect(), inv_qn: 1.0 / qn }
+                } else {
+                    Self::Int8(unit())
+                }
+            }
+            MatrixData::Bits(_) => {
+                let mag = query[0].abs();
+                if query.iter().all(|x| x.abs() == mag) {
+                    Self::BitsExact(crate::vector::pack_bits(dim, |i| query[i] > 0.0))
+                } else {
+                    // Rows are ±1/√dim, so fold that into the table.
+                    let q: Vec<f32> = unit().iter().map(|x| x / (dim as f32).sqrt()).collect();
+                    let mut table = vec![0f32; dim.div_ceil(8) * 256];
+                    for (j, chunk) in q.chunks(8).enumerate() {
+                        for (b, slot) in table[j * 256..(j + 1) * 256].iter_mut().enumerate() {
+                            *slot = chunk.iter().enumerate()
+                                .map(|(k, &x)| if b >> k & 1 == 1 { x } else { -x })
+                                .sum();
+                        }
+                    }
+                    Self::BitsTable(table)
+                }
+            }
+        })
+    }
+
+    /// Cosine similarity with matrix position `i`.
+    fn score(&self, m: &VectorMatrix, i: usize) -> f32 {
+        let dim = m.dim;
+        match (self, &m.data) {
+            (Self::F32(q), MatrixData::F32(d)) => {
+                d[i * dim..(i + 1) * dim].iter().zip(q).map(|(a, b)| a * b).sum()
+            }
+            (Self::Int8Exact { q, inv_qn }, MatrixData::Int8 { codes, inv_norm }) => {
+                dot_i8(q, &codes[i * dim..(i + 1) * dim]) as f32 * inv_norm[i] * inv_qn
+            }
+            (Self::Int8(q), MatrixData::Int8 { codes, inv_norm }) => {
+                dot_f32_i8(q, &codes[i * dim..(i + 1) * dim]) * inv_norm[i]
+            }
+            (Self::BitsExact(q), MatrixData::Bits(w)) => {
+                let s = q.len();
+                let hamming: u32 = w[i * s..(i + 1) * s].iter().zip(q).map(|(a, b)| (a ^ b).count_ones()).sum();
+                1.0 - 2.0 * hamming as f32 / dim as f32
+            }
+            (Self::BitsTable(t), MatrixData::Bits(w)) => {
+                let s = dim.div_ceil(64);
+                (0..dim.div_ceil(8))
+                    .map(|j| t[j * 256 + (w[i * s + j / 8] >> (j % 8 * 8) & 0xff) as usize])
+                    .sum()
+            }
+            _ => unreachable!("probe is built for its matrix's kind"),
+        }
+    }
+}
+
+/// `a · b`, exactly.  Sixteen lanes of `i16` products summed into `i32`,
+/// the shape the compiler lowers to `pmaddwd`; a plain `zip().map().sum()`
+/// widened every element to `i32` first and ran slower than the `f32` path.
+/// `i8 × i8` fits `i16` (the extreme is −128 × −128 = 16384), and the `i32`
+/// lanes cannot overflow below ~2 million dimensions.
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    let mut acc = [0i32; 16];
+    let (ac, bc) = (a.chunks_exact(16), b.chunks_exact(16));
+    let tail: i32 = ac.remainder().iter().zip(bc.remainder()).map(|(&x, &y)| x as i32 * y as i32).sum();
+    for (xs, ys) in ac.zip(bc) {
+        for k in 0..16 { acc[k] += (xs[k] as i16 * ys[k] as i16) as i32; }
+    }
+    acc.iter().sum::<i32>() + tail
+}
+
+/// `q · c` with eight independent accumulators.  A single running `f32` sum
+/// cannot be vectorised (float addition is not associative, so the compiler
+/// must keep the order); eight lanes can.
+fn dot_f32_i8(q: &[f32], c: &[i8]) -> f32 {
+    let mut acc = [0f32; 8];
+    let (qc, cc) = (q.chunks_exact(8), c.chunks_exact(8));
+    let tail: f32 = qc.remainder().iter().zip(cc.remainder()).map(|(&a, &b)| a * b as f32).sum();
+    for (qs, cs) in qc.zip(cc) {
+        for k in 0..8 { acc[k] += qs[k] * cs[k] as f32; }
+    }
+    acc.iter().sum::<f32>() + tail
 }
 
 pub(crate) struct IndexManager {
@@ -367,11 +603,11 @@ impl IndexManager {
         // rebuild on the next search.
         if !self.vectors_stale {
             for (field, dim) in &self.vector_fields {
-                if let Some(vec) = raw.get(field).ok().flatten().and_then(crate::vector::raw_vector) {
+                if let Some(vec) = raw.get(field).ok().flatten().and_then(crate::vector::raw_stored_vector) {
                     if vec.len() == *dim {
                         self.vector_data.entry(field.clone())
                             .or_insert_with(|| VectorMatrix::new(*dim))
-                            .push(row, &normalized(vec));
+                            .push(row, vec);
                     }
                 }
             }
@@ -667,10 +903,8 @@ impl IndexManager {
             // `_id` order, so a rebuilt matrix is laid out deterministically.
             for &row in self.by_id.values() {
                 let Some(doc) = self.doc_at(row) else { continue };
-                if let Some(vec) = doc.get(field).ok().flatten().and_then(crate::vector::raw_vector) {
-                    // Normalise at build time so cosine similarity collapses
-                    // to a plain dot product at query time.
-                    if vec.len() == *dim { m.push(row, &normalized(vec)); }
+                if let Some(vec) = doc.get(field).ok().flatten().and_then(crate::vector::raw_stored_vector) {
+                    if vec.len() == *dim { m.push(row, vec); }
                 }
             }
             self.vector_data.insert(field.clone(), m);
@@ -694,20 +928,14 @@ impl IndexManager {
         let Some(m) = self.vector_data.get(field) else { return Vec::new() };
         let (n, dim) = (m.len(), m.dim);
         if n == 0 || dim == 0 || limit == 0 { return Vec::new(); }
-
-        // Normalise query once — rows are already normalised at build time,
-        // so cosine similarity is just a dot product.
-        let qn: f32 = query.iter().map(|x| x*x).sum::<f32>().sqrt();
-        if qn == 0.0 { return Vec::new(); }
-        let q_norm: Vec<f32> = query.iter().map(|x| x / qn).collect();
+        let Some(probe) = Probe::new(&m.data, query, dim) else { return Vec::new() };
 
         // Score only allowed rows when pre-filtered — no dot products for
         // documents that would be dropped anyway.  Parallel for large n.
         let score = |i: usize| -> Option<(Row, f32)> {
             let row = m.rows[i];
             if allowed.is_some_and(|a| !a.contains(&row)) { return None; }
-            let v = &m.data[i*dim..(i+1)*dim];
-            Some((row, v.iter().zip(&q_norm).map(|(a,b)| a*b).sum()))
+            Some((row, probe.score(m, i)))
         };
         let scored: Vec<(Row, f32)> = if n > PARALLEL_THRESHOLD {
             (0..n).into_par_iter().filter_map(score).collect()
@@ -1113,7 +1341,7 @@ mod incremental_vector_tests {
 
         let vm = m.vector_data.get("embedding").unwrap();
         assert_eq!(vm.rows.len(), 3);
-        assert_eq!(vm.data.len(), vm.rows.len() * vm.dim);
+        assert!(vm.is_consistent());
         let mut got: Vec<_> = vm.rows.iter().map(|&r| m.id_of(r).unwrap()).collect();
         got.sort();
         assert_eq!(got, vec!["1", "2", "4"]);
@@ -1130,7 +1358,7 @@ mod incremental_vector_tests {
 
         let vm = m.vector_data.get("embedding").unwrap();
         assert!(vm.rows.is_empty());
-        assert!(vm.data.is_empty());
+        assert!(vm.is_consistent());
         assert!(m.vector_search("embedding", &[1.0, 0.0, 0.0], 10).is_empty());
     }
 
@@ -1150,7 +1378,7 @@ mod incremental_vector_tests {
         }
 
         let vm = m.vector_data.get("embedding").unwrap();
-        assert_eq!(vm.data.len(), vm.rows.len() * vm.dim);
+        assert!(vm.is_consistent());
         assert_eq!(vm.rows.len(), m.doc_count());
         assert_matches_rebuild(&mut m, &[1.0, 1.0, 0.0]);
     }
@@ -1186,6 +1414,214 @@ mod incremental_vector_tests {
 
         let vm = m.vector_data.get("embedding").unwrap();
         assert_eq!(vm.rows.iter().map(|&r| m.id_of(r).unwrap()).collect::<Vec<_>>(), ["vec"]);
-        assert_eq!(vm.data.len(), vm.dim);
+        assert!(vm.is_consistent() && vm.len() == 1);
+    }
+}
+
+
+#[cfg(test)]
+mod quantized_matrix_tests {
+    use super::*;
+    use bson::{doc, spec::BinarySubtype, Binary, Bson};
+
+    fn int8(v: &[i8]) -> Bson {
+        let mut bytes = vec![crate::vector::DTYPE_INT8, 0];
+        bytes.extend(v.iter().map(|&x| x as u8));
+        Bson::Binary(Binary { subtype: BinarySubtype::Vector, bytes })
+    }
+
+    fn bits(v: &[bool]) -> Bson {
+        let mut bytes = vec![crate::vector::DTYPE_PACKED_BIT, ((8 - v.len() % 8) % 8) as u8];
+        bytes.extend(v.chunks(8).map(|c| c.iter().enumerate().fold(0u8, |b, (k, &x)| b | ((x as u8) << (7 - k)))));
+        Bson::Binary(Binary { subtype: BinarySubtype::Vector, bytes })
+    }
+
+    fn as_array(v: impl IntoIterator<Item = f64>) -> Bson { Bson::Array(v.into_iter().map(Bson::Double).collect()) }
+
+    /// A deterministic pseudo-random stream, so failures reproduce.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    fn im(dim: usize) -> IndexManager { IndexManager::new(&[], &[("v".into(), dim)], &[]) }
+
+    fn ranked(im: &IndexManager, q: &[f32], k: usize) -> Vec<(String, f32)> {
+        im.vector_search("v", q, k).into_iter().map(|(d, s)| (d.get_str("_id").unwrap().to_string(), s)).collect()
+    }
+
+    /// Same documents, same scores.  Compared after grouping equal scores:
+    /// quantised scores tie exactly (binary ones are multiples of 2/dim) and
+    /// break on `_id`, while the f32 reference carries rounding noise that
+    /// can order the same tie differently.
+    fn assert_same(a: &[(String, f32)], b: &[(String, f32)]) {
+        assert_eq!(a.len(), b.len());
+        let canon = |r: &[(String, f32)]| {
+            let mut r = r.to_vec();
+            // `+ 0.0` folds the -0.0 that rounding a tiny negative gives.
+            let key = |s: f32| (s * 1e4).round() + 0.0;
+            r.sort_by(|x, y| key(y.1).total_cmp(&key(x.1)).then_with(|| x.0.cmp(&y.0)));
+            r
+        };
+        for ((ia, sa), (ib, sb)) in canon(a).iter().zip(&canon(b)) {
+            assert_eq!(ia, ib);
+            assert!((sa - sb).abs() < 1e-5, "{ia}: {sa} vs {sb}");
+        }
+    }
+
+    /// The same int8 vectors stored as INT8 and as number arrays: one matrix
+    /// is quantised, the other f32, and every query form must rank and score
+    /// them alike.
+    fn int8_pair(dim: usize, n: usize) -> (IndexManager, IndexManager) {
+        let (mut packed, mut arrays, mut seed) = (im(dim), im(dim), 1u64);
+        for i in 0..n {
+            let c: Vec<i8> = (0..dim).map(|_| (lcg(&mut seed) % 256) as i32 as i8).collect();
+            packed.add(doc! {"_id": format!("{i:03}"), "v": int8(&c)});
+            arrays.add(doc! {"_id": format!("{i:03}"), "v": as_array(c.iter().map(|&x| x as f64))});
+        }
+        packed.rebuild_vector_indexes();
+        arrays.rebuild_vector_indexes();
+        assert!(matches!(packed.vector_data["v"].data, MatrixData::Int8 { .. }));
+        assert!(matches!(arrays.vector_data["v"].data, MatrixData::F32(_)));
+        (packed, arrays)
+    }
+
+    #[test]
+    fn int8_matrix_scores_like_f32() {
+        let (packed, arrays) = int8_pair(37, 60);
+        let mut seed = 9u64;
+        let integer: Vec<f32> = (0..37).map(|_| (lcg(&mut seed) % 256) as f32 - 128.0).collect();
+        let float: Vec<f32> = (0..37).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+        for q in [&integer, &float] {
+            assert_same(&ranked(&packed, q, 60), &ranked(&arrays, q, 60));
+        }
+    }
+
+    #[test]
+    fn int8_exact_and_float_probes_agree() {
+        // An integer query takes the exact path; the same direction scaled
+        // to non-integers takes the f32 one.
+        let (packed, _) = int8_pair(16, 30);
+        let q: Vec<f32> = (0..16).map(|i| i as f32 - 8.0).collect();
+        let scaled: Vec<f32> = q.iter().map(|x| x / 127.0).collect();
+        assert!(matches!(Probe::new(&packed.vector_data["v"].data, &q, 16), Some(Probe::Int8Exact { .. })));
+        assert!(matches!(Probe::new(&packed.vector_data["v"].data, &scaled, 16), Some(Probe::Int8(_))));
+        assert_same(&ranked(&packed, &q, 30), &ranked(&packed, &scaled, 30));
+    }
+
+    #[test]
+    fn zero_int8_vector_scores_zero() {
+        let mut m = im(3);
+        m.add(doc! {"_id": "z", "v": int8(&[0, 0, 0])});
+        m.add(doc! {"_id": "a", "v": int8(&[5, 0, 0])});
+        m.rebuild_vector_indexes();
+        assert_same(&ranked(&m, &[1.0, 0.0, 0.0], 5), &[("a".into(), 1.0), ("z".into(), 0.0)]);
+    }
+
+    /// Widths either side of a 64-bit word boundary, so the padding bits of
+    /// the last word are exercised.
+    #[test]
+    fn bits_matrix_scores_like_plus_minus_one() {
+        for dim in [10, 64, 100, 512] {
+            let (mut packed, mut arrays, mut seed) = (im(dim), im(dim), dim as u64);
+            for i in 0..40 {
+                let b: Vec<bool> = (0..dim).map(|_| lcg(&mut seed) & 1 == 1).collect();
+                packed.add(doc! {"_id": format!("{i:03}"), "v": bits(&b)});
+                arrays.add(doc! {"_id": format!("{i:03}"), "v": as_array(b.iter().map(|&x| if x { 1.0 } else { -1.0 }))});
+            }
+            packed.rebuild_vector_indexes();
+            arrays.rebuild_vector_indexes();
+            assert!(matches!(packed.vector_data["v"].data, MatrixData::Bits(_)));
+            let signs: Vec<f32> = (0..dim).map(|_| if lcg(&mut seed) & 1 == 1 { 1.0 } else { -1.0 }).collect();
+            let float: Vec<f32> = (0..dim).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+            let data = &packed.vector_data["v"].data;
+            assert!(matches!(Probe::new(data, &signs, dim), Some(Probe::BitsExact(_))));
+            assert!(matches!(Probe::new(data, &float, dim), Some(Probe::BitsTable(_))));
+            for q in [&signs, &float] {
+                assert_same(&ranked(&packed, q, 40), &ranked(&arrays, q, 40));
+            }
+        }
+    }
+
+    #[test]
+    fn wrong_length_query_scores_as_before() {
+        // Cut or zero-padded to dim, normalised by the full query's norm --
+        // what the f32 matrix's zip always did.
+        let (packed, arrays) = int8_pair(8, 10);
+        for q in [vec![3.0f32; 5], vec![0.5f32; 11]] {
+            assert_same(&ranked(&packed, &q, 10), &ranked(&arrays, &q, 10));
+        }
+    }
+
+    #[test]
+    fn mixed_kinds_widen_to_f32_and_back_on_rebuild() {
+        let mut m = im(3);
+        m.add(doc! {"_id": "a", "v": int8(&[10, 0, 0])});
+        m.add(doc! {"_id": "b", "v": int8(&[0, 10, 0])});
+        m.rebuild_vector_indexes();
+        assert!(matches!(m.vector_data["v"].data, MatrixData::Int8 { .. }));
+        let before = ranked(&m, &[1.0, 0.5, 0.0], 5);
+
+        // An f32 vector arriving incrementally widens the matrix in place.
+        m.add(doc! {"_id": "c", "v": [0.0, 0.0, 2.0]});
+        assert!(matches!(m.vector_data["v"].data, MatrixData::F32(_)));
+        assert!(m.vector_data["v"].is_consistent());
+        assert_eq!(ranked(&m, &[0.0, 0.0, 1.0], 1)[0].0, "c");
+
+        // Once it is gone, a rebuild returns the field to int8 and to the
+        // same scores.
+        m.remove("c");
+        assert_same(&ranked(&m, &[1.0, 0.5, 0.0], 5), &before);
+        m.rebuild_vector_indexes();
+        assert!(matches!(m.vector_data["v"].data, MatrixData::Int8 { .. }));
+        assert_same(&ranked(&m, &[1.0, 0.5, 0.0], 5), &before);
+    }
+
+    #[test]
+    fn emptied_matrix_adopts_the_next_kind() {
+        let mut m = im(3);
+        m.add(doc! {"_id": "a", "v": [1.0, 0.0, 0.0]});
+        m.rebuild_vector_indexes();
+        m.remove("a");
+        m.add(doc! {"_id": "b", "v": int8(&[1, 2, 3])});
+        assert!(matches!(m.vector_data["v"].data, MatrixData::Int8 { .. }));
+    }
+
+    #[test]
+    fn quantised_swap_remove_matches_rebuild() {
+        let mut seed = 3u64;
+        let dim = 70;
+        for kind in 0..2 {
+            let mut m = im(dim);
+            let vec_for = |seed: &mut u64| if kind == 0 {
+                int8(&(0..dim).map(|_| (lcg(seed) % 256) as i32 as i8).collect::<Vec<_>>())
+            } else {
+                bits(&(0..dim).map(|_| lcg(seed) & 1 == 1).collect::<Vec<_>>())
+            };
+            for i in 0..20 { m.add(doc! {"_id": format!("{i:02}"), "v": vec_for(&mut seed)}); }
+            m.rebuild_vector_indexes();
+            for i in (0..20).step_by(3) {
+                m.remove(&format!("{i:02}"));
+                m.add(doc! {"_id": format!("n{i:02}"), "v": vec_for(&mut seed)});
+            }
+            assert!(m.vector_data["v"].is_consistent());
+            assert_eq!(m.vector_data["v"].len(), m.doc_count());
+            let q: Vec<f32> = (0..dim).map(|_| (lcg(&mut seed) % 1000) as f32 / 500.0 - 1.0).collect();
+            let incremental = ranked(&m, &q, 100);
+            m.rebuild_vector_indexes();
+            let mut a = incremental.clone();
+            let mut b = ranked(&m, &q, 100);
+            a.sort_by(|x, y| x.0.cmp(&y.0));
+            b.sort_by(|x, y| x.0.cmp(&y.0));
+            assert_same(&a, &b);
+        }
+    }
+
+    #[test]
+    fn from_parts_rejects_mismatched_data() {
+        assert!(VectorMatrix::from_parts(vec![0, 1], MatrixData::Bits(vec![0; 2]), 64).is_some());
+        assert!(VectorMatrix::from_parts(vec![0, 1], MatrixData::Bits(vec![0; 3]), 64).is_none());
+        let codes = MatrixData::Int8 { codes: vec![0; 6], inv_norm: vec![0.0] };
+        assert!(VectorMatrix::from_parts(vec![0, 1], codes, 3).is_none());
     }
 }

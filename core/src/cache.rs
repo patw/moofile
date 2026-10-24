@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-use crate::index::{IndexManager, Postings, Row, Value, VectorMatrix};
+use crate::index::{IndexManager, MatrixData, Postings, Row, Value, VectorMatrix};
 use crate::text::TextIndex;
 
 /// Cache format version — bump when the serialised layout **or the meaning of
@@ -42,7 +42,8 @@ use crate::text::TextIndex;
 ///   3 -> 4: the fingerprint gained the data file's inode.
 ///   4 -> 5: indexes refer to documents by row; documents are no longer
 ///           stored (they are read back from the data file).
-const CACHE_VERSION: u32 = 5;
+///   5 -> 6: vector matrices keep int8 and packed-bit vectors quantised.
+const CACHE_VERSION: u32 = 6;
 
 /// Magic bytes at the start of every cache file, so we can quickly reject
 /// non-cache files (e.g. a pickle written by the Python implementation).
@@ -90,8 +91,8 @@ pub(crate) struct CacheFile {
     rows: Vec<Option<String>>,
     /// Regular BTreeMap indexes: field → (value → [rows]).
     regular: Vec<(String, Vec<(Value, Vec<Row>)>)>,
-    /// Vector data: field → (rows, flat normalised matrix, dim).
-    vector_data: Vec<(String, Vec<Row>, Vec<f32>, usize)>,
+    /// Vector data: field → (rows, matrix, dim).
+    vector_data: Vec<(String, Vec<Row>, MatrixData, usize)>,
     /// Text indexes: field → TextIndex.
     text_indexes: Vec<(String, TextIndex)>,
 }
@@ -245,11 +246,16 @@ pub(crate) fn try_load_cache(
         })
         .collect();
 
-    let vector_data: std::collections::BTreeMap<String, VectorMatrix> = cache
+    // A matrix whose data does not match its rows would index out of bounds
+    // at search time: a miss, not a panic.
+    let Some(vector_data) = cache
         .vector_data
         .into_iter()
-        .map(|(field, rows, data, dim)| (field, VectorMatrix::from_parts(rows, data, dim)))
-        .collect();
+        .map(|(field, rows, data, dim)| Some((field, VectorMatrix::from_parts(rows, data, dim)?)))
+        .collect::<Option<std::collections::BTreeMap<String, VectorMatrix>>>()
+    else {
+        return CacheLoad::Miss;
+    };
 
     let text_indexes: std::collections::BTreeMap<String, TextIndex> =
         cache.text_indexes.into_iter().collect();
@@ -324,7 +330,7 @@ pub(crate) fn save_cache(
         })
         .collect();
 
-    let vector_data: Vec<(String, Vec<Row>, Vec<f32>, usize)> = index_manager
+    let vector_data: Vec<(String, Vec<Row>, MatrixData, usize)> = index_manager
         .vector_data
         .iter()
         .map(|(field, m)| (field.clone(), m.rows.clone(), m.data.clone(), m.dim))
@@ -543,6 +549,42 @@ mod tests {
             }
             CacheLoad::Miss => panic!("cache should hit after save"),
         }
+    }
+
+    /// Int8 and packed-bit matrices come back from the cache quantised, and
+    /// score exactly as they did before it was written.
+    #[test]
+    fn cache_roundtrip_keeps_quantised_matrices() {
+        use bson::{spec::BinarySubtype, Binary, Bson};
+        let vector = |bytes: Vec<u8>| Bson::Binary(Binary { subtype: BinarySubtype::Vector, bytes });
+        let dir = TempDir::new().unwrap();
+        let data_path = dir.path().join("test.bson");
+        let docs = [
+            doc! { "_id": "a", "q": vector(vec![0x03, 0, 10, 250, 3]), "b": vector(vec![0x10, 5, 0b1010_0000]) },
+            doc! { "_id": "b", "q": vector(vec![0x03, 0, 1, 2, 3]), "b": vector(vec![0x10, 5, 0b0110_0000]) },
+        ];
+        let mut buf = Vec::new();
+        for d in &docs {
+            buf.extend(crate::storage::encode_record(crate::storage::RECORD_LIVE, d));
+        }
+        fs::write(&data_path, &buf).unwrap();
+
+        let fields = [("q".to_string(), 3), ("b".to_string(), 3)];
+        let mut im = IndexManager::new(&[], &fields, &[]);
+        for d in &docs { im.add(d.clone()); }
+        im.rebuild_vector_indexes();
+        let search = |im: &IndexManager, f: &str, q: &[f32]| -> Vec<(String, f32)> {
+            im.vector_search(f, q, 5).into_iter().map(|(d, s)| (d.get_str("_id").unwrap().to_string(), s)).collect()
+        };
+        let before = (search(&im, "q", &[1.0, -2.0, 0.5]), search(&im, "b", &[1.0, -1.0, 1.0]));
+        save_cache(&data_path, &im, 2, file_fingerprint(&data_path).unwrap()).unwrap();
+
+        let CacheLoad::Hit { index_manager: loaded, .. } = try_load_cache(&data_path, &[], &fields, &[]) else {
+            panic!("cache should hit after save");
+        };
+        assert!(matches!(loaded.vector_data["q"].data, MatrixData::Int8 { .. }));
+        assert!(matches!(loaded.vector_data["b"].data, MatrixData::Bits(_)));
+        assert_eq!((search(&loaded, "q", &[1.0, -2.0, 0.5]), search(&loaded, "b", &[1.0, -1.0, 1.0])), before);
     }
 
     /// Free slots and replaced documents must round-trip: the cache keeps

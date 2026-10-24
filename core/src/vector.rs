@@ -81,7 +81,7 @@ impl<'a> PackedVector<'a> {
     }
 }
 
-/// Read a stored vector field: an array of numbers or a subtype-9 binary.
+/// Read a stored vector field as `f32`: an array of numbers or a subtype-9 binary.
 /// `None` for anything else, including an array with a non-numeric element
 /// (such an array used to be indexed with the bad elements silently dropped,
 /// which shifted every later dimension).
@@ -101,6 +101,51 @@ pub(crate) fn raw_vector(val: RawBsonRef) -> Option<Vec<f32>> {
         }
         _ => None,
     }
+}
+
+/// A stored vector in the form a vector index keeps it.  INT8 and PACKED_BIT
+/// stay quantised instead of being widened to `f32`: the widened values are
+/// exactly the codes (or ±1), so nothing is gained by widening them and the
+/// matrix would be 4× (or 32×) larger.
+pub(crate) enum StoredVector {
+    F32(Vec<f32>),
+    Int8(Vec<i8>),
+    /// Element `i` is bit `i % 64` of word `i / 64`; the unused high bits of
+    /// the last word are zero.
+    Bits(Vec<u64>, usize),
+}
+
+impl StoredVector {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::F32(v) => v.len(),
+            Self::Int8(v) => v.len(),
+            Self::Bits(_, n) => *n,
+        }
+    }
+}
+
+/// [`raw_vector`], keeping INT8 and PACKED_BIT quantised.
+pub(crate) fn raw_stored_vector(val: RawBsonRef) -> Option<StoredVector> {
+    if let RawBsonRef::Binary(b) = val {
+        if b.subtype == BinarySubtype::Vector {
+            return Some(match PackedVector::parse(b.bytes)? {
+                PackedVector::Int8(d) => StoredVector::Int8(d.iter().map(|&b| b as i8).collect()),
+                PackedVector::PackedBit(d, n) => StoredVector::Bits(pack_bits(n, |i| d[i / 8] & (0x80 >> (i % 8)) != 0), n),
+                f @ PackedVector::Float32(_) => StoredVector::F32(f.to_f32()),
+            });
+        }
+    }
+    raw_vector(val).map(StoredVector::F32)
+}
+
+/// Pack `n` bits, element `i` into bit `i % 64` of word `i / 64`.
+pub(crate) fn pack_bits(n: usize, bit: impl Fn(usize) -> bool) -> Vec<u64> {
+    let mut words = vec![0u64; n.div_ceil(64)];
+    for i in (0..n).filter(|&i| bit(i)) {
+        words[i / 64] |= 1 << (i % 64);
+    }
+    words
 }
 
 /// The element count of a stored vector, without decoding it.
